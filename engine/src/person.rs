@@ -63,7 +63,7 @@ struct Pu {
 // ---------------------------------------------------------------- runs
 
 /// Bytes of a run block. A run of at least a quarter of it gets a block of its own.
-const RUN_BLOCK: usize = 16 << 10;
+const RUN_BLOCK: usize = 8 << 10;
 /// Run header: name u64, timestamps u32, purchases u32, clicks u32, 0u32. Then the
 /// timestamps (u32, unsorted, padded to 8 bytes), the purchases (`Pu`, sorted), the clicks (`Clk`).
 const RUN_HDR: usize = 24;
@@ -81,19 +81,22 @@ struct RunOut {
     open: Vec<usize>,
     /// closed blocks: (start, used bytes)
     blocks: Vec<Vec<(usize, usize)>>,
+    /// `RUN_BLOCK`-sized pieces of memory to use before the arena: the event blocks pass A
+    /// has finished reading. They are mapped and in cache, new arena memory is neither.
+    free: Vec<usize>,
     arena: Arena,
 }
 unsafe impl Send for RunOut {}
 
 impl RunOut {
     fn new(parts: usize) -> Self {
-        RunOut { heads: vec![(0, 0); parts], open: vec![0; parts], blocks: vec![Vec::new(); parts], arena: Arena::new() }
+        RunOut { heads: vec![(0, 0); parts], open: vec![0; parts], blocks: vec![Vec::new(); parts], free: Vec::new(), arena: Arena::new() }
     }
     /// `bytes` (a multiple of 8) of 8-aligned space in partition `d`.
     #[inline(always)]
     fn alloc(&mut self, d: usize, bytes: usize) -> *mut u8 {
         let h = unsafe { self.heads.get_unchecked_mut(d) };
-        if h.0 + bytes <= h.1 {
+        if h.0 + bytes + OVER <= h.1 {
             let p = h.0;
             h.0 += bytes;
             return p as *mut u8;
@@ -104,12 +107,15 @@ impl RunOut {
     #[inline(never)]
     fn alloc_slow(&mut self, d: usize, bytes: usize) -> *mut u8 {
         if bytes >= RUN_BLOCK / 4 {
-            let p = self.arena.alloc(bytes) as usize;
+            let p = self.arena.alloc(bytes + OVER) as usize;
             self.blocks[d].push((p, bytes));
             return p as *mut u8;
         }
         self.close(d);
-        let p = self.arena.alloc(RUN_BLOCK) as usize;
+        let p = match self.free.pop() {
+            Some(p) => p,
+            None => self.arena.alloc(RUN_BLOCK) as usize,
+        };
         self.open[d] = p;
         self.heads[d] = (p + bytes, p + RUN_BLOCK);
         p as *mut u8
@@ -147,6 +153,8 @@ struct Out {
     hot: Vec<[u16; 2]>,
     /// Sessions counted into `hot` since the last fold.
     hot_n: u32,
+    /// ns spent in the user_daily write calls (for SE_TIMING)
+    write_ns: u64,
     /// `[campaign][day]`: purchasing sessions (top 16 bits) and their revenue (low 48 bits)
     /// since the last fold; narrow for the same reason as `hot`.
     pr: Vec<u64>,
@@ -159,6 +167,8 @@ struct Out {
     name: Vec<u8>,
     cols: Vec<Col>,
     rows: usize,
+    /// bytes of a value of the sessions and events columns: 4 (INT32) or 8
+    cw: usize,
     file: PqFile,
 }
 unsafe impl Send for Out {}
@@ -220,8 +230,10 @@ impl Out {
             c0.set_len(l0 + 4 + nl);
             let r = self.rows;
             (self.cols[1].data.as_mut_ptr().add(r * 4) as *mut i32).write_unaligned((self.day0 + day as i64) as i32);
-            (self.cols[2].data.as_mut_ptr().add(r * 8) as *mut i64).write_unaligned(sess as i64);
-            (self.cols[3].data.as_mut_ptr().add(r * 8) as *mut i64).write_unaligned(events as i64);
+            // little-endian: the low half of the 8 bytes is the INT32 value
+            let cw = self.cw;
+            (self.cols[2].data.as_mut_ptr().add(r * cw) as *mut i64).write_unaligned(sess as i64);
+            (self.cols[3].data.as_mut_ptr().add(r * cw) as *mut i64).write_unaligned(events as i64);
             (self.cols[4].data.as_mut_ptr().add(r * 8) as *mut i64).write_unaligned(rev as i64);
         }
         let mut best = u32::MAX;
@@ -249,17 +261,19 @@ impl Out {
     fn reserve_group(&mut self) {
         self.cols[1].data.reserve(GROUP_ROWS * 4);
         for c in 2..5 {
-            self.cols[c].data.reserve(GROUP_ROWS * 8);
+            self.cols[c].data.reserve(GROUP_ROWS * 8 + 8);
         }
     }
     fn write_group(&mut self) {
         unsafe {
             self.cols[1].data.set_len(self.rows * 4);
-            for c in 2..5 {
-                self.cols[c].data.set_len(self.rows * 8);
-            }
+            self.cols[2].data.set_len(self.rows * self.cw);
+            self.cols[3].data.set_len(self.rows * self.cw);
+            self.cols[4].data.set_len(self.rows * 8);
         }
+        let t = std::time::Instant::now();
         self.file.write_group(&mut self.cols, self.rows).expect("write user_daily");
+        self.write_ns += t.elapsed().as_nanos() as u64;
         self.rows = 0;
         self.reserve_group();
     }
@@ -690,6 +704,12 @@ unsafe fn click_id(ptr: usize) -> &'static [u8] {
 
 // ---------------------------------------------------------------- pass A
 
+/// SE_RECYCLE=0: runs go to fresh arena memory instead of finished event blocks.
+fn env_recycle() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_on("SE_RECYCLE"))
+}
+
 fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut Scratch, o: &mut Out, runs: &mut RunOut) {
     let n: usize = ev.iter().map(|p| p.count(q)).sum();
     let nc: usize = cl.iter().map(|p| p.count(q)).sum();
@@ -731,6 +751,19 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
         }
     }
     let n = m;
+    // The event records of this partition are not read again: their blocks take the runs.
+    if env_recycle() {
+        for p in ev {
+            for sl in p.slices(q) {
+                let base = sl.as_ptr() as usize;
+                if base % 8 == 0 {
+                    for k in 0..sl.len() * std::mem::size_of::<PRec>() / RUN_BLOCK {
+                        runs.free.push(base + k * RUN_BLOCK);
+                    }
+                }
+            }
+        }
+    }
     sc.lap(0);
     // clicks: count per ID
     sc.cidx.clear();
@@ -783,7 +816,7 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
     }
     sc.off.push(sum);
     sc.ts.clear();
-    sc.ts.reserve(n);
+    sc.ts.reserve(n + OVER);
     unsafe {
         let ts = sc.ts.as_mut_ptr();
         for j in 0..n {
@@ -806,7 +839,7 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
     }
     sc.coff.push(sum);
     sc.clk.clear();
-    sc.clk.reserve(nc);
+    sc.clk.reserve(nc + OVER);
     unsafe {
         let ck = sc.clk.as_mut_ptr();
         let mut j = 0usize;
@@ -826,6 +859,7 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
     sc.lap(4);
     // purchases by (ID, timestamp)
     sc.pu.clear();
+    sc.pu.reserve(sc.purch.len() + OVER);
     if !sc.purch.is_empty() {
         sc.purch.sort_unstable();
         for &(k, pc) in &sc.purch {
@@ -886,9 +920,12 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
         let (ca, cb) = (sc.coff[i] as usize, sc.coff[i + 1] as usize);
         let (pa, pb) = (sc.cur[i] as usize, sc.cur[i + 1] as usize);
         let (nts, npu, ncl) = (b - a, pb - pa, cb - ca);
-        if i + 4 < nk && sc.names[i + 4] != 0 {
-            let d = part_of(id_hash(sc.names[i + 4]), ctx.pbits);
-            prefetch(runs.heads[d].0 as *const u8);
+        if i + PF_RUNS < nk && sc.names[i + PF_RUNS] != 0 {
+            let d = part_of(id_hash(sc.names[i + PF_RUNS]), ctx.pbits);
+            let p = runs.heads[d].0 as *const u8;
+            prefetch(p);
+            prefetch(p.wrapping_add(64));
+            prefetch(p.wrapping_add(128));
         }
         let d = part_of(id_hash(name), ctx.pbits);
         let p = runs.alloc(d, run_bytes(nts, npu, ncl));
@@ -900,15 +937,45 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
             h.add(2).write(ncl as u32);
             h.add(3).write(0);
             let mut w = p.add(RUN_HDR);
-            std::ptr::copy_nonoverlapping(sc.ts.as_ptr().add(a), w as *mut u32, nts);
+            copy_over(sc.ts.as_ptr().add(a) as *const u8, w, nts * 4);
             w = w.add((nts * 4 + 7) & !7);
-            std::ptr::copy_nonoverlapping(sc.pu.as_ptr().add(pa), w as *mut Pu, npu);
+            copy_over(sc.pu.as_ptr().add(pa) as *const u8, w, npu * 8);
             w = w.add(npu * 8);
-            std::ptr::copy_nonoverlapping(sc.clk.as_ptr().add(ca), w as *mut Clk, ncl);
+            copy_over(sc.clk.as_ptr().add(ca) as *const u8, w, ncl * 16);
         }
     }
     sc.lap(8);
 }
+
+/// Copies `n` bytes in 32-byte steps without a call: may read and write up to 31 bytes past
+/// `n` (the sources have that much capacity, the run blocks that much slack; see `OVER`).
+#[inline(always)]
+unsafe fn copy_over(src: *const u8, dst: *mut u8, n: usize) {
+    unsafe {
+        if n > 256 {
+            std::ptr::copy_nonoverlapping(src, dst, n);
+            return;
+        }
+        let mut o = 0;
+        while o < n {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::*;
+                _mm_storeu_si128(dst.add(o) as *mut __m128i, _mm_loadu_si128(src.add(o) as *const __m128i));
+                _mm_storeu_si128(dst.add(o + 16) as *mut __m128i, _mm_loadu_si128(src.add(o + 16) as *const __m128i));
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let v = (src.add(o) as *const [u64; 4]).read_unaligned();
+                (dst.add(o) as *mut [u64; 4]).write_unaligned(v);
+            }
+            o += 32;
+        }
+    }
+}
+const OVER: usize = 32;
+/// How many IDs ahead the destination of a run is prefetched.
+const PF_RUNS: usize = 8;
 
 // ---------------------------------------------------------------- pass B
 
@@ -1069,10 +1136,20 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
     let ncamp = ctx.camp_names.len();
     let np = 1usize << ctx.pbits;
     let dir = out.join("user_daily");
+    // sessions and events of a person-day are at most the number of events: INT32 columns
+    // unless there could be 2^31 of them (revenue stays INT64)
+    let total: usize = (0..np).map(|q| ev.iter().map(|p| p.count(q)).sum::<usize>()).sum();
+    let narrow = total < i32::MAX as usize && cfg!(target_endian = "little");
+    let mut schema = UD_SCHEMA;
+    if narrow {
+        schema[2].1 = Kind::I32;
+        schema[3].1 = Kind::I32;
+    }
+    let schema = &schema;
     let order = largest_first(np, |q| ev.iter().map(|p| p.count(q)).sum::<usize>() * 2 + cl.iter().map(|p| p.count(q)).sum::<usize>() * 3);
     let next = AtomicUsize::new(0);
     let res = par((0..nthreads).collect::<Vec<usize>>(), |tid, _| {
-        let file = PqFile::create(&dir.join(format!("part-{tid:03}.parquet")), &UD_SCHEMA).expect("create user_daily file");
+        let file = PqFile::create(&dir.join(format!("part-{tid:03}.parquet")), schema).expect("create user_daily file");
         let mut o = Out {
             nd,
             day0,
@@ -1081,14 +1158,16 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
             acc: vec![[0; 4]; (ncamp + 1) * nd.max(1)],
             hot: vec![[0; 2]; (ncamp + 1) * nd.max(1)],
             hot_n: 0,
+            write_ns: 0,
             pr: vec![0; (ncamp + 1) * nd.max(1)],
             on: vec![[0; 3]; ncamp],
             segs: Vec::new(),
             catsum: vec![0; ctx.cats.len()],
             touched: Vec::new(),
             name: Vec::with_capacity(32),
-            cols: UD_SCHEMA.iter().map(|&(_, k)| Col::new(k)).collect(),
+            cols: schema.iter().map(|&(_, k)| Col::new(k)).collect(),
             rows: 0,
+            cw: if narrow { 4 } else { 8 },
             file,
         };
         o.reserve_group();
@@ -1124,10 +1203,11 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
         o.write_group();
         o.fold_hot();
         o.file.finish().expect("finish user_daily");
+        sc.prof[12] = o.write_ns;
         (o.acc, sc.prof)
     });
     if tm.on {
-        let names = ["A scan events", "A scan clicks", "A link lookups", "A group ts", "A group clicks", "A purchases", "A sessions", "A sort clicks", "A write runs", "B group runs", "B people", "A sweep"];
+        let names = ["A scan events", "A scan clicks", "A link lookups", "A group ts", "A group clicks", "A purchases", "A sessions", "A sort clicks", "A write runs", "B group runs", "B people", "A sweep", "(write calls)"];
         for (i, nm) in names.iter().enumerate() {
             let t: u64 = accs.iter().map(|a| a.1[i]).sum();
             eprintln!("[prof] {:<16} {:>9.1} ms (summed over threads)", nm, t as f64 / 1e6);

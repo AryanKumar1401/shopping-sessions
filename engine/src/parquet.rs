@@ -8,6 +8,7 @@ pub enum Kind {
     Str,
     StrOpt,
     Date,
+    I32,
     I64,
 }
 
@@ -197,6 +198,7 @@ impl PqFile {
                 Kind::Str => (6, 0, Some(0)),
                 Kind::StrOpt => (6, 1, Some(0)),
                 Kind::Date => (1, 0, Some(6)),
+                Kind::I32 => (1, 0, None),
                 Kind::I64 => (2, 0, None),
             };
             t.i32f(1, ty);
@@ -225,7 +227,7 @@ impl PqFile {
                 t.structf(3);
                 t.i32f(1, match kind {
                     Kind::Str | Kind::StrOpt => 6,
-                    Kind::Date => 1,
+                    Kind::Date | Kind::I32 => 1,
                     Kind::I64 => 2,
                 });
                 t.listf(2, 5, 2);
