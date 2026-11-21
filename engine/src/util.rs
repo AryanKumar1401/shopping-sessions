@@ -296,13 +296,19 @@ pub fn wc_default() -> bool {
 /// records, a multiple of 64 bytes; all buffers of a writer are contiguous), and a full
 /// buffer is copied to the block in one go. The hot state then is a few dense pages
 /// instead of one cache line and one page per partition scattered over the arena.
+///
+/// Records whose size divides 64 take the `aligned` form of it: every partition always has an
+/// open block, a buffer is exactly one cache line of the block, and the only per-partition
+/// state a push reads is the address its record will have (which also says how full the
+/// buffer is); the end of the block is looked at only when a buffer is flushed.
 pub struct Writers<T> {
-    /// (next record's place in the open block, or with write combining the place of the
-    /// buffer's first record; end of the open block)
+    /// (next record's place in the open block, or with unaligned write combining the place
+    /// of the buffer's first record; end of the open block)
     heads: Vec<(*mut T, *mut T)>,
     blocks: Vec<Vec<(usize, usize)>>, // (start ptr, capacity) per block; the last one is open
     block_len: usize,
     wc: bool,
+    aligned: bool,
     unit: usize,
     buf: *mut T,
     fill: Vec<u8>,
@@ -311,10 +317,23 @@ pub struct Writers<T> {
 unsafe impl<T> Send for Writers<T> {}
 
 impl<T: Copy> Writers<T> {
+    /// Records per cache line when `T` can use the aligned form, else 0.
+    const LINE: usize = {
+        let size = std::mem::size_of::<T>();
+        if size >= 8 && size <= 32 && size.is_power_of_two() && std::mem::align_of::<T>() <= 16 { 64 / size } else { 0 }
+    };
+
     pub fn new(parts: usize, block_len: usize) -> Self {
         Self::with_wc(parts, block_len, false)
     }
     pub fn with_wc(parts: usize, block_len: usize, wc: bool) -> Self {
+        Self::make(parts, block_len, wc, None)
+    }
+    /// Like `with_wc`, with all blocks taken from `region`.
+    pub fn in_region(parts: usize, block_len: usize, wc: bool, region: &'static Region) -> Self {
+        Self::make(parts, block_len, wc, Some(region))
+    }
+    fn make(parts: usize, block_len: usize, wc: bool, region: Option<&'static Region>) -> Self {
         let size = std::mem::size_of::<T>();
         // records per 64-byte multiple
         let mut unit = 1;
@@ -322,22 +341,25 @@ impl<T: Copy> Writers<T> {
             unit += 1;
         }
         let wc = wc && unit <= 16 && std::mem::align_of::<T>() <= 16 && size % 8 == 0;
+        let aligned = wc && Self::LINE != 0;
         let block_len = block_len.max(4).div_ceil(unit) * unit;
-        Writers {
+        let mut w = Writers {
             heads: vec![(std::ptr::null_mut(), std::ptr::null_mut()); parts],
             blocks: vec![Vec::new(); parts],
             block_len,
             wc,
+            aligned,
             unit,
             buf: if wc { os_alloc(parts * unit * size) as *mut T } else { std::ptr::null_mut() },
-            fill: vec![0; if wc { parts } else { 0 }],
+            fill: vec![0; if wc && !aligned { parts } else { 0 }],
             arena: Arena::new(),
+        };
+        w.arena.region = region;
+        if aligned {
+            for s in 0..parts {
+                w.refill(s);
+            }
         }
-    }
-    /// Like `with_wc`, with all blocks taken from `region`.
-    pub fn in_region(parts: usize, block_len: usize, wc: bool, region: &'static Region) -> Self {
-        let mut w = Self::with_wc(parts, block_len, wc);
-        w.arena.region = Some(region);
         w
     }
     #[cold]
@@ -356,6 +378,21 @@ impl<T: Copy> Writers<T> {
     #[inline(always)]
     pub fn push_ptr(&mut self, s: usize, v: T) -> *mut T {
         unsafe {
+            if Self::LINE != 0 && self.aligned {
+                let h = self.heads.get_unchecked_mut(s);
+                let p = h.0;
+                let n = (p as usize / std::mem::size_of::<T>()) & (Self::LINE - 1);
+                let b = self.buf.add(s * Self::LINE);
+                b.add(n).write(v);
+                h.0 = p.add(1);
+                if n + 1 == Self::LINE {
+                    wc_copy((p as *mut u8).add(std::mem::size_of::<T>()).sub(64), b as *const u8, 64);
+                    if h.0 == h.1 {
+                        self.refill(s);
+                    }
+                }
+                return p;
+            }
             if self.heads.get_unchecked(s).0 == self.heads.get_unchecked(s).1 {
                 self.refill(s);
             }
@@ -383,7 +420,16 @@ impl<T: Copy> Writers<T> {
     }
     /// Per partition: the filled slices.
     pub fn finish(mut self) -> Parts<T> {
-        if self.wc {
+        if self.aligned {
+            // the partly filled buffers
+            for s in 0..self.heads.len() {
+                let n = (self.heads[s].0 as usize / std::mem::size_of::<T>()) & (Self::LINE - 1);
+                if n > 0 {
+                    unsafe { std::ptr::copy_nonoverlapping(self.buf.add(s * Self::LINE), self.heads[s].0.sub(n), n) };
+                }
+            }
+            sfence_all();
+        } else if self.wc {
             // the partly filled buffers
             for s in 0..self.heads.len() {
                 let n = self.fill[s] as usize;
@@ -585,12 +631,28 @@ pub unsafe fn pack_id(p: *const u8, len: usize, lim: *const u8) -> Id {
     unsafe {
         if len <= 9 {
             let (lo, hi) = load16(p, len, lim);
-            // zero bytes of `lo` (exact when no byte has its top bit set)
-            let z = lo.wrapping_sub(0x0101_0101_0101_0101) & !lo & 0x8080_8080_8080_8080;
-            let want = if len >= 8 { 0 } else { 0x8080_8080_8080_8080u64 << (8 * len as u32) };
-            if ((lo | hi) & 0x8080_8080_8080_8080) == 0 && z == want && (len < 9 || hi != 0) {
+            return pack_words(p, len, lo, hi);
+        }
+        intern_long(std::slice::from_raw_parts(p, len))
+    }
+}
+
+/// `pack_id` for a field with 16 readable bytes at `p`.
+#[inline(always)]
+pub unsafe fn pack_id16(p: *const u8, len: usize) -> Id {
+    unsafe {
+        if len <= 9 {
+            // the first 8 bytes (zero padded), and the ninth
+            let m = if len >= 8 { !0u64 } else { (1u64 << (8 * len as u32)) - 1 };
+            let lo = (p as *const u64).read_unaligned() & m;
+            let b8 = *p.add(8) as u64;
+            let hi = if len == 9 { b8 } else { 0 };
+            // Packable when no byte has its top bit set and none of the `len` bytes is zero
+            // (`t`: the padding filled with ones, so that any zero byte left is a real one).
+            let t = lo | !m;
+            let zero = t.wrapping_sub(0x0101_0101_0101_0101) & !t;
+            if (((lo | zero) & 0x8080_8080_8080_8080) == 0) & ((len < 9) | (b8.wrapping_sub(1) < 127)) {
                 let x = lo.swap_bytes();
-                // drop the (zero) top bit of every byte: 8 bytes -> 56 bits
                 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
                 let x = std::arch::x86_64::_pext_u64(x, 0x7F7F_7F7F_7F7F_7F7F);
                 #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
@@ -601,6 +663,33 @@ pub unsafe fn pack_id(p: *const u8, len: usize, lim: *const u8) -> Id {
                 };
                 return (x << 7) | hi;
             }
+            if len == 0 {
+                return 0;
+            }
+        }
+        intern_long(std::slice::from_raw_parts(p, len))
+    }
+}
+
+/// `lo`, `hi`: the field's `len` (<= 9) bytes, little-endian, zero padded.
+#[inline(always)]
+unsafe fn pack_words(p: *const u8, len: usize, lo: u64, hi: u64) -> Id {
+    unsafe {
+        // zero bytes of `lo` (exact when no byte has its top bit set)
+        let z = lo.wrapping_sub(0x0101_0101_0101_0101) & !lo & 0x8080_8080_8080_8080;
+        let want = if len >= 8 { 0 } else { 0x8080_8080_8080_8080u64 << (8 * len as u32) };
+        if (((lo | hi) & 0x8080_8080_8080_8080) == 0) & (z == want) & ((len < 9) | (hi != 0)) {
+            let x = lo.swap_bytes();
+            // drop the (zero) top bit of every byte: 8 bytes -> 56 bits
+            #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+            let x = std::arch::x86_64::_pext_u64(x, 0x7F7F_7F7F_7F7F_7F7F);
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+            let x = {
+                let x = ((x & 0x7F00_7F00_7F00_7F00) >> 1) | (x & 0x007F_007F_007F_007F);
+                let x = ((x & 0x3FFF_0000_3FFF_0000) >> 2) | (x & 0x0000_3FFF_0000_3FFF);
+                ((x & 0x0FFF_FFFF_0000_0000) >> 4) | (x & 0x0000_0000_0FFF_FFFF)
+            };
+            return (x << 7) | hi;
         }
         if len == 0 {
             return 0;
@@ -657,6 +746,40 @@ impl IdMap {
                 return s.1;
             }
             i = (i + 1) & self.mask;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_id16_is_pack_id() {
+        let mut x = 0x1234_5678_9ABC_DEF1u64;
+        let mut buf = [0u8; 64];
+        for round in 0..2_000_000u32 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut y = x;
+            for b in buf.iter_mut().take(24) {
+                y = y.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
+                // mostly letters and digits, now and then a NUL, a high byte or anything
+                *b = match (y >> 40) % 23 {
+                    0 => 0,
+                    1 => 0x80 | (y >> 8) as u8,
+                    2 => (y >> 8) as u8,
+                    _ => b"abcxyz019_~\x01\x7f"[((y >> 16) % 13) as usize],
+                };
+            }
+            let len = (round % 11) as usize;
+            let lim = unsafe { buf.as_ptr().add(64) };
+            // long or unpackable IDs are interned by content: both sides give the same index
+            let (a, b) = unsafe { (pack_id16(buf.as_ptr(), len), pack_id(buf.as_ptr(), len, lim)) };
+            assert_eq!(a, b, "{:?}", &buf[..len]);
+            let b2 = unsafe { pack_id(buf.as_ptr(), len, buf.as_ptr().add(len)) };
+            assert_eq!(a, b2);
         }
     }
 }

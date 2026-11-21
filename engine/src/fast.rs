@@ -575,6 +575,121 @@ fn emit_event(ctx: &Ctx, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape:
     dw.push(part_of(id_hash(eid), ctx.dbits), DRec { eid, ing, prec: idx as u32 });
 }
 
+/// One well-formed event line, by the general rules (`eval_event`), into the writers.
+#[cold]
+#[inline(never)]
+unsafe fn event_general(ctx: &Ctx, f: &[Field; 7], lim: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) {
+    unsafe {
+        let stage = ctx.stage;
+        let r = eval_event(ctx, f, lim, cache);
+        if stage == 2 {
+            std::hint::black_box(&r);
+            return;
+        }
+        if r.status == 0 {
+            return;
+        }
+        let eid = pack_id(f[0].0, f[0].1, lim);
+        if stage == 3 {
+            std::hint::black_box(id_hash(eid) ^ id_hash(r.uid));
+            return;
+        }
+        let ing = ing32(ctx, r.ing, escape);
+        if r.status == 2 {
+            emit_event(ctx, pw, dw, escape, r.uid, r.ts, r.pc, eid, ing);
+        } else {
+            dw.push(part_of(id_hash(eid), ctx.dbits), DRec { eid, ing, prec: NOPREC });
+        }
+    }
+}
+
+/// What `event_row` needs besides the row and the writers.
+struct EvRow<'a> {
+    ctx: &'a Ctx,
+    /// End of the readable bytes.
+    lim: *const u8,
+    stage: u32,
+    /// `DRec::ing` is a whole number of seconds from `ibase` for every F1 `ingest_ts`.
+    fast_rows: bool,
+    ibase_s: i64,
+}
+
+/// One well-formed event line.
+#[inline(never)]
+unsafe fn event_row(ev: &EvRow, r: &Row, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) {
+    unsafe {
+        if ev.stage == 1 {
+            return;
+        }
+        let l0 = r.len(0);
+        if l0 == 0 {
+            return;
+        }
+        // Fast path: ingest_ts is a valid F1 and the line is not at the very end of
+        // the buffer (so that 16 bytes can be read at every field without a check).
+        // Everything else takes `event_general`, which is the plain statement of the rules.
+        let ing_s = if (r.ln[3] == 20) & (r.ptr(6) as usize + r.len(6) + 24 <= ev.lim as usize) & ev.fast_rows { parse_f1(r.ptr(3), cache) } else { NONE };
+        if ing_s == NONE {
+            event_general(ev.ctx, &r.fields::<7>(), ev.lim, cache, pw, dw, escape);
+            return;
+        }
+        let ing = ing_s * 1000;
+        let (p2, l2) = (r.ptr(2), r.len(2));
+        let ts = if l2 == 20 {
+            let t = parse_f1(p2, cache);
+            if t == NONE { parse_ts_cold(p2, l2, cache) } else { t * 1000 }
+        } else if l2 == 13 {
+            parse_f3_13(p2)
+        } else {
+            parse_ts_cold(p2, l2, cache)
+        };
+        // (a bad `ts` is NONE, which is below every window)
+        let mut ok = (r.ln[1] != 0) & (ts >= ev.ctx.ws) & (ts < ev.ctx.we) & (ing.wrapping_sub(ts) <= DAY) & (r.ln[5] != 0);
+        let (tp, tl) = (r.ptr(4), r.ln[4]);
+        let mut pc = 0u32;
+        if tl == 4 {
+            let w = (tp as *const u32).read_unaligned();
+            ok &= (w == VIEW) | (w == CART);
+        } else if tl == 8 && (tp as *const u64).read_unaligned() == PURCHASE {
+            if ok {
+                let price = parse_price(r.ptr(6), r.len(6));
+                let mut cat = ev.ctx.products.get(pack_id(r.ptr(5), r.len(5), ev.lim));
+                if cat == u32::MAX {
+                    cat = ev.ctx.unknown_cat;
+                }
+                pc = cat * PRICE_MUL + price;
+                ok = price != 0;
+            }
+        } else {
+            ok = false;
+        }
+        if ev.stage == 2 {
+            std::hint::black_box((ok, pc, ts));
+            return;
+        }
+        let eid = pack_id16(r.ptr(0), l0);
+        let d = ing_s - ev.ibase_s;
+        *escape |= (d < 0) | (d > u32::MAX as i64);
+        if ev.stage >= 3 {
+            let uid = pack_id16(r.ptr(1), r.len(1));
+            std::hint::black_box((id_hash(eid) ^ id_hash(uid), d));
+            if ev.stage == 6 {
+                dw.push(part_of(id_hash(eid), ev.ctx.dbits), DRec { eid, ing: d as u32, prec: NOPREC });
+            }
+            if ev.stage == 7 {
+                pw.push(part_of(id_hash(uid), ev.ctx.pbits), PRec { k: uid, ts: 0, pc });
+            }
+            return;
+        }
+        if ok {
+            let uid = pack_id16(r.ptr(1), r.len(1));
+            emit_event(ev.ctx, pw, dw, escape, uid, (ts - ev.ctx.cbase) as u32, pc, eid, d as u32);
+        } else {
+            dw.push(part_of(id_hash(eid), ev.ctx.dbits), DRec { eid, ing: d as u32, prec: NOPREC });
+        }
+    }
+}
+
 #[inline(always)]
 unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
     unsafe {
@@ -595,31 +710,8 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
         }
         let drop_after = ctx.drop_pages && fix == 0;
         if job.kind == 0 {
-            let stage = ctx.stage;
-            scan::<M, 7>(buf, base, len, #[inline(always)] |f, _| {
-                if stage == 1 {
-                    return;
-                }
-                let r = eval_event(ctx, f, lim, cache);
-                if stage == 2 {
-                    std::hint::black_box(&r);
-                    return;
-                }
-                if r.status == 0 {
-                    return;
-                }
-                let eid = pack_id(f[0].0, f[0].1, lim);
-                if stage == 3 {
-                    std::hint::black_box(id_hash(eid) ^ id_hash(r.uid));
-                    return;
-                }
-                let ing = ing32(ctx, r.ing, escape);
-                if r.status == 2 {
-                    emit_event(ctx, pw, dw, escape, r.uid, r.ts, r.pc, eid, ing);
-                } else {
-                    dw.push(part_of(id_hash(eid), ctx.dbits), DRec { eid, ing, prec: NOPREC });
-                }
-            });
+            let ev = EvRow { ctx, lim, stage: ctx.stage, fast_rows: ctx.ibase % 1000 == 0, ibase_s: ctx.ibase / 1000 };
+            scan_rows::<M, 7>(buf, base, len, #[inline(always)] |r| event_row(&ev, r, cache, pw, dw, escape));
         } else {
             scan::<M, 4>(buf, base, len, #[inline(always)] |f, row| {
                 if f[0].1 == 0 || f[1].1 == 0 || f[2].1 == 0 {
