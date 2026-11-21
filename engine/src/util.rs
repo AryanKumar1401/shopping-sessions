@@ -671,6 +671,59 @@ pub unsafe fn pack_id16(p: *const u8, len: usize) -> Id {
     }
 }
 
+/// Byte masks of the first `len` (0..=9) of 16 bytes.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static LEN_MASK: [[u8; 16]; 10] = {
+    let mut t = [[0u8; 16]; 10];
+    let mut l = 0;
+    while l < 10 {
+        let mut i = 0;
+        while i < l {
+            t[l][i] = 0xFF;
+            i += 1;
+        }
+        l += 1;
+    }
+    t
+};
+
+/// Two IDs packed at once: `Some((pack_id16(p0, l0), pack_id16(p1, l1)))` when both are
+/// short and plain (at most 9 bytes, each in 1..=127; an empty one is 0), else `None` and
+/// nothing has happened. 16 bytes must be readable at both pointers.
+#[inline(always)]
+pub unsafe fn pack2_id16(p0: *const u8, l0: usize, p1: *const u8, l1: usize) -> Option<(Id, Id)> {
+    unsafe {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            use std::arch::x86_64::*;
+            if (l0 > 9) | (l1 > 9) {
+                return None;
+            }
+            let ld = |a: *const u8, b: *const u8| _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128(a as *const __m128i)), _mm_loadu_si128(b as *const __m128i), 1);
+            let data = ld(p0, p1);
+            let mask = ld(LEN_MASK.get_unchecked(l0).as_ptr(), LEN_MASK.get_unchecked(l1).as_ptr());
+            // every byte of both IDs is in 1..=127
+            let plain = _mm256_cmpgt_epi8(data, _mm256_setzero_si256());
+            if _mm256_testc_si256(plain, mask) == 0 {
+                return None;
+            }
+            let d = _mm256_and_si256(data, mask);
+            // 7 bits a byte, first byte most significant: pairs of bytes, pairs of those,
+            // then the two halves of the first eight bytes; the ninth byte goes below them
+            let w = _mm256_maddubs_epi16(_mm256_set1_epi16(0x0180), d);
+            let dd = _mm256_madd_epi16(w, _mm256_set1_epi32(0x0001_4000));
+            let q = _mm256_or_si256(_mm256_mul_epu32(dd, _mm256_set1_epi64x(1 << 28)), _mm256_srli_epi64(dd, 32));
+            let id = _mm256_or_si256(_mm256_slli_epi64(q, 7), _mm256_srli_si256(d, 8));
+            Some((_mm_cvtsi128_si64(_mm256_castsi256_si128(id)) as u64, _mm_cvtsi128_si64(_mm256_extracti128_si256(id, 1)) as u64))
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            let plain = |p: *const u8, l: usize| l <= 9 && std::slice::from_raw_parts(p, l).iter().all(|&c| (1..=127).contains(&c));
+            if plain(p0, l0) && plain(p1, l1) { Some((pack_id16(p0, l0), pack_id16(p1, l1))) } else { None }
+        }
+    }
+}
+
 /// `lo`, `hi`: the field's `len` (<= 9) bytes, little-endian, zero padded.
 #[inline(always)]
 unsafe fn pack_words(p: *const u8, len: usize, lo: u64, hi: u64) -> Id {
@@ -763,7 +816,7 @@ mod tests {
             x ^= x >> 7;
             x ^= x << 17;
             let mut y = x;
-            for b in buf.iter_mut().take(24) {
+            for b in buf.iter_mut().take(48) {
                 y = y.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
                 // mostly letters and digits, now and then a NUL, a high byte or anything
                 *b = match (y >> 40) % 23 {
@@ -780,6 +833,12 @@ mod tests {
             assert_eq!(a, b, "{:?}", &buf[..len]);
             let b2 = unsafe { pack_id(buf.as_ptr(), len, buf.as_ptr().add(len)) };
             assert_eq!(a, b2);
+            // the pair version: the same values, or None exactly when one is not short and plain
+            let len2 = ((x >> 20) % 11) as usize;
+            let q = unsafe { buf.as_ptr().add(30) };
+            let plain = |o: usize, l: usize| l <= 9 && buf[o..o + l].iter().all(|&c| (1..=127).contains(&c));
+            let want = if plain(0, len) && plain(30, len2) { Some((a, unsafe { pack_id16(q, len2) })) } else { None };
+            assert_eq!(unsafe { pack2_id16(buf.as_ptr(), len, q, len2) }, want, "{:?} {:?}", &buf[..len], &buf[30..30 + len2]);
         }
     }
 }
