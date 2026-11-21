@@ -217,8 +217,8 @@ pub unsafe fn scan<M: Masker, const N: usize>(buf: &mut ScanBuf, base: *const u8
         let mut row_start = 0u32;
         let mut qrun = 0u32;
         let mut prev_q = 0u32;
-        buf.nls.reserve(PIECE + 2);
-        buf.nlq.reserve(PIECE + 2);
+        buf.nls.reserve(PIECE + 72);
+        buf.nlq.reserve(PIECE + 72);
         while pos < len {
             let pend = (pos + PIECE).min(len);
             if buf.d.len() < dlen + PIECE + 128 + N {
@@ -236,14 +236,29 @@ pub unsafe fn scan<M: Masker, const N: usize>(buf: &mut ScanBuf, base: *const u8
                     std::ptr::copy_nonoverlapping(base.add(pos), t.as_mut_ptr(), len - pos);
                     M::masks(t.as_ptr())
                 };
+                // Newlines: the first two without a branch (0, 1 or 2 per 64 bytes is the rule,
+                // in no learnable order; an absent one writes a slot that is not counted).
                 let mut m = nl;
-                while m != 0 {
-                    let b = m.trailing_zeros();
-                    *nls.add(nn) = pos as u32 + b;
-                    *nlq.add(nn) = qrun + (q & ((1u64 << b) - 1)).count_ones();
-                    nn += 1;
-                    m &= m - 1;
+                let b0 = m.trailing_zeros();
+                *nls.add(nn) = pos as u32 + b0;
+                *nlq.add(nn) = qrun + (q & (1u64 << (b0 & 63)).wrapping_sub(1)).count_ones();
+                m &= m.wrapping_sub(1);
+                let b1 = m.trailing_zeros();
+                *nls.add(nn + 1) = pos as u32 + b1;
+                *nlq.add(nn + 1) = qrun + (q & (1u64 << (b1 & 63)).wrapping_sub(1)).count_ones();
+                m &= m.wrapping_sub(1);
+                let cnt_nl = nl.count_ones() as usize;
+                if m != 0 {
+                    let mut k = nn + 2;
+                    while m != 0 {
+                        let b = m.trailing_zeros();
+                        *nls.add(k) = pos as u32 + b;
+                        *nlq.add(k) = qrun + (q & ((1u64 << b) - 1)).count_ones();
+                        k += 1;
+                        m &= m - 1;
+                    }
                 }
+                nn += cnt_nl;
                 qrun += q.count_ones();
                 let cnt = dm.count_ones() as usize;
                 let mut m = dm;

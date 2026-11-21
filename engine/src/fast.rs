@@ -89,8 +89,6 @@ pub struct Ctx {
     pub stage: u32,
     /// Drop each chunk's file pages from the mapping once it is parsed (SE_DROP=0 turns it off).
     pub drop_pages: bool,
-    /// Rows between the prefetch of a link-table slot and its use (SE_RING).
-    pub ring: usize,
     /// Zero of `DRec::ing`: `ws` - 2^31 s, in ms.
     pub ibase: i64,
     /// Where every `PRec` lives.
@@ -505,25 +503,6 @@ pub unsafe fn eval_event(ctx: &Ctx, f: &[Field; 7], lim: *const u8, cache: &mut 
     }
 }
 
-#[derive(Clone, Copy)]
-struct PendE {
-    uid: Id,
-    h: u64,
-    ts: u32,
-    pc: u32,
-    eid: Id,
-    ing: u32,
-}
-#[derive(Clone, Copy)]
-struct PendC {
-    uid: Id,
-    h: u64,
-    ts: u32,
-    camp: u32,
-    ptr: usize,
-}
-/// Capacity of the look-ahead ring; `Ctx::ring` (a power of two up to this) is the distance in use.
-const RING: usize = 64;
 /// Records per block of the person partitions.
 const PBLOCK: usize = 512;
 
@@ -586,18 +565,14 @@ fn ing32(ctx: &Ctx, ing: i64, escape: &mut bool) -> u32 {
     s as u32
 }
 
+/// Writes one good event: its `PRec` goes to the partition of its *user ID* (the person is
+/// filled in after dedup, by `resolve_people`), its `DRec` to the partition of its event ID.
 #[inline(always)]
-fn emit_event(ctx: &Ctx, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool, p: &PendE) {
-    let (k, h) = if ctx.links.any {
-        let k = ctx.links.resolve(p.uid, p.h);
-        (k, if k == p.uid { p.h } else { id_hash(k) })
-    } else {
-        (p.uid, p.h)
-    };
-    let prec = pw.push_ptr(part_of(h, ctx.pbits), PRec { k, ts: p.ts, pc: p.pc });
+fn emit_event(ctx: &Ctx, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool, uid: Id, ts: u32, pc: u32, eid: Id, ing: u32) {
+    let prec = pw.push_ptr(part_of(id_hash(uid), ctx.pbits), PRec { k: uid, ts, pc });
     let idx = (prec as usize).wrapping_sub(ctx.pregion.base) / std::mem::size_of::<PRec>();
     *escape |= idx >= NOPREC as usize;
-    dw.push(part_of(id_hash(p.eid), ctx.dbits), DRec { eid: p.eid, ing: p.ing, prec: idx as u32 });
+    dw.push(part_of(id_hash(eid), ctx.dbits), DRec { eid, ing, prec: idx as u32 });
 }
 
 #[inline(always)]
@@ -620,10 +595,8 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
         }
         let drop_after = ctx.drop_pages && fix == 0;
         if job.kind == 0 {
-            let mut ring = [PendE { uid: 0, h: 0, ts: 0, pc: 0, eid: 0, ing: 0 }; RING];
-            let mut rn = 0usize;
             let stage = ctx.stage;
-            scan::<M, 7>(buf, base, len, |f, _| {
+            scan::<M, 7>(buf, base, len, #[inline(always)] |f, _| {
                 if stage == 1 {
                     return;
                 }
@@ -640,48 +613,15 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
                     std::hint::black_box(id_hash(eid) ^ id_hash(r.uid));
                     return;
                 }
-                if stage == 4 {
-                    if r.status == 2 {
-                        std::hint::black_box(ctx.links.resolve(r.uid, id_hash(r.uid)));
-                    }
-                    return;
-                }
+                let ing = ing32(ctx, r.ing, escape);
                 if r.status == 2 {
-                    let hu = id_hash(r.uid);
-                    let slot = rn & (ctx.ring - 1);
-                    if rn >= ctx.ring {
-                        if stage == 5 {
-                            let p = &ring[slot];
-                            std::hint::black_box(ctx.links.resolve(p.uid, p.h));
-                        } else {
-                        emit_event(ctx, pw, dw, escape, &ring[slot]);
-                        }
-                    }
-                    if ctx.links.any {
-                        ctx.links.prefetch(hu);
-                    }
-                    ring[slot] = PendE { uid: r.uid, h: hu, ts: r.ts, pc: r.pc, eid, ing: ing32(ctx, r.ing, escape) };
-                    rn += 1;
+                    emit_event(ctx, pw, dw, escape, r.uid, r.ts, r.pc, eid, ing);
                 } else {
-                    dw.push(part_of(id_hash(eid), ctx.dbits), DRec { eid, ing: ing32(ctx, r.ing, escape), prec: NOPREC });
+                    dw.push(part_of(id_hash(eid), ctx.dbits), DRec { eid, ing, prec: NOPREC });
                 }
             });
-            for p in &ring[..rn.min(ctx.ring)] {
-                emit_event(ctx, pw, dw, escape, p);
-            }
         } else {
-            let mut ring = [PendC { uid: 0, h: 0, ts: 0, camp: 0, ptr: 0 }; RING];
-            let mut rn = 0usize;
-            let mut emit = |p: PendC| {
-                let (k, h) = if ctx.links.any {
-                    let k = ctx.links.resolve(p.uid, p.h);
-                    (k, if k == p.uid { p.h } else { id_hash(k) })
-                } else {
-                    (p.uid, p.h)
-                };
-                cw.push(part_of(h, ctx.pbits), CRec { k, ts: p.ts, camp: p.camp, ptr: p.ptr });
-            };
-            scan::<M, 4>(buf, base, len, |f, row| {
+            scan::<M, 4>(buf, base, len, #[inline(always)] |f, row| {
                 if f[0].1 == 0 || f[1].1 == 0 || f[2].1 == 0 {
                     return;
                 }
@@ -694,20 +634,8 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
                     return;
                 }
                 let uid = pack_id(f[1].0, f[1].1, lim);
-                let hu = id_hash(uid);
-                let slot = rn & (ctx.ring - 1);
-                if rn >= ctx.ring {
-                    emit(ring[slot]);
-                }
-                if ctx.links.any {
-                    ctx.links.prefetch(hu);
-                }
-                ring[slot] = PendC { uid, h: hu, ts: (ts - ctx.cbase) as u32, camp, ptr: (row as usize).wrapping_add(fix) };
-                rn += 1;
+                cw.push(part_of(id_hash(uid), ctx.pbits), CRec { k: uid, ts: (ts - ctx.cbase) as u32, camp, ptr: (row as usize).wrapping_add(fix) });
             });
-            for p in &ring[..rn.min(ctx.ring)] {
-                emit(*p);
-            }
         }
         if drop_after {
             drop_range(base, len);
@@ -754,7 +682,7 @@ pub fn run(inp: &Inputs, out: &Path, nthreads: usize, tm: &mut Timer) -> bool {
         return false;
     }
     let pregion = Region::new(pregion_bytes);
-    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links, products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_on("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion, ring: env_usize("SE_RING").unwrap_or(8).clamp(1, RING).next_power_of_two().min(RING) };
+    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links, products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_on("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion };
 
     if tm.on {
         eprintln!(
@@ -872,6 +800,64 @@ pub fn run(inp: &Inputs, out: &Path, nthreads: usize, tm: &mut Timer) -> bool {
         }
     });
     tm.lap("dedup");
+
+    // People. Until here a record sits in the partition of its user ID and carries that ID.
+    // Now each partition's records get their person's name; a record whose person hashes to
+    // another partition is cancelled in place and re-emitted there. The link table is
+    // partitioned by the same hash bits, so a partition's lookups stay within a small,
+    // cache-resident part of it (one random DRAM access per row when done while parsing).
+    if ctx.links.any {
+        let np = 1usize << ctx.pbits;
+        let next = AtomicUsize::new(0);
+        let (ev_ref, cl_ref) = (&ev, &cl);
+        let moved = par((0..nthreads).collect::<Vec<usize>>(), |_, _| {
+            let mut pw: Writers<PRec> = Writers::with_wc(np, PBLOCK, wc);
+            let mut cw: Writers<CRec> = Writers::with_wc(np, 128, wc);
+            loop {
+                let q = next.fetch_add(1, Relaxed);
+                if q >= np {
+                    break;
+                }
+                for p in ev_ref {
+                    for sl in p.slices(q) {
+                        for r in sl.iter_mut() {
+                            if r.ts == DEAD {
+                                continue;
+                            }
+                            let k = ctx.links.resolve(r.k, id_hash(r.k));
+                            let q2 = part_of(id_hash(k), ctx.pbits);
+                            if q2 != q {
+                                pw.push(q2, PRec { k, ts: r.ts, pc: r.pc });
+                                r.ts = DEAD;
+                            } else {
+                                r.k = k;
+                            }
+                        }
+                    }
+                }
+                for p in cl_ref {
+                    for sl in p.slices(q) {
+                        for r in sl.iter_mut() {
+                            let k = ctx.links.resolve(r.k, id_hash(r.k));
+                            let q2 = part_of(id_hash(k), ctx.pbits);
+                            if q2 != q {
+                                cw.push(q2, CRec { k, ts: r.ts, camp: r.camp, ptr: r.ptr });
+                                r.ts = DEAD;
+                            } else {
+                                r.k = k;
+                            }
+                        }
+                    }
+                }
+            }
+            (pw.finish(), cw.finish())
+        });
+        for (p, c) in moved {
+            ev.push(p);
+            cl.push(c);
+        }
+        tm.lap("resolve people");
+    }
 
     let accs = crate::person::run(&ctx, &ev, &cl, out, nthreads);
     tm.lap("person pass + user_daily");

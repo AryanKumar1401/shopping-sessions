@@ -341,7 +341,7 @@ def simplify(files, tester):
             try:
                 t = datetime.datetime.strptime(tok.decode(), "%Y-%m-%dT%H:%M:%S%z")
                 try_replace(tok, t.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ").encode())
-            except ValueError:
+            except (ValueError, OverflowError):
                 pass
     # ids: rename long ones to short ones (order-preserving rename is not guaranteed; the test decides)
     short = [b"u%d" % i for i in range(1, 200)]

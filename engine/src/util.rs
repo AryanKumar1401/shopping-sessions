@@ -590,9 +590,15 @@ pub unsafe fn pack_id(p: *const u8, len: usize, lim: *const u8) -> Id {
             let want = if len >= 8 { 0 } else { 0x8080_8080_8080_8080u64 << (8 * len as u32) };
             if ((lo | hi) & 0x8080_8080_8080_8080) == 0 && z == want && (len < 9 || hi != 0) {
                 let x = lo.swap_bytes();
-                let x = ((x & 0x7F00_7F00_7F00_7F00) >> 1) | (x & 0x007F_007F_007F_007F);
-                let x = ((x & 0x3FFF_0000_3FFF_0000) >> 2) | (x & 0x0000_3FFF_0000_3FFF);
-                let x = ((x & 0x0FFF_FFFF_0000_0000) >> 4) | (x & 0x0000_0000_0FFF_FFFF);
+                // drop the (zero) top bit of every byte: 8 bytes -> 56 bits
+                #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                let x = std::arch::x86_64::_pext_u64(x, 0x7F7F_7F7F_7F7F_7F7F);
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+                let x = {
+                    let x = ((x & 0x7F00_7F00_7F00_7F00) >> 1) | (x & 0x007F_007F_007F_007F);
+                    let x = ((x & 0x3FFF_0000_3FFF_0000) >> 2) | (x & 0x0000_3FFF_0000_3FFF);
+                    ((x & 0x0FFF_FFFF_0000_0000) >> 4) | (x & 0x0000_0000_0FFF_FFFF)
+                };
                 return (x << 7) | hi;
             }
         }

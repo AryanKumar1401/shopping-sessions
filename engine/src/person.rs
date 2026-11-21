@@ -275,6 +275,9 @@ fn do_part(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut
     for p in cl {
         for sl in p.slices(q) {
             for r in sl.iter() {
+                if r.ts == DEAD {
+                    continue; // moved to its person's partition
+                }
                 let idx = sc.find(r.k);
                 if idx != EMPTY {
                     sc.ccnt[idx as usize] += 1;
