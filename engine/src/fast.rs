@@ -76,7 +76,8 @@ pub struct Ctx {
     pub we: i64,
     /// `ws - 7 d`: the zero of relative timestamps.
     pub cbase: i64,
-    pub links: LinkTable,
+    /// Built on a background thread during parse and dedup; only the person pass reads it.
+    pub links: std::sync::OnceLock<LinkTable>,
     pub products: IdMap,
     pub unknown_cat: u32,
     pub cats: Vec<Vec<u8>>,
@@ -743,22 +744,36 @@ pub fn run(inp: &Inputs, out: &Path, nthreads: usize, tm: &mut Timer) -> bool {
         return false;
     }
     tm.lap("setup");
-    // The two small tables load on their own thread while the links are built.
-    let (links, (products, cats, unknown_cat), (campaigns, camp_names, camp_channels)) = std::thread::scope(|sc| {
-        let h = sc.spawn(|| (load_products(inp.products, level), load_campaigns(inp.campaigns, level)));
-        let links = build_links(&inp.links, level, nthreads);
-        let (p, c) = h.join().unwrap();
-        (links, p, c)
-    });
+    let (products, cats, unknown_cat) = load_products(inp.products, level);
+    let (campaigns, camp_names, camp_channels) = load_campaigns(inp.campaigns, level);
     // Fast-path preconditions (anything else goes to the general path in slow.rs):
     // category * PRICE_MUL + price fits u32; the dense [campaign][day] counters stay small;
-    // the link table's slot numbers fit u32.
+    // the link table's slot numbers fit u32 (checked when the background build joins).
     let days = ((inp.we - inp.ws) / DAY + 2) as usize;
     if cats.len() > MAX_CATS || (camp_names.len() + 1).saturating_mul(days) > (4 << 20) {
         return false;
     }
-    let Some(links) = links else { return false };
-    tm.lap("links+tables");
+    tm.lap("tables");
+    std::thread::scope(|sc| {
+        // Parse and dedup never look at links, so the link table builds alongside them.
+        let lt = env_usize("SE_LTHREADS").unwrap_or(2).max(1);
+        let lh = sc.spawn(move || build_links(&inp.links, level, lt));
+        run_rest(inp, out, nthreads, tm, level, cbase, (products, cats, unknown_cat), (campaigns, camp_names, camp_channels), lh)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rest(
+    inp: &Inputs,
+    out: &Path,
+    nthreads: usize,
+    tm: &mut Timer,
+    level: Level,
+    cbase: i64,
+    (products, cats, unknown_cat): (IdMap, Vec<Vec<u8>>, u32),
+    (campaigns, camp_names, camp_channels): (IdMap, Vec<Vec<u8>>, Vec<Vec<u8>>),
+    lh: std::thread::ScopedJoinHandle<'_, Option<LinkTable>>,
+) -> bool {
 
     let ev_bytes: usize = inp.events.iter().map(|f| f.len()).sum();
     let est_rows = ev_bytes / 75;
@@ -774,7 +789,7 @@ pub fn run(inp: &Inputs, out: &Path, nthreads: usize, tm: &mut Timer) -> bool {
         return false;
     }
     let pregion = Region::new(pregion_bytes);
-    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links, products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_on("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion };
+    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_on("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion };
 
     if tm.on {
         eprintln!(
@@ -783,7 +798,7 @@ pub fn run(inp: &Inputs, out: &Path, nthreads: usize, tm: &mut Timer) -> bool {
             1usize << pbits,
             ctx.cats.len(),
             ctx.camp_names.len(),
-            ctx.links.any
+            !inp.links.is_empty()
         );
     }
     let mut jobs = Vec::new();
@@ -892,6 +907,9 @@ pub fn run(inp: &Inputs, out: &Path, nthreads: usize, tm: &mut Timer) -> bool {
         }
     });
     tm.lap("dedup");
+    let Some(links) = lh.join().unwrap() else { return false };
+    let _ = ctx.links.set(links);
+    tm.lap("links (join)");
 
     // People: see person.rs. A record still sits in the partition of its user ID and carries
     // that ID; the per-person pass resolves the IDs itself, once per distinct ID.
