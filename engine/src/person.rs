@@ -661,17 +661,18 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
     sc.lap(1);
     // one link lookup per distinct ID
     sc.names.clear();
-    if ctx.links.any {
+    let links = ctx.links.get().unwrap();
+    if links.any {
         const AHEAD: usize = 8;
         for i in 0..nk.min(AHEAD) {
-            ctx.links.prefetch(id_hash(sc.keys[i]));
+            links.prefetch(id_hash(sc.keys[i]));
         }
         for i in 0..nk {
             if i + AHEAD < nk {
-                ctx.links.prefetch(id_hash(sc.keys[i + AHEAD]));
+                links.prefetch(id_hash(sc.keys[i + AHEAD]));
             }
             let k = sc.keys[i];
-            sc.names.push(ctx.links.lookup(k, id_hash(k)));
+            sc.names.push(links.lookup(k, id_hash(k)));
         }
     } else {
         sc.names.resize(nk, 0);
