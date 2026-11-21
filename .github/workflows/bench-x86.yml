@@ -1,50 +1,28 @@
-# Scratch: real-x86 crash test, correctness and A/B timing of engine candidates. Not for main.
+# Scratch: real-x86 probe of engine candidates (revs in bench/x86/revs). Not for main.
 name: bench-x86
 on: { push: { branches: [bench-x86] }, workflow_dispatch: {} }
 jobs:
   x86:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
-    env: { RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=+crt-static", T: x86_64-unknown-linux-gnu, PY: .venv/bin/python }
+    timeout-minutes: 45
+    env: { RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=+crt-static", T: x86_64-unknown-linux-gnu }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: cpu
-        run: lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core"; free -g
-      - name: build candidates
+      - name: setup
         run: |
-          mkdir -p out/perf
-          for rv in c4:2fe17ed head:ca6f306 p2:be88a48; do
-            n=${rv%%:*}; r=${rv##*:}
-            git worktree add -q /tmp/wt-$n $r
-            (cd /tmp/wt-$n/engine && CARGO_TARGET_DIR=/tmp/tgt cargo build -q --release --locked --target $T 2>/dev/null)
-            cp /tmp/tgt/$T/release/shopping-engine out/perf/$n
-          done
-          (cd /tmp/wt-head/engine && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_TARGET_DIR=/tmp/tgtd cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/tgtd/$T/release/shopping-engine /tmp/head-dbg)
-          (cd bench/x86/generator && RUSTFLAGS= cargo build -q --release && cp target/release/generate /tmp/generate)
-          python3 -m venv .venv && $PY -m pip -q install polars duckdb==1.5.6 pyarrow
+          lscpu | grep -E "Model name|^CPU\(s\)"
           sudo apt-get -qq install -y linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || true
           sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 || true
-      - name: correctness p2 (fixtures + oracle fuzz, both paths, few threads)
-        run: |
-          for d in fixtures fixtures_extra; do $PY scripts/run_fixtures.py $d -- out/perf/p2 | tail -1; done
-          $PY bench/qa_diff_spawn.py --seeds 0:400 --jobs 4 --quiet --no-shrink --impl "target=out/perf/p2" | tail -1
-          SE_SLOW=1 $PY bench/qa_diff_spawn.py --seeds 0:100 --jobs 4 --quiet --no-shrink --impl "target=out/perf/p2" | tail -1
-          for t in 1 2 3; do rm -rf /tmp/o; NCPU=$t out/perf/p2 fixtures/E1/input /tmp/o >/dev/null 2>&1; echo "p2 NCPU=$t rc=$?"; done
-      - name: datasets
-        run: |
-          /tmp/generate --seed 3 --events 20000000 --clicks 5000000 --output data/s3-20m >/dev/null
-          /tmp/generate --seed 5 --events 60000000 --clicks 15000000 --output data/s5-60m >/dev/null
-          du -sh data/*
+          (cd bench/x86/generator && RUSTFLAGS= cargo build -q --release && ./target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output ../../../data/s3-20m >/dev/null)
+          mkdir -p out/perf
+          for rv in $(cat bench/x86/revs); do
+            n=${rv%%:*}; r=${rv##*:}
+            git worktree add -q /tmp/wt-$n $r
+            (cd /tmp/wt-$n/engine && CARGO_TARGET_DIR=/tmp/tgt cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/tgt/$T/release/shopping-engine $GITHUB_WORKSPACE/out/perf/$n)
+            (cd /tmp/wt-$n/engine && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_TARGET_DIR=/tmp/tgtd cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/tgtd/$T/release/shopping-engine /tmp/$n-dbg)
+          done
       - name: bench 20M (interleaved)
-        run: $PY bench/bench.py --data data/s3-20m --reps 11 head=out/perf/head p2=out/perf/p2 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list)"
-      - name: profile head 20M (sections, perf)
-        run: |
-          SE_TIMING=1 out/perf/head data/s3-20m /tmp/o 2>&1 | grep -E "prof|timing"
-          sudo perf record -q -F 1999 -o /tmp/perf.data /tmp/head-dbg data/s3-20m /tmp/o 2>&1 | tail -2 || true
-          sudo perf report -i /tmp/perf.data --no-children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -40 || true
-          sudo timeout 900 perf report -i /tmp/perf.data --no-children --sort srcline --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -80 || true
-      - name: 60M vs c4
-        run: |
-          for n in c4 head p2; do rm -rf out/$n-60; /usr/bin/time -f "$n 60M %e s %M KB" out/perf/$n data/s5-60m out/$n-60; done
-          for n in head p2; do echo "$n s5-60m vs c4: $($PY scripts/compare.py out/$n-60 out/c4-60 | tail -1)"; done
+        run: python3 bench/bench.py --data data/s3-20m --reps 9 $(for rv in $(cat bench/x86/revs); do n=${rv%%:*}; echo "$n=out/perf/$n"; done) 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list|tables|links \(join)"
+      - name: probe
+        run: bench/x86/probe.sh
