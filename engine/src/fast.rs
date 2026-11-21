@@ -690,6 +690,37 @@ unsafe fn event_row(ev: &EvRow, r: &Row, cache: &mut DateCache, pw: &mut Writers
     }
 }
 
+/// One well-formed click line.
+#[inline(never)]
+unsafe fn click_row(ctx: &Ctx, lim: *const u8, fix: usize, r: &Row, cache: &mut DateCache, cw: &mut Writers<CRec>) {
+    unsafe {
+        if (r.ln[0] == 0) | (r.ln[1] == 0) | (r.ln[2] == 0) {
+            return;
+        }
+        let (p3, l3) = (r.ptr(3), r.len(3));
+        // 16 bytes can be read at every field unless the line is at the very end of the buffer
+        let roomy = p3 as usize + l3 + 24 <= lim as usize;
+        let ts = if (l3 == 20) & roomy {
+            let t = parse_f1(p3, cache);
+            if t == NONE { parse_ts_cold(p3, l3, cache) } else { t * 1000 }
+        } else if (l3 == 13) & roomy {
+            parse_f3_13(p3)
+        } else {
+            parse_ts_cold(p3, l3, cache)
+        };
+        // (a bad `ts` is NONE, which is below every window)
+        if (ts < ctx.cbase) | (ts >= ctx.we) {
+            return;
+        }
+        let (cid, uid) = if roomy { (pack_id16(r.ptr(2), r.len(2)), pack_id16(r.ptr(1), r.len(1))) } else { (pack_id(r.ptr(2), r.len(2), lim), pack_id(r.ptr(1), r.len(1), lim)) };
+        let camp = ctx.campaigns.get(cid);
+        if camp == u32::MAX {
+            return;
+        }
+        cw.push(part_of(id_hash(uid), ctx.pbits), CRec { k: uid, ts: (ts - ctx.cbase) as u32, camp, ptr: (r.start() as usize).wrapping_add(fix) });
+    }
+}
+
 #[inline(always)]
 unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
     unsafe {
@@ -713,21 +744,7 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
             let ev = EvRow { ctx, lim, stage: ctx.stage, fast_rows: ctx.ibase % 1000 == 0, ibase_s: ctx.ibase / 1000 };
             scan_rows::<M, 7>(buf, base, len, #[inline(always)] |r| event_row(&ev, r, cache, pw, dw, escape));
         } else {
-            scan::<M, 4>(buf, base, len, #[inline(always)] |f, row| {
-                if f[0].1 == 0 || f[1].1 == 0 || f[2].1 == 0 {
-                    return;
-                }
-                let ts = parse_ts(f[3].0, f[3].1, cache);
-                if ts == NONE || ts < ctx.cbase || ts >= ctx.we {
-                    return;
-                }
-                let camp = ctx.campaigns.get(pack_id(f[2].0, f[2].1, lim));
-                if camp == u32::MAX {
-                    return;
-                }
-                let uid = pack_id(f[1].0, f[1].1, lim);
-                cw.push(part_of(id_hash(uid), ctx.pbits), CRec { k: uid, ts: (ts - ctx.cbase) as u32, camp, ptr: (row as usize).wrapping_add(fix) });
-            });
+            scan_rows::<M, 4>(buf, base, len, #[inline(always)] |r| click_row(ctx, lim, fix, r, cache, cw));
         }
         if drop_after {
             drop_range(base, len);
