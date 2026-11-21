@@ -1,0 +1,9 @@
+--- a/engine/src/main.rs
++++ b/engine/src/main.rs
+@@ -69,5 +69,5 @@
+         util::release_all(nthreads);
+         tm.lap("release");
+     }
+-    unsafe { util::_exit(0) }
++    std::process::exit(0)
+ }

@@ -1,0 +1,21 @@
+diff --git a/engine/src/fast.rs b/engine/src/fast.rs
+index 68cfa3f..bf5ae48 100644
+--- a/engine/src/fast.rs
++++ b/engine/src/fast.rs
+@@ -806,8 +806,14 @@ fn run_rest(
+     let read = env_flag("SE_READ");
+     let chunk = chunk_bytes(2 << 20);
+     let rcap = if read { chunk + READ_SLACK + 64 } else { 0 };
+-    make_jobs(&inp.events, 0, chunk, read, &mut jobs);
+-    make_jobs(&inp.clicks, 1, chunk, read, &mut jobs);
++    // probe knob SE_SKIP=clicks|events (timing only: the output is wrong)
++    let skip = std::env::var("SE_SKIP").unwrap_or_default();
++    if skip != "events" {
++        make_jobs(&inp.events, 0, chunk, read, &mut jobs);
++    }
++    if skip != "clicks" {
++        make_jobs(&inp.clicks, 1, chunk, read, &mut jobs);
++    }
+     // Largest first is not needed: chunks are uniform. Interleave so that clicks spread out.
+     let nt = nthreads.min(jobs.len().max(1));
+     let next = AtomicUsize::new(0);

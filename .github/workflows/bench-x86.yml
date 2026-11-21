@@ -1,28 +1,44 @@
-# Scratch: real-x86 probe of engine candidates (revs in bench/x86/revs). Not for main.
+# Scratch: real-x86 probe of engine candidates. Not for main. This round: PGO, and the click writer knobs.
 name: bench-x86
 on: { push: { branches: [bench-x86] }, workflow_dispatch: {} }
 jobs:
   x86:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env: { RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=+crt-static", T: x86_64-unknown-linux-gnu }
+    env: { RF: "-C target-cpu=x86-64-v3 -C target-feature=+crt-static", T: x86_64-unknown-linux-gnu, BASE: be88a48 }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - name: setup
         run: |
           lscpu | grep -E "Model name|^CPU\(s\)"
-          sudo apt-get -qq install -y linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || true
-          sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 || true
-          (cd bench/x86/generator && RUSTFLAGS= cargo build -q --release && ./target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output ../../../data/s3-20m >/dev/null)
+          rustup component add llvm-tools-preview >/dev/null 2>&1
+          (cd bench/x86/generator && cargo build -q --release && for s in "3 20000000 5000000" "11 5000000 1250000"; do set -- $s; ./target/release/generate --seed $1 --events $2 --clicks $3 --output ../../../data/s$1 >/dev/null; done)
+          python3 -m venv /tmp/venv && /tmp/venv/bin/pip -q install polars pyarrow >/dev/null 2>&1
           mkdir -p out/perf
-          for rv in $(cat bench/x86/revs); do
-            n=${rv%%:*}; r=${rv##*:}
-            git worktree add -q /tmp/wt-$n $r
-            (cd /tmp/wt-$n/engine && CARGO_TARGET_DIR=/tmp/tgt cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/tgt/$T/release/shopping-engine $GITHUB_WORKSPACE/out/perf/$n)
-            (cd /tmp/wt-$n/engine && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_TARGET_DIR=/tmp/tgtd cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/tgtd/$T/release/shopping-engine /tmp/$n-dbg)
-          done
+      - name: build p2, skip, pgo
+        run: |
+          W=$GITHUB_WORKSPACE
+          git worktree add -q /tmp/wt $BASE
+          cd /tmp/wt/engine
+          RUSTFLAGS="$RF" CARGO_TARGET_DIR=/tmp/t-p2 cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/t-p2/$T/release/shopping-engine $W/out/perf/p2
+          git -C /tmp/wt apply $W/bench/x86/patches/skip.patch
+          RUSTFLAGS="$RF" CARGO_TARGET_DIR=/tmp/t-skip cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/t-skip/$T/release/shopping-engine $W/out/perf/skip
+          git -C /tmp/wt checkout -q -- . && git -C /tmp/wt apply $W/bench/x86/patches/exit.patch
+          RUSTFLAGS="$RF -Cprofile-generate=/tmp/pgo-data" CARGO_TARGET_DIR=/tmp/t-gen cargo build -q --release --locked --target $T 2>/dev/null
+          /tmp/t-gen/$T/release/shopping-engine $W/data/s11 /tmp/o-gen
+          ls -la /tmp/pgo-data
+          PD=$(ls -d $(rustc --print sysroot)/lib/rustlib/*/bin)/llvm-profdata
+          $PD merge -o /tmp/p.profdata /tmp/pgo-data && ls -la /tmp/p.profdata
+          git -C /tmp/wt checkout -q -- .
+          RUSTFLAGS="$RF -Cprofile-use=/tmp/p.profdata" CARGO_TARGET_DIR=/tmp/t-pgo cargo build -q --release --locked --target $T 2>&1 | grep -iE "warn.*profile|error" | head -5
+          cp /tmp/t-pgo/$T/release/shopping-engine $W/out/perf/pgo
+          rustc --version
+      - name: correctness pgo vs p2 (20M, 5M)
+        run: |
+          for d in s3 s11; do out/perf/p2 data/$d /tmp/a-$d >/dev/null 2>&1; out/perf/pgo data/$d /tmp/b-$d >/dev/null 2>&1; echo "pgo $d vs p2: $(/tmp/venv/bin/python scripts/compare.py /tmp/b-$d /tmp/a-$d 2>&1 | tail -1)"; done
       - name: bench 20M (interleaved)
-        run: python3 bench/bench.py --data data/s3-20m --reps 9 $(for rv in $(grep -v ^skip bench/x86/revs); do n=${rv%%:*}; echo "$n=out/perf/$n"; done) 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list|tables|links \(join)"
-      - name: probe
-        run: bench/x86/probe.sh
+        run: python3 bench/bench.py --data data/s3 --reps 11 p2=out/perf/p2 pgo=out/perf/pgo 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list|tables|links \(join)"
+      - name: click writer knobs (clicks only; parse wall, user; min of 5)
+        run: |
+          for wc in 1 0; do for pb in 9 6; do printf "SE_WC=$wc SE_PBITS=$pb  "; for i in 1 2 3 4 5; do SE_SKIP=events SE_WC=$wc SE_PBITS=$pb SE_TIMING=1 out/perf/skip data/s3 /tmp/o 2>&1 | grep 'parse events' | awk '{print $5, $8}'; done | sort -n | head -1; done; done
