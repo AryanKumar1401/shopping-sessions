@@ -1,0 +1,5 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+e1,u1,2026-10-03T23:45:00Z,2026-10-04T12:00:00Z,view,p1,
+e2,u1,2026-10-04T00:10:00Z,2026-10-04T12:00:00Z,purchase,p1,1000
+e3,u1,2026-10-04T00:30:00Z,2026-10-04T12:00:00Z,purchase,p2,200
+e4,u1,2026-10-04T09:00:00Z,2026-10-04T12:00:00Z,purchase,p2,5000

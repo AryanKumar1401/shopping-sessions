@@ -1,0 +1,8 @@
+downloads
+data
+out
+.venv
+.git
+**/target
+fixtures
+fixtures_extra

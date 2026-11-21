@@ -1,0 +1,4 @@
+campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions
+organic,organic,2026-11-30,1,0,0,0
+organic,organic,2026-12-01,1,0,0,0
+c_2,social,2026-12-01,1,0,0,1
