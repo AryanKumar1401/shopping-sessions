@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 const GAP: u32 = 1_800_000;
 const GROUP_ROWS: usize = 1 << 16;
+const LF: usize = 2;
 
 pub const UD_SCHEMA: [(&str, Kind); 6] = [
     ("user_id", Kind::Str),
@@ -60,14 +61,9 @@ struct Pu {
 
 /// Bytes of a run block. A run of at least a quarter of it gets a block of its own.
 const RUN_BLOCK: usize = 16 << 10;
-/// Run header: name u64, timestamps u32, purchases u32, clicks u32, flags u32. Then the
-/// timestamps (u32, padded to 8 bytes), the purchases (`Pu`), the clicks (`Clk`).
+/// Run header: name u64, timestamps u32, purchases u32, clicks u32, 0u32. Then the
+/// timestamps (u32, unsorted, padded to 8 bytes), the purchases (`Pu`, sorted), the clicks (`Clk`).
 const RUN_HDR: usize = 24;
-/// Flag: the timestamps are not sorted.
-const F_UNSORTED: u32 = 1;
-/// Pass A sorts the timestamps of a run shorter than this; longer ones are sorted once, after
-/// pass B has put the person's runs together.
-const SORT_IN_A: usize = 2048;
 
 #[inline(always)]
 fn run_bytes(nts: usize, npu: usize, ncl: usize) -> usize {
@@ -141,11 +137,13 @@ struct Out {
     day_off: u64,
     organic: usize,
     acc: Vec<[u64; 4]>,
-    /// Assisted-session counts `[campaign][day]`, kept apart and narrow: about ten of these
-    /// are bumped per session, at random places. Folded into `acc` by `fold_assists`.
-    ass: Vec<u32>,
-    /// Sessions counted into `ass` since the last fold (an upper bound).
-    ass_n: u64,
+    /// The counters every session touches, `[campaign][day] -> [assisted, credited]` sessions,
+    /// kept apart and narrow so that they stay in the core's cache: a session bumps about ten
+    /// assists at random campaigns, and its credited campaign is one of them. Folded into
+    /// `acc` (`fold_hot`) before any counter can pass u16.
+    hot: Vec<[u16; 2]>,
+    /// Sessions counted into `hot` since the last fold.
+    hot_n: u32,
     acnt: Vec<u32>,
     apos: Vec<u32>,
     active: Vec<u32>,
@@ -159,30 +157,42 @@ struct Out {
 unsafe impl Send for Out {}
 
 impl Out {
-    fn fold_assists(&mut self) {
-        for (a, x) in self.acc.iter_mut().zip(self.ass.iter_mut()) {
-            a[3] += *x as u64;
-            *x = 0;
+    #[cold]
+    #[inline(never)]
+    fn fold_hot(&mut self) {
+        for (a, x) in self.acc.iter_mut().zip(self.hot.iter_mut()) {
+            a[3] += x[0] as u64;
+            a[0] += x[1] as u64;
+            *x = [0, 0];
         }
-        self.ass_n = 0;
-    }
-    /// Call before a partition that can add at most `n` sessions: no counter of `ass` can pass u32.
-    fn guard(&mut self, n: usize) {
-        if self.ass_n + n as u64 >= u32::MAX as u64 {
-            self.fold_assists();
-        }
-        self.ass_n += n as u64;
+        self.hot_n = 0;
     }
     #[inline(always)]
     fn flush_row(&mut self, ctx: &Ctx, name: Id, day: u32, sess: u64, events: u64, rev: u64) {
         if self.name.is_empty() {
             id_bytes(name, &mut self.name);
+            self.name.reserve(16);
         }
-        self.cols[0].push_str(&self.name);
-        self.cols[1].push_i32((self.day0 + day as i64) as i32);
-        self.cols[2].push_i64(sess as i64);
-        self.cols[3].push_i64(events as i64);
-        self.cols[4].push_i64(rev as i64);
+        unsafe {
+            // fixed-width columns have room for the whole group (`reserve_group`)
+            let nl = self.name.len();
+            let c0 = &mut self.cols[0].data;
+            c0.reserve(4 + nl + 16);
+            let l0 = c0.len();
+            let p = c0.as_mut_ptr().add(l0);
+            (p as *mut u32).write_unaligned(nl as u32);
+            // `name` has at least 16 readable bytes
+            std::ptr::copy_nonoverlapping(self.name.as_ptr(), p.add(4), 16);
+            if nl > 16 {
+                std::ptr::copy_nonoverlapping(self.name.as_ptr(), p.add(4), nl);
+            }
+            c0.set_len(l0 + 4 + nl);
+            let r = self.rows;
+            (self.cols[1].data.as_mut_ptr().add(r * 4) as *mut i32).write_unaligned((self.day0 + day as i64) as i32);
+            (self.cols[2].data.as_mut_ptr().add(r * 8) as *mut i64).write_unaligned(sess as i64);
+            (self.cols[3].data.as_mut_ptr().add(r * 8) as *mut i64).write_unaligned(events as i64);
+            (self.cols[4].data.as_mut_ptr().add(r * 8) as *mut i64).write_unaligned(rev as i64);
+        }
         let mut best = u32::MAX;
         if !self.touched.is_empty() {
             let mut best_sum = 0u64;
@@ -202,52 +212,43 @@ impl Out {
         }
         self.rows += 1;
         if self.rows >= GROUP_ROWS {
-            self.file.write_group(&mut self.cols, self.rows).expect("write user_daily");
-            self.rows = 0;
+            self.write_group();
         }
+    }
+    fn reserve_group(&mut self) {
+        self.cols[1].data.reserve(GROUP_ROWS * 4);
+        for c in 2..5 {
+            self.cols[c].data.reserve(GROUP_ROWS * 8);
+        }
+    }
+    fn write_group(&mut self) {
+        unsafe {
+            self.cols[1].data.set_len(self.rows * 4);
+            for c in 2..5 {
+                self.cols[c].data.set_len(self.rows * 8);
+            }
+        }
+        self.file.write_group(&mut self.cols, self.rows).expect("write user_daily");
+        self.rows = 0;
+        self.reserve_group();
     }
 }
 
-/// One person: `t` = their events' timestamps, sorted, not empty; `pu` = their purchases
-/// sorted by timestamp; `cl` = their clicks sorted by timestamp.
+/// One person: `sess` = their sessions in order, not empty; `pu` = their purchases sorted by
+/// timestamp; `cl` = their clicks sorted by timestamp.
 #[inline(always)]
-fn person(ctx: &Ctx, o: &mut Out, name: Id, t: &[u32], pu: &[Pu], cl: &[Clk]) {
-    let n = t.len();
+fn person(ctx: &Ctx, o: &mut Out, name: Id, sess: &[Sess], pu: &[Pu], cl: &[Clk]) {
     let (nd, organic, day_off) = (o.nd, o.organic, o.day_off);
     o.name.clear();
     let (mut lo, mut hi) = (0usize, 0usize);
     let mut pj = 0usize;
-    let mut cur_day = u32::MAX;
+    let mut cur_day = ((sess[0].start as u64 + day_off) / DAY as u64) as u32;
     let (mut d_sess, mut d_events, mut d_rev) = (0u64, 0u64, 0u64);
-    let mut i = 0usize;
-    loop {
-        // the next session: events i..j, from `start` to `end`
-        let (mut start, mut end, mut cnt, mut day) = (0u32, 0u32, 0usize, u32::MAX);
-        if i < n {
-            unsafe {
-                start = *t.get_unchecked(i);
-                end = start;
-                let mut j = i + 1;
-                while j < n {
-                    let x = *t.get_unchecked(j);
-                    if x - end > GAP {
-                        break;
-                    }
-                    end = x;
-                    j += 1;
-                }
-                cnt = j - i;
-                i = j;
-            }
-            day = ((start as u64 + day_off) / DAY as u64) as u32;
-        }
+    for se in sess {
+        let (start, end, cnt) = (se.start, se.end, se.n);
+        let day = ((start as u64 + day_off) / DAY as u64) as u32;
         if day != cur_day {
-            if cur_day != u32::MAX {
-                o.flush_row(ctx, name, cur_day, d_sess, d_events, d_rev);
-            }
-            if day == u32::MAX {
-                break;
-            }
+            o.flush_row(ctx, name, cur_day, d_sess, d_events, d_rev);
             cur_day = day;
             d_sess = 0;
             d_events = 0;
@@ -294,30 +295,46 @@ fn person(ctx: &Ctx, o: &mut Out, name: Id, t: &[u32], pu: &[Pu], cl: &[Clk]) {
                 let top = cl[hi - 1];
                 camp = top.camp as usize;
                 if hi - lo >= 2 && cl[hi - 2].ts == top.ts {
-                    let mut best = unsafe { click_id(top.ptr) };
+                    // Several clicks at the latest timestamp: the smallest click_id wins. The
+                    // IDs are only read (from the file) when the tied clicks disagree on the
+                    // campaign; copies of one click never do.
                     let mut k = hi - 1;
+                    let mut differ = false;
                     while k > lo && cl[k - 1].ts == top.ts {
                         k -= 1;
-                        let id = unsafe { click_id(cl[k].ptr) };
-                        if id < best {
-                            best = id;
-                            camp = cl[k].camp as usize;
+                        differ |= cl[k].camp != top.camp;
+                    }
+                    if differ {
+                        let mut best = unsafe { click_id(top.ptr) };
+                        for c in &cl[k..hi - 1] {
+                            let id = unsafe { click_id(c.ptr) };
+                            if id < best {
+                                best = id;
+                                camp = c.camp as usize;
+                            }
                         }
                     }
                 }
                 for &c in &o.active {
-                    unsafe { *o.ass.get_unchecked_mut(c as usize * nd + di) += 1 };
+                    unsafe { o.hot.get_unchecked_mut(c as usize * nd + di)[0] += 1 };
                 }
             }
         }
-        let acc = &mut o.acc[camp * nd + di];
-        acc[0] += 1;
-        acc[1] += (rev > 0) as u64;
-        acc[2] += rev;
+        o.hot[camp * nd + di][1] += 1;
+        if rev > 0 {
+            let acc = &mut o.acc[camp * nd + di];
+            acc[1] += 1;
+            acc[2] += rev;
+        }
+        o.hot_n += 1;
+        if o.hot_n == u16::MAX as u32 {
+            o.fold_hot();
+        }
         d_sess += 1;
         d_events += cnt as u64;
         d_rev += rev;
     }
+    o.flush_row(ctx, name, cur_day, d_sess, d_events, d_rev);
     for k in lo..hi {
         o.acnt[cl[k].camp as usize] = 0;
     }
@@ -343,8 +360,8 @@ struct Scratch {
     pidx: Vec<u32>,
     tstmp: Vec<u32>,
     ts: Vec<u32>,
-    tmp: Vec<u32>,
-    bounds: Vec<u32>,
+    sess: Vec<Sess>,
+    bk: Buckets,
     purch: Vec<(u64, u32)>,
     pu: Vec<Pu>,
     coff: Vec<u32>,
@@ -352,10 +369,13 @@ struct Scratch {
     clk: Vec<Clk>,
     runs: Vec<(u32, usize)>,
     rp: Vec<usize>,
+    /// Section times in ns (SE_TIMING).
+    prof: [u64; 16],
+    t0: std::time::Instant,
 }
 
 impl Scratch {
-    fn new() -> Self {
+    fn new(span: u32) -> Self {
         Scratch {
             slots: vec![(0, 0); 4096],
             mask: 4095,
@@ -369,8 +389,8 @@ impl Scratch {
             pidx: Vec::new(),
             tstmp: Vec::new(),
             ts: Vec::new(),
-            tmp: Vec::new(),
-            bounds: Vec::new(),
+            sess: Vec::new(),
+            bk: Buckets::new(span),
             purch: Vec::new(),
             pu: Vec::new(),
             coff: Vec::new(),
@@ -378,7 +398,15 @@ impl Scratch {
             clk: Vec::new(),
             runs: Vec::new(),
             rp: Vec::new(),
+            prof: [0; 16],
+            t0: std::time::Instant::now(),
         }
+    }
+    #[inline(always)]
+    fn lap(&mut self, i: usize) {
+        let n = std::time::Instant::now();
+        self.prof[i] += (n - self.t0).as_nanos() as u64;
+        self.t0 = n;
     }
     fn reset(&mut self) {
         for &s in &self.kslot {
@@ -412,7 +440,7 @@ impl Scratch {
         self.kslot.push(i as u32);
         self.cnt.push(0);
         self.ccnt.push(0);
-        if self.keys.len() * 2 > self.slots.len() {
+        if self.keys.len() * LF > self.slots.len() {
             self.grow();
         }
         idx
@@ -435,78 +463,6 @@ impl Scratch {
 }
 
 #[inline]
-fn sort_u32(t: &mut [u32], tmp: &mut Vec<u32>) {
-    let n = t.len();
-    if n <= 24 {
-        for i in 1..n {
-            let x = t[i];
-            let mut j = i;
-            while j > 0 && t[j - 1] > x {
-                t[j] = t[j - 1];
-                j -= 1;
-            }
-            t[j] = x;
-        }
-    } else if n < 2048 {
-        t.sort_unstable();
-    } else {
-        radix_sort(t, tmp);
-    }
-}
-
-/// LSD radix sort, 11 bits a pass, skipping passes where every key shares the digit.
-fn radix_sort(t: &mut [u32], tmp: &mut Vec<u32>) {
-    let n = t.len();
-    tmp.clear();
-    tmp.resize(n, 0);
-    let mut hist = vec![[0u32; 2048]; 3];
-    for &x in t.iter() {
-        hist[0][(x & 2047) as usize] += 1;
-        hist[1][((x >> 11) & 2047) as usize] += 1;
-        hist[2][(x >> 22) as usize] += 1;
-    }
-    let mut src_is_t = true;
-    for pass in 0..3 {
-        let h = &mut hist[pass];
-        if h.iter().any(|&c| c as usize == n) {
-            continue;
-        }
-        let mut sum = 0u32;
-        for c in h.iter_mut() {
-            let v = *c;
-            *c = sum;
-            sum += v;
-        }
-        let shift = 11 * pass as u32;
-        let (src, dst): (&[u32], &mut [u32]) = if src_is_t { (&*t, &mut tmp[..]) } else { (&tmp[..], &mut *t) };
-        // SAFETY: src and dst are distinct buffers.
-        let src: &[u32] = unsafe { std::slice::from_raw_parts(src.as_ptr(), n) };
-        for &x in src {
-            let d = ((x >> shift) & 2047) as usize;
-            dst[h[d] as usize] = x;
-            h[d] += 1;
-        }
-        src_is_t = !src_is_t;
-    }
-    if !src_is_t {
-        t.copy_from_slice(&tmp[..]);
-    }
-}
-
-/// The click_id of the click line at `ptr`.
-unsafe fn click_id(ptr: usize) -> &'static [u8] {
-    unsafe {
-        let p = ptr as *const u8;
-        let mut n = 0;
-        while *p.add(n) != b',' {
-            n += 1;
-        }
-        if n >= 2 && *p == b'"' { std::slice::from_raw_parts(p.add(1), n - 2) } else { std::slice::from_raw_parts(p, n) }
-    }
-}
-
-
-#[inline]
 fn sort_clicks(c: &mut [Clk]) {
     if c.len() <= 16 {
         for i in 1..c.len() {
@@ -523,48 +479,119 @@ fn sort_clicks(c: &mut [Clk]) {
     }
 }
 
-/// Merges the sorted runs `t[bounds[i]..bounds[i + 1]]` (bounds starts with 0 and ends with
-/// `t.len()`) into one sorted sequence in `t`.
-fn merge_runs(t: &mut Vec<u32>, tmp: &mut Vec<u32>, bounds: &mut Vec<u32>) {
-    let n = t.len();
-    tmp.clear();
-    tmp.resize(n, 0);
-    while bounds.len() > 2 {
-        let nb = bounds.len() - 1;
-        let mut w = 1;
-        let mut r = 0;
-        while r < nb {
-            let a0 = bounds[r] as usize;
-            if r + 1 < nb {
-                let (a1, b1) = (bounds[r + 1] as usize, bounds[r + 2] as usize);
-                let (mut i, mut j, mut o) = (a0, a1, a0);
-                unsafe {
-                    while i < a1 && j < b1 {
-                        let (x, y) = (*t.get_unchecked(i), *t.get_unchecked(j));
-                        let tb = y < x;
-                        *tmp.get_unchecked_mut(o) = if tb { y } else { x };
-                        i += !tb as usize;
-                        j += tb as usize;
-                        o += 1;
-                    }
-                }
-                tmp[o..o + (a1 - i)].copy_from_slice(&t[i..a1]);
-                o += a1 - i;
-                tmp[o..o + (b1 - j)].copy_from_slice(&t[j..b1]);
-                bounds[w] = b1 as u32;
-                r += 2;
-            } else {
-                let b0 = bounds[r + 1] as usize;
-                tmp[a0..b0].copy_from_slice(&t[a0..b0]);
-                bounds[w] = b0 as u32;
-                r += 1;
+#[derive(Clone, Copy)]
+struct Sess {
+    start: u32,
+    end: u32,
+    n: u32,
+}
+
+/// Width of a time bucket. Two timestamps in one bucket are less than `GAP` apart, so they are
+/// in one session whatever lies between them; two timestamps in buckets that are not
+/// neighbours are more than `GAP` apart with nothing in between, so they are not (unless the
+/// buckets in between chain them). Hence a person's sessions follow from the smallest and
+/// largest timestamp and the event count of each bucket, and no timestamp is ever sorted.
+const BW: u32 = GAP;
+/// People with at most this many events are sorted instead.
+const SMALL: usize = 8;
+
+/// Sessions of one person from unsorted timestamps.
+struct Buckets {
+    /// per bucket: [smallest ts, largest ts, events]; an unused bucket is [MAX, 0, 0]
+    b: Vec<[u32; 3]>,
+    /// which buckets are in use
+    bm: Vec<u64>,
+}
+
+impl Buckets {
+    /// `span`: every timestamp is below it.
+    fn new(span: u32) -> Self {
+        let nb = (span / BW) as usize + 1;
+        Buckets { b: vec![[u32::MAX, 0, 0]; nb], bm: vec![0; nb.div_ceil(64)] }
+    }
+    #[inline(always)]
+    fn add(&mut self, t: &[u32]) {
+        for &x in t {
+            let b = (x / BW) as usize;
+            unsafe {
+                let e = self.b.get_unchecked_mut(b);
+                e[0] = e[0].min(x);
+                e[1] = e[1].max(x);
+                e[2] += 1;
+                *self.bm.get_unchecked_mut(b >> 6) |= 1u64 << (b & 63);
             }
-            w += 1;
         }
-        bounds.truncate(w);
-        std::mem::swap(t, tmp);
+    }
+    /// Writes the sessions of the timestamps added so far to `sess` and empties the buckets.
+    #[inline(always)]
+    fn drain(&mut self, sess: &mut Vec<Sess>) {
+        sess.clear();
+        let mut cur = Sess { start: 0, end: 0, n: 0 };
+        for w in 0..self.bm.len() {
+            let mut m = self.bm[w];
+            if m == 0 {
+                continue;
+            }
+            self.bm[w] = 0;
+            while m != 0 {
+                let b = w * 64 + m.trailing_zeros() as usize;
+                m &= m - 1;
+                let e = std::mem::replace(unsafe { self.b.get_unchecked_mut(b) }, [u32::MAX, 0, 0]);
+                if cur.n != 0 && e[0] - cur.end > GAP {
+                    sess.push(cur);
+                    cur.n = 0;
+                }
+                if cur.n == 0 {
+                    cur.start = e[0];
+                }
+                cur.end = e[1];
+                cur.n += e[2];
+            }
+        }
+        if cur.n != 0 {
+            sess.push(cur);
+        }
     }
 }
+
+/// Sessions of a few timestamps: sorts `t`.
+#[inline(always)]
+fn sessions_small(t: &mut [u32], sess: &mut Vec<Sess>) {
+    sess.clear();
+    let n = t.len();
+    for i in 1..n {
+        let x = t[i];
+        let mut j = i;
+        while j > 0 && t[j - 1] > x {
+            t[j] = t[j - 1];
+            j -= 1;
+        }
+        t[j] = x;
+    }
+    let mut cur = Sess { start: t[0], end: t[0], n: 0 };
+    for &x in t.iter() {
+        if x - cur.end > GAP {
+            sess.push(cur);
+            cur = Sess { start: x, end: x, n: 0 };
+        }
+        cur.end = x;
+        cur.n += 1;
+    }
+    sess.push(cur);
+}
+
+/// The click_id of the click line at `ptr`.
+unsafe fn click_id(ptr: usize) -> &'static [u8] {
+    unsafe {
+        let p = ptr as *const u8;
+        let mut n = 0;
+        while *p.add(n) != b',' {
+            n += 1;
+        }
+        if n >= 2 && *p == b'"' { std::slice::from_raw_parts(p.add(1), n - 2) } else { std::slice::from_raw_parts(p, n) }
+    }
+}
+
 
 // ---------------------------------------------------------------- pass A
 
@@ -574,7 +601,7 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
     if n + nc == 0 {
         return;
     }
-    o.guard(n);
+    sc.t0 = std::time::Instant::now();
     sc.reset();
     sc.purch.clear();
     sc.pidx.clear();
@@ -609,6 +636,7 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
         }
     }
     let n = m;
+    sc.lap(0);
     // clicks: count per ID
     sc.cidx.clear();
     sc.cidx.reserve(nc);
@@ -630,6 +658,7 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
         unsafe { sc.cidx.set_len(m) };
     }
     let nk = sc.keys.len();
+    sc.lap(1);
     // one link lookup per distinct ID
     sc.names.clear();
     if ctx.links.any {
@@ -647,6 +676,7 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
     } else {
         sc.names.resize(nk, 0);
     }
+    sc.lap(2);
     // timestamps grouped by ID
     sc.off.clear();
     sc.cur.clear();
@@ -669,6 +699,7 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
         }
         sc.ts.set_len(n);
     }
+    sc.lap(3);
     // clicks grouped by ID
     sc.coff.clear();
     sc.cur.clear();
@@ -697,6 +728,7 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
         }
         sc.clk.set_len(nc);
     }
+    sc.lap(4);
     // purchases by (ID, timestamp)
     sc.pu.clear();
     if !sc.purch.is_empty() {
@@ -705,49 +737,66 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
             sc.pu.push(Pu { ts: k as u32, pc });
         }
     }
-    let mut pcur = 0usize;
+    sc.lap(5);
+    // the first purchase of every ID
+    sc.cur.clear();
+    sc.cur.resize(nk + 1, 0);
+    for &(k, _) in &sc.purch {
+        sc.cur[(k >> 32) as usize + 1] += 1;
+    }
+    for i in 0..nk {
+        sc.cur[i + 1] += sc.cur[i];
+    }
+    // people of their own
     for i in 0..nk {
         let (a, b) = (sc.off[i] as usize, sc.off[i + 1] as usize);
-        let (ca, cb) = (sc.coff[i] as usize, sc.coff[i + 1] as usize);
-        let pa = pcur;
-        while pcur < sc.purch.len() && (sc.purch[pcur].0 >> 32) as usize == i {
-            pcur += 1;
+        if sc.names[i] != 0 || a == b {
+            continue;
         }
+        let (ca, cb) = (sc.coff[i] as usize, sc.coff[i + 1] as usize);
+        let (pa, pb) = (sc.cur[i] as usize, sc.cur[i + 1] as usize);
+        if b - a <= SMALL {
+            sessions_small(&mut sc.ts[a..b], &mut sc.sess);
+        } else {
+            sc.bk.add(&sc.ts[a..b]);
+            sc.bk.drain(&mut sc.sess);
+        }
+        sort_clicks(&mut sc.clk[ca..cb]);
+        person(ctx, o, sc.keys[i], &sc.sess, &sc.pu[pa..pb], &sc.clk[ca..cb]);
+    }
+    sc.lap(7);
+    // linked IDs: one run each, to the partition of the person's name
+    for i in 0..nk {
         let name = sc.names[i];
         if name == 0 {
-            // a person of their own
-            if a == b {
-                continue;
-            }
-            sort_u32(&mut sc.ts[a..b], &mut sc.tmp);
-            sort_clicks(&mut sc.clk[ca..cb]);
-            person(ctx, o, sc.keys[i], &sc.ts[a..b], &sc.pu[pa..pcur], &sc.clk[ca..cb]);
-        } else {
-            let (nts, npu, ncl) = (b - a, pcur - pa, cb - ca);
-            let mut flags = 0;
-            if nts < SORT_IN_A {
-                sort_u32(&mut sc.ts[a..b], &mut sc.tmp);
-            } else {
-                flags = F_UNSORTED;
-            }
-            let d = part_of(id_hash(name), ctx.pbits);
-            let p = runs.alloc(d, run_bytes(nts, npu, ncl));
-            unsafe {
-                (p as *mut u64).write(name);
-                let h = p.add(8) as *mut u32;
-                h.write(nts as u32);
-                h.add(1).write(npu as u32);
-                h.add(2).write(ncl as u32);
-                h.add(3).write(flags);
-                let mut w = p.add(RUN_HDR);
-                std::ptr::copy_nonoverlapping(sc.ts.as_ptr().add(a), w as *mut u32, nts);
-                w = w.add((nts * 4 + 7) & !7);
-                std::ptr::copy_nonoverlapping(sc.pu.as_ptr().add(pa), w as *mut Pu, npu);
-                w = w.add(npu * 8);
-                std::ptr::copy_nonoverlapping(sc.clk.as_ptr().add(ca), w as *mut Clk, ncl);
-            }
+            continue;
+        }
+        let (a, b) = (sc.off[i] as usize, sc.off[i + 1] as usize);
+        let (ca, cb) = (sc.coff[i] as usize, sc.coff[i + 1] as usize);
+        let (pa, pb) = (sc.cur[i] as usize, sc.cur[i + 1] as usize);
+        let (nts, npu, ncl) = (b - a, pb - pa, cb - ca);
+        if i + 4 < nk && sc.names[i + 4] != 0 {
+            let d = part_of(id_hash(sc.names[i + 4]), ctx.pbits);
+            prefetch(runs.heads[d].0 as *const u8);
+        }
+        let d = part_of(id_hash(name), ctx.pbits);
+        let p = runs.alloc(d, run_bytes(nts, npu, ncl));
+        unsafe {
+            (p as *mut u64).write(name);
+            let h = p.add(8) as *mut u32;
+            h.write(nts as u32);
+            h.add(1).write(npu as u32);
+            h.add(2).write(ncl as u32);
+            h.add(3).write(0);
+            let mut w = p.add(RUN_HDR);
+            std::ptr::copy_nonoverlapping(sc.ts.as_ptr().add(a), w as *mut u32, nts);
+            w = w.add((nts * 4 + 7) & !7);
+            std::ptr::copy_nonoverlapping(sc.pu.as_ptr().add(pa), w as *mut Pu, npu);
+            w = w.add(npu * 8);
+            std::ptr::copy_nonoverlapping(sc.clk.as_ptr().add(ca), w as *mut Clk, ncl);
         }
     }
+    sc.lap(8);
 }
 
 // ---------------------------------------------------------------- pass B
@@ -758,17 +807,17 @@ struct Hdr {
     nts: usize,
     npu: usize,
     ncl: usize,
-    flags: u32,
 }
 #[inline(always)]
 unsafe fn hdr(p: usize) -> Hdr {
     unsafe {
         let h = (p + 8) as *const u32;
-        Hdr { name: *(p as *const u64), nts: *h as usize, npu: *h.add(1) as usize, ncl: *h.add(2) as usize, flags: *h.add(3) }
+        Hdr { name: *(p as *const u64), nts: *h as usize, npu: *h.add(1) as usize, ncl: *h.add(2) as usize }
     }
 }
 
 fn pass_b(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], sc: &mut Scratch, o: &mut Out) {
+    sc.t0 = std::time::Instant::now();
     sc.reset();
     sc.runs.clear();
     let mut total = 0usize;
@@ -788,7 +837,6 @@ fn pass_b(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], sc: &mut Scr
     if total == 0 {
         return;
     }
-    o.guard(total);
     let nk = sc.keys.len();
     sc.off.clear();
     sc.cur.clear();
@@ -806,30 +854,24 @@ fn pass_b(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], sc: &mut Scr
         sc.rp[*c as usize] = p;
         *c += 1;
     }
+    sc.lap(9);
     for i in 0..nk {
         let rs = &sc.rp[sc.off[i] as usize..sc.off[i + 1] as usize];
         let mut nts = 0usize;
-        let (mut kts, mut kpu, mut kcl) = (0usize, 0usize, 0usize);
-        let mut unsorted = false;
+        let (mut kpu, mut kcl) = (0usize, 0usize);
         for &r in rs {
             let h = unsafe { hdr(r) };
             nts += h.nts;
-            kts += (h.nts > 0) as usize;
             kpu += (h.npu > 0) as usize;
             kcl += (h.ncl > 0) as usize;
-            unsorted |= h.nts > 0 && h.flags & F_UNSORTED != 0;
         }
         if nts == 0 {
             continue;
         }
-        let (mut t_one, mut pu_one, mut cl_one): (&[u32], &[Pu], &mut [Clk]) = (&[], &[], &mut []);
-        let (direct_t, direct_pu, direct_cl) = (kts == 1 && !unsorted, kpu <= 1, kcl <= 1);
-        if !direct_t {
-            sc.ts.clear();
-            sc.ts.reserve(nts);
-            sc.bounds.clear();
-            sc.bounds.push(0);
-        }
+        let (mut pu_one, mut cl_one): (&[Pu], &mut [Clk]) = (&[], &mut []);
+        let (small, direct_pu, direct_cl) = (nts <= SMALL, kpu <= 1, kcl <= 1);
+        let mut few = [0u32; SMALL];
+        let mut nfew = 0usize;
         if !direct_pu {
             sc.pu.clear();
         }
@@ -843,12 +885,12 @@ fn pass_b(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], sc: &mut Scr
                 let pp = (r + RUN_HDR + ((h.nts * 4 + 7) & !7)) as *const Pu;
                 let cp = (pp as usize + h.npu * 8) as *mut Clk;
                 if h.nts > 0 {
-                    let s = std::slice::from_raw_parts(tp, h.nts);
-                    if direct_t {
-                        t_one = s;
+                    let t = std::slice::from_raw_parts(tp, h.nts);
+                    if small {
+                        few[nfew..nfew + h.nts].copy_from_slice(t);
+                        nfew += h.nts;
                     } else {
-                        sc.ts.extend_from_slice(s);
-                        sc.bounds.push(sc.ts.len() as u32);
+                        sc.bk.add(t);
                     }
                 }
                 if h.npu > 0 {
@@ -869,16 +911,11 @@ fn pass_b(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], sc: &mut Scr
                 }
             }
         }
-        let t: &[u32] = if direct_t {
-            t_one
+        if small {
+            sessions_small(&mut few[..nfew], &mut sc.sess);
         } else {
-            if nts <= 24 || unsorted || kts > 8 {
-                sort_u32(&mut sc.ts, &mut sc.tmp);
-            } else {
-                merge_runs(&mut sc.ts, &mut sc.tmp, &mut sc.bounds);
-            }
-            &sc.ts
-        };
+            sc.bk.drain(&mut sc.sess);
+        }
         let pu: &[Pu] = if direct_pu {
             pu_one
         } else {
@@ -892,8 +929,9 @@ fn pass_b(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], sc: &mut Scr
             sort_clicks(&mut sc.clk);
             &sc.clk
         };
-        person(ctx, o, sc.keys[i], t, pu, cl);
+        person(ctx, o, sc.keys[i], &sc.sess, pu, cl);
     }
+    sc.lap(10);
 }
 
 fn day_params(ctx: &Ctx) -> (usize, i64, u64) {
@@ -929,19 +967,20 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
             day_off,
             organic: ncamp,
             acc: vec![[0; 4]; (ncamp + 1) * nd.max(1)],
-            ass: vec![0; (ncamp + 1) * nd.max(1)],
-            ass_n: 0,
+            hot: vec![[0; 2]; (ncamp + 1) * nd.max(1)],
+            hot_n: 0,
             acnt: vec![0; ncamp],
             apos: vec![0; ncamp],
             active: Vec::new(),
             catsum: vec![0; ctx.cats.len()],
             touched: Vec::new(),
-            name: Vec::new(),
+            name: Vec::with_capacity(32),
             cols: UD_SCHEMA.iter().map(|&(_, k)| Col::new(k)).collect(),
             rows: 0,
             file,
         };
-        let mut sc = Scratch::new();
+        o.reserve_group();
+        let mut sc = Scratch::new((ctx.we - ctx.cbase) as u32);
         let mut runs = RunOut::new(np);
         loop {
             let j = next.fetch_add(1, Relaxed);
@@ -970,11 +1009,19 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
             }
             pass_b(ctx, order[j] as usize, blocks, &mut sc, &mut o);
         }
-        o.file.write_group(&mut o.cols, o.rows).expect("write user_daily");
-        o.fold_assists();
+        o.write_group();
+        o.fold_hot();
         o.file.finish().expect("finish user_daily");
-        o.acc
+        (o.acc, sc.prof)
     });
+    if tm.on {
+        let names = ["A scan events", "A scan clicks", "A link lookups", "A group ts", "A group clicks", "A purchases", "-", "A singletons", "A write runs", "B group runs", "B people"];
+        for (i, nm) in names.iter().enumerate() {
+            let t: u64 = accs.iter().map(|a| a.1[i]).sum();
+            eprintln!("[prof] {:<16} {:>9.1} ms (summed over threads)", nm, t as f64 / 1e6);
+        }
+    }
+    let accs: Vec<Vec<[u64; 4]>> = accs.into_iter().map(|a| a.0).collect();
     tm.lap("people B (linked) + user_daily");
     accs
 }
