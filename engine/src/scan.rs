@@ -144,17 +144,71 @@ impl Masker for Avx512 {
 pub type Field = (*const u8, usize);
 
 pub struct ScanBuf {
+    /// Positions of the buffered delimiters (commas and newlines), relative to `base`.
     d: Vec<u32>,
-    nls: Vec<u32>,
-    nlq: Vec<u32>,
+    /// One flag byte per buffered delimiter, at index + 1 (index 0 belongs to the delimiter
+    /// before the first buffered one): `AQ` | `BQ` | `NL`.
+    fl: Vec<u8>,
+    /// Positions inside lines that hold a misplaced quote (ascending).
+    bad: Vec<u32>,
 }
 impl ScanBuf {
     pub fn new() -> Self {
-        ScanBuf { d: Vec::new(), nls: Vec::new(), nlq: Vec::new() }
+        ScanBuf { d: Vec::new(), fl: Vec::new(), bad: Vec::new() }
+    }
+}
+
+/// The byte after the delimiter is a quote.
+const AQ: u8 = 1;
+/// The byte before the delimiter is a quote.
+const BQ: u8 = 2;
+/// The delimiter is a newline.
+const NL: u8 = 4;
+
+/// The bits of `x` selected by `m`, packed into the low bits.
+#[inline(always)]
+fn pext(x: u64, m: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_pext_u64(x, m)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let (mut m, mut r, mut k) = (m, 0u64, 0u32);
+        while m != 0 {
+            r |= ((x >> m.trailing_zeros()) & 1) << k;
+            k += 1;
+            m &= m - 1;
+        }
+        r
+    }
+}
+
+/// Bit `j` of the low byte of `x` -> bit 0 of byte `j`.
+#[inline(always)]
+fn spread8(x: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_pdep_u64(x, 0x0101_0101_0101_0101)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let v = (x & 0xFF).wrapping_mul(0x0101_0101_0101_0101) & 0x8040_2010_0804_0201;
+        ((v + 0x7F7F_7F7F_7F7F_7F7F) >> 7) & 0x0101_0101_0101_0101
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn push_bad(bad: &mut Vec<u32>, pos: usize, mut err: u64) {
+    while err != 0 {
+        bad.push(pos as u32 + err.trailing_zeros());
+        err &= err - 1;
     }
 }
 
 const PIECE: usize = 8192;
+const PF_ROWS: bool = false;
 
 /// Splits one line (without its `\n`) into exactly `N` fields; `None` when malformed.
 #[inline]
@@ -203,127 +257,278 @@ pub unsafe fn scan_scalar<const N: usize>(base: *const u8, len: usize, mut f: im
 
 /// Vectorised scanner, same contract as `scan_scalar`. `base[..len]` must hold whole lines
 /// (the last one may lack its `\n`).
+///
+/// Per 64 bytes: the masks of delimiters (commas and newlines), newlines and quotes. The
+/// delimiter positions are written out one after the other, each with a flag byte: is it a
+/// newline, is the byte before it a quote, is the byte after it a quote. A line is taken on the
+/// fast path when its first `N` delimiters are `N - 1` commas and a newline, every field has a
+/// quote at both ends or at neither, and no quote of the line is misplaced. A misplaced quote
+/// is one that is neither the first byte of a field nor directly before a delimiter, or that
+/// is a whole field on its own; the masks find those 64 bytes at a time and their positions go
+/// to a list that is almost always empty. Every other line goes through `split_row`.
 #[inline(always)]
 pub unsafe fn scan<M: Masker, const N: usize>(buf: &mut ScanBuf, base: *const u8, len: usize, mut f: impl FnMut(&[Field; N], *const u8)) {
     unsafe {
-        if M::SCALAR || len >= (u32::MAX as usize) - 256 {
+        if M::SCALAR || N > 7 || N == 0 || len >= (1usize << 31) {
             return scan_scalar::<N>(base, len, f);
         }
         if len == 0 {
             return;
         }
+        // flag bytes of the delimiter before a line and of its N delimiters, as one word
+        let (mut nl_mask, mut pair_mask) = (0u64, 0u64);
+        for k in 0..N {
+            nl_mask |= (NL as u64) << (8 * (k + 1));
+            pair_mask |= 1u64 << (8 * k);
+        }
+        let nl_want = (NL as u64) << (8 * N);
+        // A last line without a newline gets a virtual one at `len`.
+        let total = len + (*base.add(len - 1) != b'\n') as usize;
         let mut pos = 0usize;
         let mut dlen = 0usize;
         let mut row_start = 0u32;
-        let mut qrun = 0u32;
-        let mut prev_q = 0u32;
-        buf.nls.reserve(PIECE + 72);
-        buf.nlq.reserve(PIECE + 72);
-        while pos < len {
-            let pend = (pos + PIECE).min(len);
-            if buf.d.len() < dlen + PIECE + 128 + N {
-                buf.d.resize(dlen + PIECE + 128 + N, 0);
+        // carries from the previous 64 bytes: its last byte was a delimiter (the data starts
+        // as if after one), a quote, a quote not at a field start, a quote at a field start
+        let (mut c_d, mut c_q, mut c_no, mut c_o) = (1u64, 0u64, 0u64, 0u64);
+        buf.bad.clear();
+        let mut bi = 0usize;
+        let mut next_bad = u32::MAX;
+        if buf.fl.is_empty() {
+            buf.fl.resize(1, 0);
+        }
+        buf.fl[0] = 0;
+        while pos < total {
+            let pend = (pos + PIECE).min(total);
+            if buf.d.len() < dlen + PIECE + 136 {
+                buf.d.resize(dlen + PIECE + 136, 0);
+                buf.fl.resize(dlen + PIECE + 137, 0);
             }
             let d = buf.d.as_mut_ptr();
-            let nls = buf.nls.as_mut_ptr();
-            let nlq = buf.nlq.as_mut_ptr();
-            let mut nn = 0usize;
+            let fl = buf.fl.as_mut_ptr().add(1);
+            let mut nrows = 0usize;
             while pos < pend {
                 let (dm, nl, q) = if pos + 64 <= len {
                     M::masks(base.add(pos))
                 } else {
                     let mut t = [0u8; 64];
                     std::ptr::copy_nonoverlapping(base.add(pos), t.as_mut_ptr(), len - pos);
+                    if total != len {
+                        t[len - pos] = b'\n';
+                    }
                     M::masks(t.as_ptr())
                 };
-                // Newlines: the first two without a branch (0, 1 or 2 per 64 bytes is the rule,
-                // in no learnable order; an absent one writes a slot that is not counted).
-                let mut m = nl;
-                let b0 = m.trailing_zeros();
-                *nls.add(nn) = pos as u32 + b0;
-                *nlq.add(nn) = qrun + (q & (1u64 << (b0 & 63)).wrapping_sub(1)).count_ones();
-                m &= m.wrapping_sub(1);
-                let b1 = m.trailing_zeros();
-                *nls.add(nn + 1) = pos as u32 + b1;
-                *nlq.add(nn + 1) = qrun + (q & (1u64 << (b1 & 63)).wrapping_sub(1)).count_ones();
-                m &= m.wrapping_sub(1);
-                let cnt_nl = nl.count_ones() as usize;
-                if m != 0 {
-                    let mut k = nn + 2;
-                    while m != 0 {
-                        let b = m.trailing_zeros();
-                        *nls.add(k) = pos as u32 + b;
-                        *nlq.add(k) = qrun + (q & ((1u64 << b) - 1)).count_ones();
-                        k += 1;
-                        m &= m - 1;
-                    }
+                let fs = (dm << 1) | c_d;
+                let open = q & fs;
+                let nonopen = q & !fs;
+                let err = (((nonopen << 1) | c_no) & !dm) | (((open << 1) | c_o) & dm);
+                let bq = ((q << 1) | c_q) & dm;
+                let aq = (q >> 1) & dm;
+                // the previous delimiter was the byte before these 64: its `AQ` is known now
+                *fl.add(dlen).sub(1) |= (c_d & q) as u8 & AQ;
+                c_d = dm >> 63;
+                c_q = q >> 63;
+                c_no = nonopen >> 63;
+                c_o = open >> 63;
+                if err != 0 {
+                    push_bad(&mut buf.bad, pos, err);
+                    next_bad = *buf.bad.get_unchecked(bi);
                 }
-                nn += cnt_nl;
-                qrun += q.count_ones();
+                nrows += nl.count_ones() as usize;
                 let cnt = dm.count_ones() as usize;
+                let (mut fa, mut fb, mut fn_) = (pext(aq, dm), pext(bq, dm), pext(nl, dm));
                 let mut m = dm;
                 let mut o = d.add(dlen);
+                let mut fo = fl.add(dlen);
                 loop {
                     for k in 0..8 {
                         *o.add(k) = pos as u32 + m.trailing_zeros();
                         m &= m.wrapping_sub(1);
                     }
+                    (fo as *mut u64).write_unaligned(spread8(fa) | (spread8(fb) << 1) | (spread8(fn_) << 2));
                     if m == 0 {
                         break;
                     }
                     o = o.add(8);
+                    fo = fo.add(8);
+                    fa >>= 8;
+                    fb >>= 8;
+                    fn_ >>= 8;
                 }
                 dlen += cnt;
                 pos += 64;
             }
-            if pos >= len && *base.add(len - 1) != b'\n' {
-                // Last line of the file without a newline: a virtual one at `len`.
-                *nls.add(nn) = len as u32;
-                *nlq.add(nn) = qrun;
-                nn += 1;
-                *d.add(dlen) = len as u32;
-                dlen += 1;
-            }
-            for k in 0..N {
-                *d.add(dlen + k) = u32::MAX;
-            }
             let mut i = 0usize;
-            for j in 0..nn {
-                let e = *nls.add(j);
-                let qn = *nlq.add(j) - prev_q;
-                prev_q = *nlq.add(j);
-                if *d.add(i + N - 1) == e {
+            // The rows take far longer than the masks: meanwhile the next piece is fetched,
+            // two cache lines a row (the hardware prefetcher does not run ahead of a burst).
+            let mut pf = base.wrapping_add(pos);
+            let pf_end = base.wrapping_add((pos + PIECE).min(len));
+            for _ in 0..nrows {
+                if PF_ROWS {
+                    let t = if pf < pf_end { pf } else { base };
+                    crate::util::prefetch(t);
+                    crate::util::prefetch(t.wrapping_add(64));
+                    pf = pf.wrapping_add(128);
+                }
+                let w = (fl.add(i).sub(1) as *const u64).read_unaligned();
+                let e = *d.add(i + N - 1);
+                if ((w & nl_mask) == nl_want) & ((((w >> 9) ^ w) & pair_mask) == 0) & (e < next_bad) {
                     let mut fields: [Field; N] = [(base, 0); N];
                     let mut s = row_start;
-                    let mut nq = 0u32;
                     for k in 0..N {
                         let en = *d.add(i + k);
-                        let mut fp = base.add(s as usize);
-                        let mut fl = (en - s) as usize;
-                        // branch-free quote strip (reads stay inside the line or its delimiter)
-                        let isq = ((fl >= 2) & (*fp == b'"') & (*base.add((en as usize).wrapping_sub(1)) == b'"')) as usize;
-                        fp = fp.add(isq);
-                        fl -= 2 * isq;
-                        nq += 2 * isq as u32;
-                        fields[k] = (fp, fl);
+                        let a = ((w >> (8 * k)) & 1) as usize;
+                        fields[k] = (base.add(s as usize + a), (en - s) as usize - 2 * a);
                         s = en + 1;
                     }
-                    if nq == qn {
+                    f(&fields, base.add(row_start as usize));
+                    i += N;
+                    row_start = e + 1;
+                } else {
+                    let mut j = i;
+                    while *fl.add(j) & NL == 0 {
+                        j += 1;
+                    }
+                    let e = *d.add(j);
+                    if let Some(fields) = split_row::<N>(base.add(row_start as usize), (e - row_start) as usize) {
                         f(&fields, base.add(row_start as usize));
                     }
-                    i += N;
-                } else {
-                    while *d.add(i) != e {
-                        i += 1;
+                    i = j + 1;
+                    row_start = e + 1;
+                    while bi < buf.bad.len() && *buf.bad.get_unchecked(bi) <= e {
+                        bi += 1;
                     }
-                    i += 1;
+                    next_bad = if bi < buf.bad.len() { *buf.bad.get_unchecked(bi) } else { u32::MAX };
                 }
-                row_start = e + 1;
             }
             if i > 0 {
                 std::ptr::copy(d.add(i), d, dlen - i);
+                std::ptr::copy(fl.add(i).sub(1), fl.sub(1), dlen - i + 1);
                 dlen -= i;
             }
+            if bi > 0 && bi == buf.bad.len() {
+                buf.bad.clear();
+                bi = 0;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run<M: Masker, const N: usize>(v: &[u8]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let b = v.as_ptr() as usize;
+        let mut buf = ScanBuf::new();
+        unsafe {
+            scan::<M, N>(&mut buf, v.as_ptr(), v.len(), |f, row| {
+                out.push(row as usize - b);
+                for x in f {
+                    out.push(x.0 as usize - b);
+                    out.push(x.1);
+                }
+            });
+        }
+        out
+    }
+
+    fn check<M: Masker>(v: &[u8]) {
+        assert!(run::<M, 1>(v) == run::<Scalar, 1>(v), "N=1 {:?}", String::from_utf8_lossy(v));
+        assert!(run::<M, 2>(v) == run::<Scalar, 2>(v), "N=2 {:?}", String::from_utf8_lossy(v));
+        assert!(run::<M, 4>(v) == run::<Scalar, 4>(v), "N=4 {:?}", String::from_utf8_lossy(v));
+        assert!(run::<M, 7>(v) == run::<Scalar, 7>(v), "N=7 {:?}", String::from_utf8_lossy(v));
+    }
+
+    fn all(v: &[u8]) {
+        check::<Swar>(v);
+        #[cfg(target_arch = "aarch64")]
+        check::<Neon>(v);
+        #[cfg(target_arch = "x86_64")]
+        {
+            check::<Sse2>(v);
+            if is_x86_feature_detected!("avx2") {
+                check::<Avx2>(v);
+            }
+        }
+    }
+
+    #[test]
+    fn random_lines() {
+        let mut x = 0x1234_5678_9ABC_DEF1u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphas: [&[u8]; 4] = [b"abc,,,,\"\"\n\n\nxyz01 ", b"a,,,,,,,,\"\n", b"ab\"\",,,,,,\n", b"abcdefghijk,,,\"\n"];
+        for round in 0..6000 {
+            let alpha = alphas[round % 4];
+            let n = match round % 5 {
+                0 => (rnd() % 200) as usize,
+                1 => 64 * (1 + (rnd() % 4) as usize),
+                2 => 8192 * (1 + (rnd() % 2) as usize) + (rnd() % 3) as usize - 1,
+                3 => (rnd() % 20_000) as usize,
+                _ => 1 + (rnd() % 700) as usize,
+            };
+            let long = round % 7 == 3;
+            let mut v = Vec::with_capacity(n);
+            for i in 0..n {
+                let r = rnd();
+                let c = if long && (i / 3000) % 3 == 1 && r % 50 != 0 { b'q' } else { alpha[(r % alpha.len() as u64) as usize] };
+                v.push(c);
+            }
+            if round % 3 == 0 && n > 0 {
+                v[n - 1] = b'\n';
+            }
+            all(&v);
+        }
+    }
+
+    #[test]
+    fn plausible_rows() {
+        // rows shaped like the real files, with a little dirt, so that the fast path is taken
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..300 {
+            let mut v = Vec::new();
+            let rows = 1 + rnd() % 400;
+            for _ in 0..rows {
+                let nf = if rnd() % 50 == 0 { 1 + rnd() % 9 } else { [7, 7, 4, 2][round % 4] };
+                for k in 0..nf {
+                    if k > 0 {
+                        v.push(b',');
+                    }
+                    let l = rnd() % 12;
+                    let quoted = rnd() % 5 == 0;
+                    if quoted {
+                        v.push(b'"');
+                    }
+                    for _ in 0..l {
+                        v.push(b'a' + (rnd() % 26) as u8);
+                    }
+                    match rnd() % 400 {
+                        0 => v.push(b'"'),
+                        1 => v.extend_from_slice(b"\"\""),
+                        2 => v.extend_from_slice(b"x\"y"),
+                        _ => {}
+                    }
+                    if quoted && rnd() % 100 != 0 {
+                        v.push(b'"');
+                    }
+                }
+                v.push(b'\n');
+            }
+            if round % 2 == 0 {
+                v.pop();
+            }
+            all(&v);
         }
     }
 }
