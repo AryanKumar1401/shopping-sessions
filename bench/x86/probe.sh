@@ -14,14 +14,10 @@ done
 echo "### clicks vs events (skip knob; parse wall, user; min of 5)"
 for k in clicks events; do printf "skip %-7s " $k; for i in 1 2 3 4 5; do SE_SKIP=$k SE_TIMING=1 out/perf/skip $D /tmp/o 2>&1 | grep 'parse events' | awk '{print $5, $8}'; done | best; done
 for k in clicks events; do printf "skip %-7s stage1 " $k; for i in 1 2 3 4 5; do SE_STAGE=1 SE_SKIP=$k SE_TIMING=1 out/perf/skip $D /tmp/o 2>&1 | grep 'parse events' | awk '{print $5, $8}'; done | best; done
-echo "### correctness: tsbl vs p2 output"
-out/perf/p2 $D /tmp/a >/dev/null 2>&1; out/perf/tsbl $D /tmp/b >/dev/null 2>&1
-python3 -c "
-import sys,glob,hashlib
-def h(d):
-  import subprocess
-  return None
-" ; (cd /tmp/a && find . -name '*.parquet' | sort | xargs cat | md5sum) ; (cd /tmp/b && find . -name '*.parquet' | sort | xargs cat | md5sum)
+echo "### correctness vs p2 (row multisets)"
+python3 -m venv /tmp/venv && /tmp/venv/bin/pip -q install polars pyarrow >/dev/null 2>&1
+out/perf/p2 $D /tmp/a >/dev/null 2>&1
+for n in click pf; do rm -rf /tmp/b; out/perf/$n $D /tmp/b >/dev/null 2>&1; echo "$n: $(/tmp/venv/bin/python scripts/compare.py /tmp/b /tmp/a 2>&1 | tail -1)"; done
 exit 0
 n=$(head -1 bench/x86/revs | cut -d: -f1)
 echo "### perf: $n"
