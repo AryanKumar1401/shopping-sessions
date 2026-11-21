@@ -213,3 +213,34 @@ impl LinkTable {
         Some(t)
     }
 }
+
+// ---------------------------------------------------------------- person pass helpers (begin)
+impl LinkTable {
+    /// The name of the person `id` belongs to, or 0 when `id` is in no link line
+    /// (`h` = `id_hash(id)`). Must not be called on an empty table (`any` false).
+    #[inline(always)]
+    pub fn lookup(&self, id: Id, h: u64) -> Id {
+        unsafe {
+            let p = part_of(h, self.bits);
+            let base = *self.base.get_unchecked(p) as usize;
+            let mask = *self.mask.get_unchecked(p);
+            let mut i = h as u32 & mask & !3;
+            loop {
+                let b = self.slots.add(base + i as usize);
+                let (mut hit, mut empty, mut val) = (0u64, 0u64, 0u64);
+                for j in 0..4 {
+                    let s = &*b.add(j);
+                    let e = (s.key == id) as u64;
+                    hit |= e;
+                    val |= s.aux & e.wrapping_neg();
+                    empty |= (s.key == 0) as u64;
+                }
+                if (hit | empty) != 0 {
+                    return val;
+                }
+                i = (i + 4) & mask;
+            }
+        }
+    }
+}
+// ---------------------------------------------------------------- person pass helpers (end)

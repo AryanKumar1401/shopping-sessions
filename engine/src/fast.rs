@@ -893,66 +893,9 @@ pub fn run(inp: &Inputs, out: &Path, nthreads: usize, tm: &mut Timer) -> bool {
     });
     tm.lap("dedup");
 
-    // People. Until here a record sits in the partition of its user ID and carries that ID.
-    // Now each partition's records get their person's name; a record whose person hashes to
-    // another partition is cancelled in place and re-emitted there. The link table is
-    // partitioned by the same hash bits, so a partition's lookups stay within a small,
-    // cache-resident part of it (one random DRAM access per row when done while parsing).
-    if ctx.links.any {
-        let np = 1usize << ctx.pbits;
-        let next = AtomicUsize::new(0);
-        let (ev_ref, cl_ref) = (&ev, &cl);
-        let moved = par((0..nthreads).collect::<Vec<usize>>(), |_, _| {
-            let mut pw: Writers<PRec> = Writers::with_wc(np, PBLOCK, wc);
-            let mut cw: Writers<CRec> = Writers::with_wc(np, 128, wc);
-            loop {
-                let q = next.fetch_add(1, Relaxed);
-                if q >= np {
-                    break;
-                }
-                for p in ev_ref {
-                    for sl in p.slices(q) {
-                        for r in sl.iter_mut() {
-                            if r.ts == DEAD {
-                                continue;
-                            }
-                            let k = ctx.links.resolve(r.k, id_hash(r.k));
-                            let q2 = part_of(id_hash(k), ctx.pbits);
-                            if q2 != q {
-                                pw.push(q2, PRec { k, ts: r.ts, pc: r.pc });
-                                r.ts = DEAD;
-                            } else {
-                                r.k = k;
-                            }
-                        }
-                    }
-                }
-                for p in cl_ref {
-                    for sl in p.slices(q) {
-                        for r in sl.iter_mut() {
-                            let k = ctx.links.resolve(r.k, id_hash(r.k));
-                            let q2 = part_of(id_hash(k), ctx.pbits);
-                            if q2 != q {
-                                cw.push(q2, CRec { k, ts: r.ts, camp: r.camp, ptr: r.ptr });
-                                r.ts = DEAD;
-                            } else {
-                                r.k = k;
-                            }
-                        }
-                    }
-                }
-            }
-            (pw.finish(), cw.finish())
-        });
-        for (p, c) in moved {
-            ev.push(p);
-            cl.push(c);
-        }
-        tm.lap("resolve people");
-    }
-
-    let accs = crate::person::run(&ctx, &ev, &cl, out, nthreads);
-    tm.lap("person pass + user_daily");
+    // People: see person.rs. A record still sits in the partition of its user ID and carries
+    // that ID; the per-person pass resolves the IDs itself, once per distinct ID.
+    let accs = crate::person::run(&ctx, &ev, &cl, out, nthreads, tm);
     crate::person::write_campaign_daily(&ctx, &accs, out);
     tm.lap("campaign_daily");
     true
