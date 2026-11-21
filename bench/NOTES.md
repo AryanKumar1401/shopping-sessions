@@ -76,3 +76,36 @@ Rows for this environment are in the generated table above (`Darwin/arm64 native
 - write combining on arm64 (plain copy, no NT stores): 6.951 -> 7.398 G instr, cycles 2.62 -> 2.91 G (off by default on arm64).
 - `SE_STAGE` instruction split (G instr, whole process, 5M): stage 1 2.88, stage 2 4.24, stage 3 4.63, full 6.83.
 - person pass sections (ms summed over threads, 5M): group by person 46-70, scatter 12-24, clicks 20-38, sort purchases 2-7, sort timestamps 51-61.
+
+## GitHub Actions runner (real x86): ubuntu-latest, 4 vCPU (2 cores / 4 threads), 16 GB, 2026-11-21
+
+Used because the benchmark VM was unavailable. The runner CPU varies between runs: AMD EPYC 7763 (Zen 3) or 9V74 (Zen 4).
+Compare rows only within one run. Every run builds with the Dockerfile's flags (`-C target-cpu=x86-64-v3 -C target-feature=+crt-static`), warm page cache, `bench/bench.py`.
+Data: generator seed 3, 20M events / 5M clicks (seed 5, 60M for the 60M row). Times in ms; wall and user are the min of N.
+The scratch workflow lives on branch `bench-x86` (not on main).
+
+| variant | run CPU | N | wall min / med | user min | parse wall / user | people A + B wall | output |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| c4 (2fe17ed, gated baseline) | 7763 | 9 | 1446 / 1467 | 5366 | 1010 / 3823 | 304 | reference |
+| person v5 alone (5e0f5d9) | 7763 | 9 | 1168 / 1186 | 4280 | 754 / 2816 | 283 | MATCH c4 |
+| HEAD ca6f306 (parse fast path + person v5) | 7763 | 9 | **1045 / 1054** | 3755 | 627 / 2300 | 284 | MATCH c4, MATCH DuckDB at 5M |
+| ca6f306 + links built during parse (be88a48) | 7763 | 11 | 1040 / 1049 (ca6f306 in the same run: 1050 / 1057) | 3761 | 670 / 2473 | 283 | MATCH c4 |
+| 60M, single non-interleaved run each: c4 / ca6f306 / be88a48 | 7763 | 1 | 4850 / 3120 / 3060 | - | - | - | MATCH c4 |
+
+Correctness on real x86 for ca6f306 and be88a48: fixtures and fixtures_extra pass, 400 oracle fuzz seeds pass, 100 more with `SE_SLOW=1` pass, NCPU=1..8 runs without a crash, 20M and 60M MATCH c4, and 5M seed 11 MATCHes DuckDB. A window that holds 2028-02-29 (seed 249, 1M) MATCHes DuckDB (checked on the Mac and under Rosetta).
+Under Rosetta (macOS), x86-64-v3 builds of the person pass abort in a free with NCPU<8. Real x86 does not, and ASan on arm64 is clean, so this is a Rosetta artefact.
+Docker amd64 emulation on the Mac has no AVX2, so it gets SIGILL.
+
+Parse attribution for ca6f306 (user ms, 20M, `SE_STAGE` and the `SE_SKIP` probe knob):
+- 7763: event scan 917, event evaluate + write 1281, clicks 469 (full parse 2534).
+- 9V74, stages: 1 scan 867, 2 + evaluate 1391, 3 + pack/hash 1606, 6 + dedup push 1746, full 1952.
+
+Nulls on x86 (none landed; all MATCH, all within the run's noise of the same-run baseline). Parse user ms, variant vs baseline:
+- F1 and F3 `ts` both parsed, picked without a branch: 2731 vs 2523 (**worse**: the extra work costs more than the mispredicts).
+- `PIECE` 4096 / 16384 instead of 8192: 2547 / 2520 vs 2523.
+- Clicks through a check-free row fast path like events: 2522 vs 2497 (click cost is in the scan and writer, not the evaluation).
+- Pack/hash both IDs first and prefetch both partition buffer lines: 2506 vs 2522.
+- PGO (trained on seed 11 5M, measured on seed 3 20M, rustc 1.100): parse 2646 vs 2660, wall 1070 vs 1072. On the Mac (arm64) the same PGO gave parse 1327 -> 1169, so it helps only the Neon fallback paths.
+- Clicks only, writer knobs `SE_WC`/`SE_PBITS` 1/9, 1/6, 0/9, 0/6: 473 / 495 / 460 / 460 user (3% at best).
+
+Mac (arm64) results do not carry over for the scanner: ca6f306's parse was 2x slower than 5e0f5d9's on the M4 but 17% faster on x86.
