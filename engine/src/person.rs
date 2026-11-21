@@ -67,6 +67,11 @@ struct Scratch {
     catsum: Vec<u64>,
     touched: Vec<u32>,
     acc: Vec<[u64; 4]>,
+    /// Assisted-session counts `[campaign][day]`, kept apart and narrow: about ten of these
+    /// are bumped per session, at random places. Folded into `acc` by `fold_assists`.
+    ass: Vec<u32>,
+    /// Sessions counted into `ass` since the last fold (an upper bound).
+    ass_n: u64,
     radix: Vec<u32>,
     name: Vec<u8>,
     cols: Vec<Col>,
@@ -75,6 +80,13 @@ struct Scratch {
 }
 
 impl Scratch {
+    fn fold_assists(&mut self) {
+        for (a, x) in self.acc.iter_mut().zip(self.ass.iter_mut()) {
+            a[3] += *x as u64;
+            *x = 0;
+        }
+        self.ass_n = 0;
+    }
     #[inline(always)]
     fn get_or_insert(&mut self, k: Id) -> u32 {
         let mut i = id_hash(k) as usize & self.mask;
@@ -200,6 +212,11 @@ fn do_part(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut
     if n == 0 {
         return;
     }
+    // No counter of `ass` can pass u32: a partition adds at most `n` (one per session) to each.
+    if sc.ass_n + n as u64 >= u32::MAX as u64 {
+        sc.fold_assists();
+    }
+    sc.ass_n += n as u64;
     for s in sc.slots.iter_mut() {
         s.1 = EMPTY;
     }
@@ -436,7 +453,7 @@ fn do_part(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut
                         }
                     }
                     for &c in &sc.active {
-                        sc.acc[c as usize * nd + di][3] += 1;
+                        unsafe { *sc.ass.get_unchecked_mut(c as usize * nd + di) += 1 };
                     }
                 }
             }
@@ -495,6 +512,8 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
             catsum: vec![0; ctx.cats.len()],
             touched: Vec::new(),
             acc: vec![[0; 4]; (ncamp + 1) * nd.max(1)],
+            ass: vec![0; (ncamp + 1) * nd.max(1)],
+            ass_n: 0,
             radix: Vec::new(),
             name: Vec::new(),
             cols: UD_SCHEMA.iter().map(|&(_, k)| Col::new(k)).collect(),
@@ -509,6 +528,7 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
             do_part(ctx, q, ev, cl, &mut sc, nd, day0, day_off);
         }
         sc.file.write_group(&mut sc.cols, sc.rows).expect("write user_daily");
+        sc.fold_assists();
         sc.file.finish().expect("finish user_daily");
         sc.acc
     })

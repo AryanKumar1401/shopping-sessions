@@ -44,27 +44,37 @@ impl LinkTable {
     pub fn prefetch(&self, h: u64) {
         unsafe {
             let p = part_of(h, self.bits);
-            prefetch(self.slots.add((*self.base.get_unchecked(p) + (h as u32 & *self.mask.get_unchecked(p))) as usize));
+            prefetch(self.slots.add((*self.base.get_unchecked(p) + (h as u32 & *self.mask.get_unchecked(p) & !3)) as usize));
         }
     }
 
     /// The name of the person `id` belongs to (`h` = `id_hash(id)`).
+    ///
+    /// A partition is probed in buckets of four slots (one cache line), starting at the bucket
+    /// `h` selects; `build` fills slots in the same order. All four keys are compared without
+    /// branching: whether an ID is linked is a coin toss the branch predictor cannot learn.
     #[inline(always)]
     pub fn resolve(&self, id: Id, h: u64) -> Id {
         unsafe {
             let p = part_of(h, self.bits);
             let base = *self.base.get_unchecked(p) as usize;
             let mask = *self.mask.get_unchecked(p);
-            let mut i = h as u32 & mask;
+            let mut i = h as u32 & mask & !3;
             loop {
-                let s = &*self.slots.add(base + i as usize);
-                if s.key == id {
-                    return s.aux;
+                let b = self.slots.add(base + i as usize);
+                let (mut hit, mut empty, mut val) = (0u64, 0u64, 0u64);
+                for j in 0..4 {
+                    let s = &*b.add(j);
+                    let e = (s.key == id) as u64;
+                    hit |= e;
+                    val |= s.aux & e.wrapping_neg();
+                    empty |= (s.key == 0) as u64;
                 }
-                if s.key == 0 {
-                    return id;
+                if (hit | empty) != 0 {
+                    // hit: the stored name; otherwise the ID itself
+                    return val | (id & hit.wrapping_sub(1));
                 }
-                i = (i + 1) & mask;
+                i = (i + 4) & mask;
             }
         }
     }
@@ -121,7 +131,7 @@ impl LinkTable {
         for p in 0..np {
             let n: usize = occ.iter().map(|o| o.count(p)).sum();
             any |= n > 0;
-            let cap = (n * 2).max(2).next_power_of_two();
+            let cap = (n * 2).max(4).next_power_of_two();
             base.push(total as u32);
             mask.push(cap as u32 - 1);
             total += cap as u64;
@@ -148,7 +158,7 @@ impl LinkTable {
                 for o in occ {
                     for sl in o.slices(p) {
                         for oc in sl.iter() {
-                            let mut i = id_hash(oc.id) as u32 & m;
+                            let mut i = id_hash(oc.id) as u32 & m & !3;
                             let g = loop {
                                 let s = &mut *t.slots.add((b + i) as usize);
                                 if s.key == oc.id {

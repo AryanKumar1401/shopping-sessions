@@ -105,13 +105,20 @@ impl Masker for Avx2 {
         unsafe {
             let a = _mm256_loadu_si256(p as *const __m256i);
             let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
-            let mm = |c: u8| -> u64 {
-                let k = _mm256_set1_epi8(c as i8);
-                (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, k)) as u32 as u64)
-                    | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, k)) as u32 as u64) << 32)
+            let (kc, kn, kq) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
+            let (na, nb) = (_mm256_cmpeq_epi8(a, kn), _mm256_cmpeq_epi8(b, kn));
+            let da = _mm256_or_si256(_mm256_cmpeq_epi8(a, kc), na);
+            let db = _mm256_or_si256(_mm256_cmpeq_epi8(b, kc), nb);
+            // Each 32-bit mask is joined to its other half as plain integers. (Written as
+            // `mm(',') | mm('\n')` over 64-bit masks, LLVM merged the halves into one
+            // 64-lane mask vector, which AVX2 cannot hold: it was rebuilt bit by bit, at
+            // several hundred instructions per 64 bytes.)
+            let join = |lo: __m256i, hi: __m256i| -> u64 {
+                let lo = std::hint::black_box(_mm256_movemask_epi8(lo) as u32) as u64;
+                let hi = _mm256_movemask_epi8(hi) as u32 as u64;
+                lo | (hi << 32)
             };
-            let n = mm(b'\n');
-            (mm(b',') | n, n, mm(b'"'))
+            (join(da, db), join(na, nb), join(_mm256_cmpeq_epi8(a, kq), _mm256_cmpeq_epi8(b, kq)))
         }
     }
 }

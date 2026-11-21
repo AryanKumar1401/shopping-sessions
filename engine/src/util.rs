@@ -11,6 +11,40 @@ unsafe extern "C" {
     fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
     pub fn _exit(code: i32) -> !;
     fn getrusage(who: i32, ru: *mut [i64; 18]) -> i32;
+    fn pread(fd: i32, buf: *mut c_void, n: usize, off: i64) -> isize;
+    #[cfg(target_os = "linux")]
+    fn prctl(option: i32, a2: u64, a3: u64, a4: u64, a5: u64) -> i32;
+}
+
+/// Experiment knob (Linux, SE_NOTHP=1): run without transparent huge pages, to measure what
+/// a host with THP disabled would cost.
+pub fn thp_knob() {
+    #[cfg(target_os = "linux")]
+    if env_flag("SE_NOTHP") {
+        unsafe { prctl(41, 1, 0, 0, 0) }; // PR_SET_THP_DISABLE
+    }
+}
+
+/// File descriptors of the mapped files, by mapping address (kept open until exit).
+static FDS: Mutex<Vec<(usize, i32)>> = Mutex::new(Vec::new());
+
+/// The descriptor behind a `map_file` mapping, or -1.
+pub fn fd_of(data: &[u8]) -> i32 {
+    let p = data.as_ptr() as usize;
+    FDS.lock().unwrap().iter().find(|x| x.0 == p).map_or(-1, |x| x.1)
+}
+
+/// Reads exactly `n` bytes at `off`; false on any error or short read.
+pub fn pread_exact(fd: i32, buf: *mut u8, n: usize, off: usize) -> bool {
+    let mut done = 0;
+    while done < n {
+        let r = unsafe { pread(fd, buf.add(done) as *mut c_void, n - done, (off + done) as i64) };
+        if r <= 0 {
+            return false;
+        }
+        done += r as usize;
+    }
+    true
 }
 
 /// (user, system) CPU seconds used by the whole process so far.
@@ -37,6 +71,11 @@ const MAP_POPULATE: i32 = 0x8000;
 const MADV_WILLNEED: i32 = 3;
 #[cfg(target_os = "linux")]
 const MADV_HUGEPAGE: i32 = 14;
+
+/// A knob that is on unless set to `0`.
+pub fn env_on(name: &str) -> bool {
+    std::env::var(name).map(|v| v != "0").unwrap_or(true)
+}
 
 pub fn env_flag(name: &str) -> bool {
     std::env::var(name).map(|v| !v.is_empty() && v != "0").unwrap_or(false)
@@ -65,6 +104,8 @@ pub fn map_file(path: &std::path::Path) -> std::io::Result<&'static [u8]> {
         if len >= (1 << 20) && env_flag("SE_WILLNEED") {
             madvise(p, len, MADV_WILLNEED);
         }
+        use std::os::fd::IntoRawFd;
+        FDS.lock().unwrap().push((p as usize, f.into_raw_fd()));
         Ok(std::slice::from_raw_parts(p as *const u8, len))
     }
 }
@@ -80,6 +121,44 @@ pub fn populate_read(_p: *const u8, _len: usize) {
             let e = (_p as usize + _len + 4095) & !4095;
             unsafe { madvise(a as *mut c_void, e - a, 22) }; // MADV_POPULATE_READ
         }
+    }
+}
+
+/// Big anonymous slabs handed out by `os_alloc`, for `release_all`.
+#[cfg(target_os = "linux")]
+static SLABS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Drops the pages of a parsed chunk of a file mapping (Linux; the mapping stays valid and
+/// re-reads from the page cache if touched again). Done by the thread that parsed it, so the
+/// unmapping work is spread over all threads instead of being done serially at exit.
+#[inline]
+pub fn drop_range(_p: *const u8, _len: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        let a = (_p as usize + 4095) & !4095;
+        let e = (_p as usize + _len) & !4095;
+        if e > a {
+            unsafe { madvise(a as *mut c_void, e - a, 4) }; // MADV_DONTNEED
+        }
+    }
+}
+
+/// Gives the big anonymous slabs back to the kernel from `nthreads` threads at once (Linux).
+/// Process exit would do the same work on one thread. Nothing may use arena memory afterwards.
+pub fn release_all(_nthreads: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        let slabs = std::mem::take(&mut *SLABS.lock().unwrap());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        par(vec![(); _nthreads.max(1)], |_, _| {
+            loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= slabs.len() {
+                    break;
+                }
+                unsafe { madvise(slabs[i].0 as *mut c_void, slabs[i].1, 4) }; // MADV_DONTNEED
+            }
+        });
     }
 }
 
@@ -106,26 +185,61 @@ pub fn os_alloc(bytes: usize) -> *mut u8 {
         if bytes >= (2 << 20) {
             madvise(p, bytes, MADV_HUGEPAGE);
         }
+        if bytes >= (1 << 20) {
+            // in pieces, so that `release_all` can spread one big range over its threads
+            let mut s = SLABS.lock().unwrap();
+            let mut o = 0;
+            while o < bytes {
+                let n = (bytes - o).min(4 * SLAB);
+                s.push((p as usize + o, n));
+                o += n;
+            }
+        }
     }
     p as *mut u8
+}
+
+/// One big reserved address range that several arenas carve their slabs from, so that a
+/// record in it can be named by a 32-bit index instead of a pointer.
+pub struct Region {
+    pub base: usize,
+    next: std::sync::atomic::AtomicUsize,
+    end: usize,
+}
+impl Region {
+    /// Reserves `bytes` (untouched pages cost nothing).
+    pub fn new(bytes: usize) -> &'static Region {
+        let bytes = (bytes + SLAB - 1) / SLAB * SLAB;
+        let base = os_alloc(bytes) as usize;
+        Box::leak(Box::new(Region { base, next: std::sync::atomic::AtomicUsize::new(base), end: base + bytes }))
+    }
+    fn slab(&self) -> Option<usize> {
+        let p = self.next.fetch_add(SLAB, std::sync::atomic::Ordering::Relaxed);
+        if p + SLAB <= self.end { Some(p) } else { None }
+    }
 }
 
 /// Per-thread bump allocator over big OS slabs. Memory is never returned.
 pub struct Arena {
     cur: usize,
     end: usize,
+    region: Option<&'static Region>,
 }
 const SLAB: usize = 8 << 20;
 impl Arena {
     pub fn new() -> Self {
-        Arena { cur: 0, end: 0 }
+        Arena { cur: 0, end: 0, region: None }
     }
     #[inline]
     pub fn alloc(&mut self, bytes: usize) -> *mut u8 {
         let bytes = (bytes + 63) & !63;
         if self.cur + bytes > self.end {
             let slab = bytes.max(SLAB);
-            self.cur = os_alloc(slab) as usize;
+            // A full region falls back to a private slab (outside the region's index range).
+            self.cur = match self.region.and_then(|r| if slab == SLAB { r.slab() } else { None }) {
+                Some(p) => p,
+                None => os_alloc(slab) as usize,
+            };
             self.end = self.cur + slab;
         }
         let p = self.cur;
@@ -134,23 +248,97 @@ impl Arena {
     }
 }
 
+/// Copies `bytes` (a multiple of 64) from a write-combining buffer to its 64-byte-aligned
+/// place in a block. On x86-64 with non-temporal stores: the block's cache lines are not
+/// read first and do not displace the working set (`sfence_all` must follow before the
+/// records are read by another thread).
+#[inline(always)]
+unsafe fn wc_copy(dst: *mut u8, src: *const u8, bytes: usize) {
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::*;
+            let mut o = 0;
+            while o < bytes {
+                _mm_stream_si128(dst.add(o) as *mut __m128i, _mm_loadu_si128(src.add(o) as *const __m128i));
+                o += 16;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        std::ptr::copy_nonoverlapping(src, dst, bytes);
+    }
+}
+
+#[inline(always)]
+fn sfence_all() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence();
+    }
+}
+
+/// Whether `Writers` use write-combining buffers. Default: on for x86-64, where the copy to
+/// the block is a non-temporal store (measured on a Cascade Lake n2-standard-8 at 20M events:
+/// parse 680 -> 609 ms wall), off elsewhere (arm64: about 6% more instructions, no gain).
+/// SE_WC=0 / SE_WC=1 override.
+pub fn wc_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("SE_WC").as_deref() {
+        Ok("0") => false,
+        Ok(v) if !v.is_empty() => true,
+        _ => cfg!(target_arch = "x86_64"),
+    })
+}
+
 /// Fan-out writer: one append-only stream of `T` per partition, stored as blocks.
+///
+/// With write combining, a record first goes into the partition's small buffer (`unit`
+/// records, a multiple of 64 bytes; all buffers of a writer are contiguous), and a full
+/// buffer is copied to the block in one go. The hot state then is a few dense pages
+/// instead of one cache line and one page per partition scattered over the arena.
 pub struct Writers<T> {
+    /// (next record's place in the open block, or with write combining the place of the
+    /// buffer's first record; end of the open block)
     heads: Vec<(*mut T, *mut T)>,
     blocks: Vec<Vec<(usize, usize)>>, // (start ptr, capacity) per block; the last one is open
     block_len: usize,
+    wc: bool,
+    unit: usize,
+    buf: *mut T,
+    fill: Vec<u8>,
     pub arena: Arena,
 }
 unsafe impl<T> Send for Writers<T> {}
 
 impl<T: Copy> Writers<T> {
     pub fn new(parts: usize, block_len: usize) -> Self {
+        Self::with_wc(parts, block_len, false)
+    }
+    pub fn with_wc(parts: usize, block_len: usize, wc: bool) -> Self {
+        let size = std::mem::size_of::<T>();
+        // records per 64-byte multiple
+        let mut unit = 1;
+        while unit * size % 64 != 0 {
+            unit += 1;
+        }
+        let wc = wc && unit <= 16 && std::mem::align_of::<T>() <= 16 && size % 8 == 0;
+        let block_len = block_len.max(4).div_ceil(unit) * unit;
         Writers {
             heads: vec![(std::ptr::null_mut(), std::ptr::null_mut()); parts],
             blocks: vec![Vec::new(); parts],
-            block_len: block_len.max(4),
+            block_len,
+            wc,
+            unit,
+            buf: if wc { os_alloc(parts * unit * size) as *mut T } else { std::ptr::null_mut() },
+            fill: vec![0; if wc { parts } else { 0 }],
             arena: Arena::new(),
         }
+    }
+    /// Like `with_wc`, with all blocks taken from `region`.
+    pub fn in_region(parts: usize, block_len: usize, wc: bool, region: &'static Region) -> Self {
+        let mut w = Self::with_wc(parts, block_len, wc);
+        w.arena.region = Some(region);
+        w
     }
     #[cold]
     #[inline(never)]
@@ -161,16 +349,10 @@ impl<T: Copy> Writers<T> {
     }
     #[inline(always)]
     pub fn push(&mut self, s: usize, v: T) {
-        unsafe {
-            if self.heads.get_unchecked(s).0 == self.heads.get_unchecked(s).1 {
-                self.refill(s);
-            }
-            let h = self.heads.get_unchecked_mut(s);
-            h.0.write(v);
-            h.0 = h.0.add(1);
-        }
+        self.push_ptr(s, v);
     }
-    /// Like `push`, returning where the value now lives.
+    /// Appends `v` to partition `s`, returning where the value lives (with write combining:
+    /// will live once its buffer is flushed, at the latest by `finish`).
     #[inline(always)]
     pub fn push_ptr(&mut self, s: usize, v: T) -> *mut T {
         unsafe {
@@ -178,14 +360,42 @@ impl<T: Copy> Writers<T> {
                 self.refill(s);
             }
             let h = self.heads.get_unchecked_mut(s);
-            let p = h.0;
-            p.write(v);
-            h.0 = p.add(1);
-            p
+            if self.wc {
+                let n = *self.fill.get_unchecked(s) as usize;
+                let b = self.buf.add(s * self.unit);
+                b.add(n).write(v);
+                let p = h.0.add(n);
+                if n + 1 == self.unit {
+                    wc_copy(h.0 as *mut u8, b as *const u8, self.unit * std::mem::size_of::<T>());
+                    h.0 = h.0.add(self.unit);
+                    *self.fill.get_unchecked_mut(s) = 0;
+                } else {
+                    *self.fill.get_unchecked_mut(s) = (n + 1) as u8;
+                }
+                p
+            } else {
+                let p = h.0;
+                p.write(v);
+                h.0 = p.add(1);
+                p
+            }
         }
     }
     /// Per partition: the filled slices.
-    pub fn finish(self) -> Parts<T> {
+    pub fn finish(mut self) -> Parts<T> {
+        if self.wc {
+            // the partly filled buffers
+            for s in 0..self.heads.len() {
+                let n = self.fill[s] as usize;
+                if n > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(self.buf.add(s * self.unit), self.heads[s].0, n);
+                        self.heads[s].0 = self.heads[s].0.add(n);
+                    }
+                }
+            }
+            sfence_all();
+        }
         let mut out = Vec::with_capacity(self.blocks.len());
         for (s, bl) in self.blocks.into_iter().enumerate() {
             let mut v: Vec<(usize, usize)> = Vec::with_capacity(bl.len());
@@ -287,12 +497,14 @@ fn interner() -> &'static Interner {
 
 #[cold]
 #[inline(never)]
-pub fn intern_long(s: &'static [u8]) -> Id {
+pub fn intern_long(s: &[u8]) -> Id {
     let it = interner();
     let mut m = it.map.lock().unwrap();
     if let Some(&i) = m.get(s) {
         return i | LONG;
     }
+    // A private copy: the caller's bytes may sit in a reused read buffer.
+    let s: &'static [u8] = Box::leak(s.to_vec().into_boxed_slice());
     let mut l = it.list.write().unwrap();
     let i = l.len() as u64;
     l.push(s);
