@@ -114,7 +114,9 @@ impl Masker for Avx2 {
             // 64-lane mask vector, which AVX2 cannot hold: it was rebuilt bit by bit, at
             // several hundred instructions per 64 bytes.)
             let join = |lo: __m256i, hi: __m256i| -> u64 {
-                let lo = std::hint::black_box(_mm256_movemask_epi8(lo) as u32) as u64;
+                let mut lo = _mm256_movemask_epi8(lo) as u32 as u64;
+                // an optimisation barrier that costs no instruction
+                std::arch::asm!("/* {0} */", inout(reg) lo, options(pure, nomem, nostack, preserves_flags));
                 let hi = _mm256_movemask_epi8(hi) as u32 as u64;
                 lo | (hi << 32)
             };
@@ -143,8 +145,51 @@ impl Masker for Avx512 {
 /// A field: pointer and length (quotes already stripped).
 pub type Field = (*const u8, usize);
 
+/// One well-formed line of `N` fields: field `k < N` is the `ln[k]` bytes at `base + st[k]`
+/// (quotes already stripped); the line starts at `base + row`. Entries from `N` on mean nothing.
+#[repr(C, align(32))]
+pub struct Row {
+    pub st: [u32; 8],
+    pub ln: [u32; 8],
+    pub base: *const u8,
+    pub row: u32,
+}
+impl Row {
+    #[inline(always)]
+    pub fn ptr(&self, k: usize) -> *const u8 {
+        self.base.wrapping_add(self.st[k] as usize)
+    }
+    #[inline(always)]
+    pub fn len(&self, k: usize) -> usize {
+        self.ln[k] as usize
+    }
+    #[inline(always)]
+    pub fn start(&self) -> *const u8 {
+        self.base.wrapping_add(self.row as usize)
+    }
+    #[inline(always)]
+    pub fn fields<const N: usize>(&self) -> [Field; N] {
+        let mut f: [Field; N] = [(self.base, 0); N];
+        for k in 0..N {
+            f[k] = (self.ptr(k), self.len(k));
+        }
+        f
+    }
+    #[inline(always)]
+    fn of<const N: usize>(base: *const u8, row: *const u8, f: &[Field; N]) -> Row {
+        let mut r = Row { st: [0; 8], ln: [0; 8], base, row: (row as usize - base as usize) as u32 };
+        for k in 0..N {
+            r.st[k] = (f[k].0 as usize - base as usize) as u32;
+            r.ln[k] = f[k].1 as u32;
+        }
+        r
+    }
+}
+
 pub struct ScanBuf {
-    /// Positions of the buffered delimiters (commas and newlines), relative to `base`.
+    /// Positions of the buffered delimiters (commas and newlines), relative to `base`, at
+    /// index + 1 (index 0 is the delimiter before the first buffered one: the end of the
+    /// previous line, or "-1" at the start of the data).
     d: Vec<u32>,
     /// One flag byte per buffered delimiter, at index + 1 (index 0 belongs to the delimiter
     /// before the first buffered one): `AQ` | `BQ` | `NL`.
@@ -268,9 +313,15 @@ pub unsafe fn scan_scalar<const N: usize>(base: *const u8, len: usize, mut f: im
 /// to a list that is almost always empty. Every other line goes through `split_row`.
 #[inline(always)]
 pub unsafe fn scan<M: Masker, const N: usize>(buf: &mut ScanBuf, base: *const u8, len: usize, mut f: impl FnMut(&[Field; N], *const u8)) {
+    unsafe { scan_rows::<M, N>(buf, base, len, #[inline(always)] |r| f(&r.fields::<N>(), r.start())) }
+}
+
+/// `scan` handing out each line as a `Row`.
+#[inline(always)]
+pub unsafe fn scan_rows<M: Masker, const N: usize>(buf: &mut ScanBuf, base: *const u8, len: usize, mut f: impl FnMut(&Row)) {
     unsafe {
         if M::SCALAR || N > 7 || N == 0 || len >= (1usize << 31) {
-            return scan_scalar::<N>(base, len, f);
+            return scan_scalar::<N>(base, len, |fields, row| f(&Row::of(base, row, fields)));
         }
         if len == 0 {
             return;
@@ -295,15 +346,18 @@ pub unsafe fn scan<M: Masker, const N: usize>(buf: &mut ScanBuf, base: *const u8
         let mut next_bad = u32::MAX;
         if buf.fl.is_empty() {
             buf.fl.resize(1, 0);
+            buf.d.resize(1, 0);
         }
         buf.fl[0] = 0;
+        buf.d[0] = u32::MAX;
+        let mut r = Row { st: [0; 8], ln: [0; 8], base, row: 0 };
         while pos < total {
             let pend = (pos + PIECE).min(total);
-            if buf.d.len() < dlen + PIECE + 136 {
-                buf.d.resize(dlen + PIECE + 136, 0);
+            if buf.d.len() < dlen + PIECE + 137 {
+                buf.d.resize(dlen + PIECE + 137, 0);
                 buf.fl.resize(dlen + PIECE + 137, 0);
             }
-            let d = buf.d.as_mut_ptr();
+            let d = buf.d.as_mut_ptr().add(1);
             let fl = buf.fl.as_mut_ptr().add(1);
             let mut nrows = 0usize;
             while pos < pend {
@@ -372,15 +426,30 @@ pub unsafe fn scan<M: Masker, const N: usize>(buf: &mut ScanBuf, base: *const u8
                 let w = (fl.add(i).sub(1) as *const u64).read_unaligned();
                 let e = *d.add(i + N - 1);
                 if ((w & nl_mask) == nl_want) & ((((w >> 9) ^ w) & pair_mask) == 0) & (e < next_bad) {
-                    let mut fields: [Field; N] = [(base, 0); N];
-                    let mut s = row_start;
-                    for k in 0..N {
-                        let en = *d.add(i + k);
-                        let a = ((w >> (8 * k)) & 1) as usize;
-                        fields[k] = (base.add(s as usize + a), (en - s) as usize - 2 * a);
-                        s = en + 1;
+                    // field k: from one past the delimiter before it (and past its quote)
+                    // to its own delimiter (less its quote)
+                    let dp = d.add(i).sub(1);
+                    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                    {
+                        use std::arch::x86_64::*;
+                        let one = _mm256_set1_epi32(1);
+                        let a = _mm256_and_si256(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(w as i64)), one);
+                        let st = _mm256_add_epi32(_mm256_add_epi32(_mm256_loadu_si256(dp as *const __m256i), one), a);
+                        let ln = _mm256_sub_epi32(_mm256_sub_epi32(_mm256_loadu_si256(dp.add(1) as *const __m256i), st), a);
+                        _mm256_store_si256(r.st.as_mut_ptr() as *mut __m256i, st);
+                        _mm256_store_si256(r.ln.as_mut_ptr() as *mut __m256i, ln);
                     }
-                    f(&fields, base.add(row_start as usize));
+                    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+                    {
+                        let a = (w & 0x0101_0101_0101_0101).to_le_bytes();
+                        for k in 0..8 {
+                            let s = (*dp.add(k)).wrapping_add(1 + a[k] as u32);
+                            r.st[k] = s;
+                            r.ln[k] = (*dp.add(k + 1)).wrapping_sub(s).wrapping_sub(a[k] as u32);
+                        }
+                    }
+                    r.row = row_start;
+                    f(&r);
                     i += N;
                     row_start = e + 1;
                 } else {
@@ -390,7 +459,7 @@ pub unsafe fn scan<M: Masker, const N: usize>(buf: &mut ScanBuf, base: *const u8
                     }
                     let e = *d.add(j);
                     if let Some(fields) = split_row::<N>(base.add(row_start as usize), (e - row_start) as usize) {
-                        f(&fields, base.add(row_start as usize));
+                        f(&Row::of(base, base.add(row_start as usize), &fields));
                     }
                     i = j + 1;
                     row_start = e + 1;
@@ -401,7 +470,7 @@ pub unsafe fn scan<M: Masker, const N: usize>(buf: &mut ScanBuf, base: *const u8
                 }
             }
             if i > 0 {
-                std::ptr::copy(d.add(i), d, dlen - i);
+                std::ptr::copy(d.add(i).sub(1), d.sub(1), dlen - i + 1);
                 std::ptr::copy(fl.add(i).sub(1), fl.sub(1), dlen - i + 1);
                 dlen -= i;
             }
