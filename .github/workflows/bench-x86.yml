@@ -23,6 +23,6 @@ jobs:
             (cd /tmp/wt-$n/engine && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_TARGET_DIR=/tmp/tgtd cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/tgtd/$T/release/shopping-engine /tmp/$n-dbg)
           done
       - name: bench 20M (interleaved)
-        run: python3 bench/bench.py --data data/s3-20m --reps 9 $(for rv in $(cat bench/x86/revs); do n=${rv%%:*}; echo "$n=out/perf/$n"; done) 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list|tables|links \(join)"
+        run: python3 bench/bench.py --data data/s3-20m --reps 9 $(for rv in $(grep -v ^skip bench/x86/revs); do n=${rv%%:*}; echo "$n=out/perf/$n"; done) 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list|tables|links \(join)"
       - name: probe
         run: bench/x86/probe.sh

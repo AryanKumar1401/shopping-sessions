@@ -5,11 +5,24 @@ D=data/s3-20m
 best() { sort -n | head -1; }
 echo "### parse stages (wall ms, user ms; min of 5)"
 for n in $(cut -d: -f1 bench/x86/revs); do
-  for s in 1 2 3 6 7 0; do
+  [ $n = skip ] && continue
+  for s in 1 2 0; do
     printf "%-6s stage %s  " $n $s
     for i in 1 2 3 4 5; do SE_STAGE=$s SE_TIMING=1 out/perf/$n $D /tmp/o 2>&1 | grep 'parse events' | awk '{print $5, $8}'; done | best
   done
 done
+echo "### clicks vs events (skip knob; parse wall, user; min of 5)"
+for k in clicks events; do printf "skip %-7s " $k; for i in 1 2 3 4 5; do SE_SKIP=$k SE_TIMING=1 out/perf/skip $D /tmp/o 2>&1 | grep 'parse events' | awk '{print $5, $8}'; done | best; done
+for k in clicks events; do printf "skip %-7s stage1 " $k; for i in 1 2 3 4 5; do SE_STAGE=1 SE_SKIP=$k SE_TIMING=1 out/perf/skip $D /tmp/o 2>&1 | grep 'parse events' | awk '{print $5, $8}'; done | best; done
+echo "### correctness: tsbl vs p2 output"
+out/perf/p2 $D /tmp/a >/dev/null 2>&1; out/perf/tsbl $D /tmp/b >/dev/null 2>&1
+python3 -c "
+import sys,glob,hashlib
+def h(d):
+  import subprocess
+  return None
+" ; (cd /tmp/a && find . -name '*.parquet' | sort | xargs cat | md5sum) ; (cd /tmp/b && find . -name '*.parquet' | sort | xargs cat | md5sum)
+exit 0
 n=$(head -1 bench/x86/revs | cut -d: -f1)
 echo "### perf: $n"
 sudo perf record -q -F 4999 -o /tmp/perf.data /tmp/$n-dbg $D /tmp/o >/dev/null 2>&1
