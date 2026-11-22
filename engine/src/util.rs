@@ -594,11 +594,14 @@ pub const LONG: u64 = 1 << 63;
 //   the shard, one table word and the record (words compared eight bytes at a time). A miss takes the shard's lock, looks again, and inserts.
 //   A full table is replaced by a bigger copy; the old one stays valid (and is never freed)
 //   for readers that still hold it: they can only miss in it, which sends them to the lock.
-// - The index comes from one atomic counter; the record's address by index sits in a
-//   directory of 128K-entry chunks that is written before the table word is published and
-//   read without a lock (`long_bytes`, `id_bytes`, `id_less`).
+// - Indexes come from one atomic counter in blocks of `INTERN_BLOCK` per thread (unused
+//   ones are never looked up), so threads that intern at once do not share the counter's
+//   cache line or directory lines; the record's address by index sits in a directory of
+//   128K-entry chunks that is written before the table word is published and read without a
+//   lock (`long_bytes`, `id_bytes`, `id_less`).
 const INTERN_SHARD_BITS: u32 = 12;
 const DIR_CHUNK_BITS: u32 = 17;
+const INTERN_BLOCK: u64 = 1024;
 
 #[repr(C)]
 struct IRec {
@@ -807,7 +810,19 @@ fn intern_new(sh: &InternShard, h: u64, s: &[u8]) -> Id {
         sh.table.store(n, Ordering::Release);
         t = n;
     }
-    let idx = INTERN_NEXT.fetch_add(1, Ordering::Relaxed);
+    thread_local! {
+        /// (next index, end of this thread's block)
+        static IDX: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    let idx = IDX.with(|c| {
+        let (mut i, mut end) = c.get();
+        if i == end {
+            i = INTERN_NEXT.fetch_add(INTERN_BLOCK, Ordering::Relaxed);
+            end = i + INTERN_BLOCK;
+        }
+        c.set((i + 1, end));
+        i
+    });
     if idx >= 0xFFFF_FFFF || s.len() > u32::MAX as usize {
         eprintln!("shopping-engine: too many distinct long IDs");
         std::process::exit(1);
