@@ -552,6 +552,13 @@ struct Hot {
     ds: usize,
     /// `PURCHASE`: the row so far.
     pur: Purchase,
+    /// `LONGROW`: the row so far.
+    lr: LongRow,
+}
+/// The two ID fields (start, length) and what `row_rest` found.
+struct LongRow {
+    ids: (*const u8, usize, *const u8, usize),
+    rest: (i64, i64, usize, *const u8, u32, u32, usize),
 }
 #[derive(Clone, Copy)]
 struct Purchase {
@@ -572,8 +579,8 @@ const BAIL: usize = 0;
 const DATE_MISS: usize = 1;
 /// the line is a purchase inside the window, to be finished by `purchase_finish`.
 const PURCHASE: usize = 2;
-/// nothing was done, the line has an ID of 10 bytes or more (or is not of the usual shape):
-/// `long_row`.
+/// the line has an ID of 10 bytes or more, is of the usual shape, and is to be finished by
+/// `long_emit` from `Hot::lr`.
 const LONGROW: usize = 3;
 const CODES: isize = 4;
 /// Added to the next line's start: a block the row wrote to is full (`Writers::refill_full`
@@ -689,25 +696,45 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
         let a0 = p.add(q0);
         let (v0, l0) = k::id_scan(a0);
         let t0 = a0.add(l0);
-        let mut bad = term(t0, q0);
         // user_id
         let s1 = t0.add(q0 + 1);
         let q1 = (*s1 == b'"') as usize;
         let a1 = s1.add(q1);
         let (v1, l1) = k::id_scan(a1);
-        // an ID of 10 bytes or more: `long_row`
-        if (l0 > 9) | (l1 > 9) {
-            return LONGROW;
-        }
-        let t1 = a1.add(l1);
-        bad |= term(t1, q1);
-        // the event_id not empty (an empty user_id packs to 0)
-        bad |= (*LEN_BAD.get_unchecked(l0) | *LEN_BAD0.get_unchecked(l1)) as u64;
+        let long = (l0 > 9) | (l1 > 9);
+        let (s2, mut bad) = if !long {
+            let t1 = a1.add(l1);
+            // the event_id not empty (an empty user_id packs to 0)
+            (t1.add(q1 + 1), term(t0, q0) | term(t1, q1) | (*LEN_BAD.get_unchecked(l0) | *LEN_BAD0.get_unchecked(l1)) as u64)
+        } else {
+            // An ID of 10 bytes or more: both fields again, up to 64 bytes each; the line is
+            // walked here and finished by `long_emit`.
+            let l0 = k::id_len(a0);
+            if l0.wrapping_sub(1) > 63 {
+                return BAIL;
+            }
+            let t0 = a0.add(l0);
+            let s1 = t0.add(q0 + 1);
+            let q1 = (*s1 == b'"') as usize;
+            let a1 = s1.add(q1);
+            let l1 = k::id_len(a1);
+            if l1 > 64 {
+                return BAIL;
+            }
+            let t1 = a1.add(l1);
+            hot.lr.ids = (a0, l0, a1, l1);
+            (t1.add(q1 + 1), term(t0, q0) | term(t1, q1))
+        };
+        // (of no meaning for a long line)
         let ids = k::pack2(v0, l0, v1, l1);
-        let (ts, ing_s, kt, s5, mcb, open, nl, tb) = row_rest!(t1.add(q1 + 1), dates, hot);
+        let (ts, ing_s, kt, s5, mcb, open, nl, tb) = row_rest!(s2, dates, hot);
         bad |= tb as u64;
         if bad != 0 {
             return BAIL;
+        }
+        if long {
+            hot.lr.rest = (ts, ing_s, kt, s5, mcb, open, nl);
+            return LONGROW;
         }
         let mut next = s5 as usize + nl + 1;
         let dd = (ing_s - hot.ibase_s) as u64;
@@ -755,34 +782,15 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
     }
 }
 
-/// `hop_row` for a line whose event_id or user_id is long: the same walk with ID fields of up
-/// to 64 bytes (all in `0x30..=0x7F`), out of line. A user_id of 10 bytes or more gets a
-/// `URec`; an event_id of 10 bytes or more gets an `LRec`
-/// (`push_dedup`). Returns the next line's start, `BAIL` or `DATE_MISS`.
+/// The rest of a line that left `hop_row` with `LONGROW` (walked and of the usual shape, IDs
+/// of up to 64 bytes all in `0x30..=0x7F`); returns the next line's start. A user_id of 10
+/// bytes or more gets a `URec`, an event_id of 10 bytes or more an `LRec`: for these bytes
+/// `packable` is the length alone.
 #[inline(never)]
-unsafe fn long_row(ev: &EvRow, hot: &mut Hot, p: *const u8, dates: &HopDates, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> usize {
+unsafe fn long_emit<const RAW: bool>(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> *const u8 {
     unsafe {
-        let q0 = (*p == b'"') as usize;
-        let a0 = p.add(q0);
-        let l0 = k::id_len(a0);
-        if l0.wrapping_sub(1) > 63 {
-            return BAIL;
-        }
-        let t0 = a0.add(l0);
-        let mut bad = term(t0, q0);
-        let s1 = t0.add(q0 + 1);
-        let q1 = (*s1 == b'"') as usize;
-        let a1 = s1.add(q1);
-        let l1 = k::id_len(a1);
-        if l1 > 64 {
-            return BAIL;
-        }
-        let t1 = a1.add(l1);
-        bad |= term(t1, q1);
-        let (ts, ing_s, kt, s5, mcb, open, nl, tb) = row_rest!(t1.add(q1 + 1), dates, hot);
-        if bad | tb as u64 != 0 {
-            return BAIL;
-        }
+        let (a0, l0, a1, l1) = hot.lr.ids;
+        let (ts, ing_s, kt, s5, mcb, open, nl) = hot.lr.rest;
         let dd = (ing_s - hot.ibase_s) as u64;
         hot.max_d |= dd;
         let mut prec = NOPREC;
@@ -790,18 +798,42 @@ unsafe fn long_row(ev: &EvRow, hot: &mut Hot, p: *const u8, dates: &HopDates, pw
             let pc = if kt < 2 { purchase_pc(ev, s5, mcb, nl, open) } else { 0 };
             if kt >= 2 || pc != 0 {
                 let pts = (ts - hot.cbase) as u32;
-                prec = if l1 <= 9 { push_prec(ev.ctx, pw, escape, pack_id16(a1, l1), pts, pc) } else { push_urec(ev.ctx, uw, escape, a1, l1, ev.fix, pts, pc) };
+                prec = if l1 > 9 {
+                    push_urec(ev.ctx, uw, escape, a1, l1, ev.fix, pts, pc, true)
+                } else if RAW {
+                    let uid = pack_id16(a1, l1);
+                    let ps = ((id_hash(uid) >> 1) >> hot.pshift) as usize;
+                    let mut full = 0;
+                    let r = push16(hot.ph, hot.pb, ps, PRec { k: uid, ts: pts, pc }, &mut full);
+                    if full != 0 {
+                        pw.refill_full(ps);
+                    }
+                    let idx = r.wrapping_sub(hot.pbase) / std::mem::size_of::<PRec>();
+                    hot.max_idx |= idx;
+                    idx as u32
+                } else {
+                    push_prec(ev.ctx, pw, escape, pack_id16(a1, l1), pts, pc)
+                };
             }
         }
-        // (the bytes are all in 0x30..=0x7F: `packable` is the length alone here)
         if l0 <= 9 {
             let eid = pack_id16(a0, l0);
-            dw.push(((id_hash(eid) >> 1) >> hot.dshift) as usize, DRec { eid, ing: dd as u32, prec });
+            let ds = ((id_hash(eid) >> 1) >> hot.dshift) as usize;
+            let rec = DRec { eid, ing: dd as u32, prec };
+            if RAW {
+                let mut full = 0;
+                push16(hot.dh, hot.db, ds, rec, &mut full);
+                if full != 0 {
+                    dw.refill_full(ds);
+                }
+            } else {
+                dw.push(ds, rec);
+            }
         } else {
             let h = bytes_hash(a0, l0);
-            lw.push(((h >> 1) >> hot.dshift) as usize, LRec { h, ptr: (a0 as usize).wrapping_add(ev.fix), len: l0 as u32, ing: dd as u32, prec, pad: 0 });
+            lw.push(crate::links::part_of(h, ev.ctx.lbits), LRec { h, ptr: (a0 as usize).wrapping_add(ev.fix), len: l0 as u32, ing: dd as u32, prec, pad: 0 });
         }
-        s5 as usize + nl + 1
+        s5.add(nl + 1)
     }
 }
 
@@ -935,6 +967,7 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
             ps: 0,
             ds: 0,
             pur: Purchase { eid: 0, uid: 0, ts: 0, dd: 0, s5: base, mcb: 0, open: 0, nl: 0 },
+            lr: LongRow { ids: (base, 0, base, 0), rest: (0, 0, 0, base, 0, 0, 0) },
         };
         let end = base.add(len);
         // lines that start before `fast_end` have `GUARD` readable bytes
@@ -964,12 +997,8 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
                 continue;
             }
             if code == LONGROW {
-                let r = long_row(ev, &mut hot, p, dates, pw, dw, lw, uw, escape);
-                if (r as isize) >= CODES {
-                    p = r as *const u8;
-                    continue;
-                }
-                code = r;
+                p = long_emit::<RAW>(ev, &mut hot, pw, dw, lw, uw, escape);
+                continue;
             }
             if code == DATE_MISS {
                 // A line misses at most twice (its two dates) before it passes; one whose

@@ -102,22 +102,24 @@ pub(crate) unsafe fn push_good(ctx: &Ctx, pw: &mut Writers<PRec>, uw: &mut Write
         if packable(p, len) {
             return push_prec(ctx, pw, escape, pack_id(p, len, lim), ts, pc);
         }
-        push_urec(ctx, uw, escape, p, len, fix, ts, pc)
+        push_urec(ctx, uw, escape, p, len, fix, ts, pc, false)
     }
 }
 
-/// `push_good` for a user_id that is known not to be packable.
+/// `push_good` for a user_id that is known not to be packable (`readable`: and to have
+/// `UINLINE` readable bytes at `p`).
 #[inline(always)]
-pub(crate) unsafe fn push_urec(ctx: &Ctx, uw: &mut Writers<URec>, escape: &mut bool, p: *const u8, len: usize, fix: usize, ts: u32, pc: u32) -> u32 {
+pub(crate) unsafe fn push_urec(ctx: &Ctx, uw: &mut Writers<URec>, escape: &mut bool, p: *const u8, len: usize, fix: usize, ts: u32, pc: u32, readable: bool) -> u32 {
     unsafe {
         let h = bytes_hash(p, len);
         let mut rec = URec { h, ts, pc, len: len as u32, pad: 0, bytes: [0; UINLINE] };
         if len <= UINLINE {
-            std::ptr::copy_nonoverlapping(p, rec.bytes.as_mut_ptr(), len);
+            // (`readable`: `UINLINE` bytes can be read at `p`; those after `len` mean nothing)
+            std::ptr::copy_nonoverlapping(p, rec.bytes.as_mut_ptr(), if readable { UINLINE } else { len });
         } else {
             (rec.bytes.as_mut_ptr() as *mut usize).write_unaligned((p as usize).wrapping_add(fix));
         }
-        let r = uw.push_ptr(part_of(h, ctx.pbits), rec);
+        let r = uw.push_ptr(part_of(h, ctx.lbits), rec);
         let idx = (r as usize).wrapping_sub(ctx.uregion.base) / std::mem::size_of::<URec>();
         *escape |= idx >= UFLAG as usize;
         idx as u32 | UFLAG
@@ -139,13 +141,13 @@ unsafe fn kill(pbase: *mut PRec, ubase: *mut URec, prec: u32) {
 
 /// The surviving `URec`s as `PRec`s (in the partitions of their interned user IDs).
 fn resolve_long_users(ctx: &Ctx, uparts: &[Parts<URec>], nthreads: usize, wc: bool) -> Vec<Parts<PRec>> {
-    let np = 1usize << ctx.pbits;
+    let np = 1usize << ctx.lbits;
     if (0..np).all(|p| uparts.iter().all(|u| u.count(p) == 0)) {
         return Vec::new();
     }
     let next = AtomicUsize::new(0);
     par((0..nthreads.max(1)).collect::<Vec<usize>>(), |_, _| {
-        let mut pw: Writers<PRec> = Writers::with_wc(np, PBLOCK, wc);
+        let mut pw: Writers<PRec> = Writers::with_wc(1 << ctx.pbits, PBLOCK, wc);
         // slots: 1 + the index in `seen` of a distinct ID of the partition (its first
         // record and its Id), or 0
         let mut table: Vec<u32> = Vec::new();
@@ -207,14 +209,16 @@ pub unsafe fn bytes_hash(p: *const u8, len: usize) -> u64 {
     unsafe {
         let rd = |q: *const u8| (q as *const u64).read_unaligned();
         let mut h = (len as u64).wrapping_mul(K1) ^ K0;
-        if len >= 8 {
+        if len >= 16 {
+            // sixteen bytes a multiplication; the last sixteen may overlap the ones before
             let mut i = 0;
-            while i + 8 < len {
-                h = mum(h ^ rd(p.add(i)), K1);
-                i += 8;
+            while i + 16 < len {
+                h = mum(rd(p.add(i)) ^ K0, rd(p.add(i + 8)) ^ h);
+                i += 16;
             }
-            // the last eight bytes (they may overlap the word before)
-            h = mum(h ^ rd(p.add(len - 8)) ^ K0, K1);
+            h = mum(rd(p.add(len - 16)) ^ K1, rd(p.add(len - 8)) ^ h);
+        } else if len >= 8 {
+            h = mum(rd(p) ^ K0, rd(p.add(len - 8)) ^ h);
         } else {
             let mut w = 0u64;
             for i in 0..len {
@@ -236,7 +240,7 @@ pub(crate) unsafe fn push_dedup(ctx: &Ctx, dw: &mut Writers<DRec>, lw: &mut Writ
             dw.push(part_of(id_hash(eid), ctx.dbits), DRec { eid, ing, prec });
         } else {
             let h = bytes_hash(p, len);
-            lw.push(part_of(h, ctx.dbits), LRec { h, ptr: (p as usize).wrapping_add(fix), len: len as u32, ing, prec, pad: 0 });
+            lw.push(part_of(h, ctx.lbits), LRec { h, ptr: (p as usize).wrapping_add(fix), len: len as u32, ing, prec, pad: 0 });
         }
     }
 }
@@ -285,6 +289,9 @@ pub struct Ctx {
     pub camp_names: Vec<Vec<u8>>,
     pub camp_channels: Vec<Vec<u8>>,
     pub dbits: u32,
+    /// Partition bits of the `LRec` and `URec` streams (fewer than `dbits`: few lines have
+    /// such records, and every open partition costs cache in the parse).
+    pub lbits: u32,
     pub pbits: u32,
     /// Debug knob (SE_STAGE): 1 = scan only, 2 = scan + evaluate, 0 = everything.
     pub stage: u32,
@@ -1020,6 +1027,7 @@ fn run_rest(
     let ev_bytes: usize = inp.events.iter().map(|f| f.len()).sum();
     let est_rows = ev_bytes / 75;
     let dbits = env_usize("SE_DBITS").map_or(ceil_log2(est_rows / 65_536).min(10), |b| b.min(12) as u32);
+    let lbits = env_usize("SE_LBITS").map_or(dbits.min(7), |b| b.min(12) as u32);
     let pbits = env_usize("SE_PBITS").map_or(ceil_log2(est_rows / 50_000).min(10), |b| b.min(12) as u32);
     // Every PRec comes from one region, so that a DRec can name it in 32 bits. A good event
     // line has at least 16 bytes, so the records need at most `ev_bytes`; the rest is for the
@@ -1028,13 +1036,13 @@ fn run_rest(
     let nt_max = nthreads.max(1);
     let pregion_bytes = ev_bytes + nt_max * ((PBLOCK * std::mem::size_of::<PRec>() + 64) << pbits) + (nt_max + 1) * (16 << 20);
     // (the same for the `URec`s: a line with one has at least 32 bytes)
-    let uregion_bytes = ev_bytes + nt_max * ((UBLOCK * std::mem::size_of::<URec>() + 64) << pbits) + (nt_max + 1) * (16 << 20);
+    let uregion_bytes = ev_bytes + nt_max * ((UBLOCK * std::mem::size_of::<URec>() + 64) << lbits) + (nt_max + 1) * (16 << 20);
     if pregion_bytes / std::mem::size_of::<PRec>() >= UFLAG as usize || uregion_bytes / std::mem::size_of::<URec>() >= UFLAG as usize {
         return false;
     }
     let pregion = Region::new(pregion_bytes);
     let uregion = Region::new(uregion_bytes);
-    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_flag("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion, uregion, hop: hop_default(level), chop: chop_default(level) };
+    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, lbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_flag("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion, uregion, hop: hop_default(level), chop: chop_default(level) };
 
     if tm.on {
         eprintln!(
@@ -1069,9 +1077,9 @@ fn run_rest(
             cache: DateCache::new(),
             dates: crate::hop::HopDates::new(), 
             dw: Writers::with_wc(1 << dbits, 1024, wc),
-            lw: Writers::with_wc(1 << dbits, 128, wc),
+            lw: Writers::with_wc(1 << lbits, 128, wc),
             pw: Writers::in_region(1 << pbits, PBLOCK, wc, pregion),
-            uw: Writers::in_region(1 << pbits, UBLOCK, wc, uregion),
+            uw: Writers::in_region(1 << lbits, UBLOCK, wc, uregion),
             cw: Writers::with_wc(1 << pbits, 128, wc),
         })
         .collect();
@@ -1164,7 +1172,7 @@ fn run_rest(
         // the lengths and the bytes are equal.
         loop {
             let p = next_long.fetch_add(1, Relaxed);
-            if p >= np {
+            if p >= 1usize << ctx.lbits {
                 break;
             }
             let n: usize = lparts_ref.iter().map(|d| d.count(p)).sum();
@@ -1208,8 +1216,9 @@ fn run_rest(
             }
         }
     });
-    ev.extend(resolve_long_users(&ctx, &uparts, nthreads, wc));
     tm.lap("dedup");
+    ev.extend(resolve_long_users(&ctx, &uparts, nthreads, wc));
+    tm.lap("long user IDs");
     let Some(links) = lh.join().unwrap() else { return false };
     let _ = ctx.links.set(links);
     tm.lap("links (join)");
@@ -1238,6 +1247,7 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
     let ev_bytes: usize = inp.events.iter().map(|f| f.len()).sum();
     let est_rows = ev_bytes / 75;
     let dbits = env_usize("SE_DBITS").map_or(ceil_log2(est_rows / 65_536).min(10), |b| b.min(12) as u32);
+    let lbits = env_usize("SE_LBITS").map_or(dbits.min(7), |b| b.min(12) as u32);
     let pbits = env_usize("SE_PBITS").map_or(ceil_log2(est_rows / 50_000).min(10), |b| b.min(12) as u32);
     let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let kernels = var("KB_KERNELS", "scan,hop");
@@ -1245,7 +1255,7 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
     let reps = env_usize("KB_REPS").unwrap_or(2);
     let nt_max = threads.iter().copied().max().unwrap_or(1).max(1);
     let pregion_bytes = ev_bytes + nt_max * ((PBLOCK * std::mem::size_of::<PRec>() + 64) << pbits) + (nt_max + 1) * (16 << 20);
-    let mut ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: 0, drop_pages: false, ibase: inp.ws - (1i64 << 31) * 1000, pregion: Region::new(1 << 20), uregion: Region::new(1 << 20), hop: false, chop: false };
+    let mut ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, lbits, pbits, stage: 0, drop_pages: false, ibase: inp.ws - (1i64 << 31) * 1000, pregion: Region::new(1 << 20), uregion: Region::new(1 << 20), hop: false, chop: false };
     let mut jobs = Vec::new();
     // KB_KIND=clicks: the click files instead (hash of every `CRec`, row pointer included).
     let clicks = var("KB_KIND", "events") == "clicks";
@@ -1268,7 +1278,7 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                 let nt = nt.min(jobs.len().max(1));
                 let next = AtomicUsize::new(0);
                 let states: Vec<PState> = (0..nt)
-                    .map(|_| PState { escape: false, slow: 0, rbuf: std::ptr::null_mut(), rcap: 0, buf: ScanBuf::new(), cache: DateCache::new(), dates: crate::hop::HopDates::new(),  dw: Writers::with_wc(1 << dbits, 1024, wc), lw: Writers::with_wc(1 << dbits, 128, wc), pw: Writers::in_region(1 << pbits, PBLOCK, wc, ctx.pregion), uw: Writers::in_region(1 << pbits, UBLOCK, wc, ctx.uregion), cw: Writers::with_wc(1 << pbits, 128, wc) })
+                    .map(|_| PState { escape: false, slow: 0, rbuf: std::ptr::null_mut(), rcap: 0, buf: ScanBuf::new(), cache: DateCache::new(), dates: crate::hop::HopDates::new(),  dw: Writers::with_wc(1 << dbits, 1024, wc), lw: Writers::with_wc(1 << lbits, 128, wc), pw: Writers::in_region(1 << pbits, PBLOCK, wc, ctx.pregion), uw: Writers::in_region(1 << lbits, UBLOCK, wc, ctx.uregion), cw: Writers::with_wc(1 << pbits, 128, wc) })
                     .collect();
                 let t0 = std::time::Instant::now();
                 let res = par(states, |_, mut st| {
@@ -1300,7 +1310,7 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                 };
                 let mut nlong = 0u64;
                 for (_, _, _, _, _, l) in &res {
-                    for part in 0..(1usize << dbits) {
+                    for part in 0..(1usize << lbits) {
                         for sl in l.slices(part) {
                             for r in sl.iter() {
                                 nd += 1;
@@ -1571,9 +1581,9 @@ mod hop_tests {
             cache: DateCache::new(),
             dates: crate::hop::HopDates::new(), 
             dw: Writers::with_wc(1 << ctx.dbits, 8, true),
-            lw: Writers::with_wc(1 << ctx.dbits, 8, true),
+            lw: Writers::with_wc(1 << ctx.lbits, 8, true),
             pw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.pregion),
-            uw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.uregion),
+            uw: Writers::in_region(1 << ctx.lbits, 8, true, ctx.uregion),
             cw: Writers::with_wc(1 << ctx.pbits, 8, true),
         };
         let mut jobs = Vec::new();
@@ -1605,14 +1615,14 @@ mod hop_tests {
             }
         };
         let mut out = Vec::new();
-        for part in 0..(1usize << ctx.dbits) {
+        for part in 0..(1usize << ctx.lbits) {
             for sl in l.slices(part) {
                 for r in sl.iter() {
                     // the record names the ID's bytes in the file
                     let off = r.ptr.wrapping_sub(data.as_ptr() as usize);
                     assert!(off < data.len() && off + r.len as usize <= data.len());
                     let b = &data[off..off + r.len as usize];
-                    assert!(unsafe { bytes_hash(b.as_ptr(), b.len()) } == r.h && !unsafe { packable(b.as_ptr(), b.len()) } && part == part_of(r.h, ctx.dbits));
+                    assert!(unsafe { bytes_hash(b.as_ptr(), b.len()) } == r.h && !unsafe { packable(b.as_ptr(), b.len()) } && part == part_of(r.h, ctx.lbits));
                     let p = view(r.prec);
                     out.push((r.h | LONG, r.ing ^ r.len.rotate_left(27), p));
                 }
@@ -1650,6 +1660,7 @@ mod hop_tests {
             camp_names: Vec::new(),
             camp_channels: Vec::new(),
             dbits: 2,
+            lbits: 1,
             pbits: 1,
             stage: 0,
             drop_pages: false,
@@ -1788,9 +1799,9 @@ mod hop_tests {
             cache: DateCache::new(),
             dates: crate::hop::HopDates::new(), 
             dw: Writers::with_wc(1 << ctx.dbits, 8, true),
-            lw: Writers::with_wc(1 << ctx.dbits, 8, true),
+            lw: Writers::with_wc(1 << ctx.lbits, 8, true),
             pw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.pregion),
-            uw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.uregion),
+            uw: Writers::in_region(1 << ctx.lbits, 8, true, ctx.uregion),
             cw: Writers::with_wc(1 << ctx.pbits, 8, true),
         };
         let mut jobs = Vec::new();
