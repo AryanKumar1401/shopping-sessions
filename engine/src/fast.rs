@@ -1574,7 +1574,7 @@ fn run_rest(
             // The partition's records are first copied into sub-buckets by further hash bits,
             // each small enough that it and its table (slots: 1 + index in the bucket) stay
             // in the second-level cache; the copies have all that is needed.
-            let sb = env_sub.unwrap_or_else(|| ceil_log2(n / 6000).min(SUB_MAX_BITS));
+            let sb = env_sub.unwrap_or_else(|| ceil_log2(n / 1000).min(SUB_MAX_BITS));
             for v in subs[..1usize << sb].iter_mut() {
                 v.clear();
             }
