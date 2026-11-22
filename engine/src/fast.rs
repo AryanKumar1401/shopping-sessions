@@ -162,34 +162,15 @@ pub fn load_inputs(data: &Path) -> Inputs {
     let manifest = std::fs::read(data.join("manifest.json")).unwrap_or_else(|e| die(&format!("manifest.json: {e}")));
     let (products, campaigns) = (map(&data.join("products.csv")), map(&data.join("campaigns.csv")));
     // The tables are built on their own thread while the other files are opened and mapped
-    // (a few hundred of them: that takes as long as the tables do).
+    // (a few hundred of them: that takes as long as the tables do). The mapping itself stays
+    // on this thread: mapping from several threads only contends for the address-space lock.
     let level = pick_level();
     let tables = std::thread::spawn(move || (load_products(products, level), load_campaigns(campaigns, level)));
-    let lists = ["events", "clicks", "links"].map(|d| list_csv(&data.join(d)));
-    let n = [lists[0].len(), lists[1].len()];
-    let paths: Vec<PathBuf> = lists.into_iter().flatten().collect();
-    let nt = (paths.len() / 16).clamp(1, 4);
-    let next = AtomicUsize::new(0);
-    let mut maps: Vec<&'static [u8]> = vec![&[]; paths.len()];
-    let slots = maps.as_mut_ptr() as usize;
-    std::thread::scope(|sc| {
-        for _ in 0..nt {
-            sc.spawn(|| loop {
-                let i = next.fetch_add(1, Relaxed);
-                if i >= paths.len() {
-                    break;
-                }
-                // each index is written by exactly one thread
-                unsafe { (slots as *mut &'static [u8]).add(i).write(map(&paths[i])) };
-            });
-        }
-    });
-    let links = maps.split_off(n[0] + n[1]);
-    let clicks = maps.split_off(n[0]);
+    let maps = |d: &str| -> Vec<&'static [u8]> { list_csv(&data.join(d)).iter().map(|p| map(p)).collect() };
     Inputs {
-        events: maps,
-        clicks,
-        links,
+        events: maps("events"),
+        clicks: maps("clicks"),
+        links: maps("links"),
         products,
         campaigns,
         ws: manifest_value(&manifest, "window_start"),
