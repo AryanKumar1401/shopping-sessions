@@ -3,7 +3,7 @@
 # VARIANTS: "label:binary:ENV=V,ENV=V" (binary old = $OLDSHA built here, new = the probe's commit)
 set -u
 OLDSHA=${OLDSHA:-f1938a5}
-VARIANTS=${VARIANTS:-"old:old: new:new: l16:new:SE_LAHEAD=16 l32:new:SE_LAHEAD=32 bw:new:SE_BWARM=1"}
+VARIANTS=${VARIANTS:-"old:old: new:new: b4:new:SE_BFM=4 b8:new:SE_BFM=8 b4l:new:SE_BFM=4,SE_LAHEAD=16"}
 git worktree add -q --detach /tmp/wt-o $OLDSHA
 (cd /tmp/wt-o/engine && CARGO_TARGET_DIR=/tmp/t-o cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/t-o/$T/release/shopping-engine /tmp/eng-old)
 cp /tmp/eng /tmp/eng-new
