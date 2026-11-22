@@ -150,8 +150,9 @@ pub struct Ctx {
     pub pbits: u32,
     /// Debug knob (SE_STAGE): 1 = scan only, 2 = scan + evaluate, 0 = everything.
     pub stage: u32,
-    /// Drop each chunk's file pages from the mapping once it is parsed (SE_DROP=1; off by default:
-    /// `release_all` unmaps the files from all threads at the end, which is cheaper).
+    /// Drop each chunk's file pages from the mapping once it is parsed (SE_DROP=1 / 0; by default
+    /// only above `DROP_ABOVE` bytes of events: `release_files` unmaps the files from all
+    /// threads at the end, which is cheaper).
     pub drop_pages: bool,
     /// Zero of `DRec::ing`: `ws` - 2^31 s, in ms.
     pub ibase: i64,
@@ -838,6 +839,12 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
 }
 dispatch!(main_d, main_g, (ctx: &Ctx, st: &mut PState, job: &Job));
 
+/// Event bytes above which parsed chunks are dropped from the mappings as the parse goes
+/// (`Ctx::drop_pages`), to bound the mapped file pages (they are in the resident set, 5.7 GB
+/// at 60M events with 3.3 GB of arenas beside them). Below it, keeping them mapped until the
+/// end is faster (VM, 60M: 2585 vs 2679 ms).
+const DROP_ABOVE: usize = 12 << 30;
+
 pub fn run(inp: &Inputs, out: &Path, nthreads: usize, tm: &mut Timer) -> bool {
     let level = pick_level();
     let cbase = inp.ws - WEEK;
@@ -890,7 +897,7 @@ fn run_rest(
         return false;
     }
     let pregion = Region::new(pregion_bytes);
-    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_flag("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion, hop: hop_default(level), chop: chop_default(level) };
+    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: std::env::var("SE_DROP").map_or(ev_bytes > DROP_ABOVE, |v| !v.is_empty() && v != "0"), ibase: inp.ws - (1i64 << 31) * 1000, pregion, hop: hop_default(level), chop: chop_default(level) };
 
     if tm.on {
         eprintln!(

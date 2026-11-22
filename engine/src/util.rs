@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::os::fd::AsRawFd;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 unsafe extern "C" {
@@ -149,33 +149,51 @@ pub fn drop_range(_p: *const u8, _len: usize) {
     }
 }
 
-/// Gives the big anonymous slabs back to the kernel from `nthreads` threads at once (Linux).
-/// Process exit would do the same work on one thread. Nothing may use arena memory afterwards.
+/// `MADV_DONTNEED` on every range, from `nthreads` threads at once.
+#[cfg(target_os = "linux")]
+fn drop_ranges(ranges: &[(usize, usize)], nthreads: usize) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    par(vec![(); nthreads.max(1)], |_, _| {
+        loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= ranges.len() {
+                break;
+            }
+            unsafe { madvise(ranges[i].0 as *mut c_void, ranges[i].1, 4) }; // MADV_DONTNEED
+        }
+    });
+}
+
+/// Drops the pages of all file mappings from `nthreads` threads (Linux; SE_UNMAP=0: leaves
+/// them to exit, which does it on one thread and inside the measured time). The mappings stay
+/// valid: a byte read afterwards comes back from the page cache. (Starting this on the idle
+/// threads while campaign_daily is written was measured: 0.5 ms at 20M, nothing at 60M.)
+#[cfg(target_os = "linux")]
+fn release_files(_nthreads: usize) {
+    if env_on("SE_UNMAP") {
+        let maps = std::mem::take(&mut *MAPS.lock().unwrap());
+        let mut ranges = Vec::new();
+        for (p, len) in maps {
+            let mut o = 0;
+            while o < len {
+                let n = (len - o).min(4 * SLAB);
+                ranges.push((p + o, n));
+                o += n;
+            }
+        }
+        drop_ranges(&ranges, _nthreads);
+    }
+}
+
+/// Gives the big anonymous slabs (and any file mapping `release_files` has not done) back to
+/// the kernel from `nthreads` threads at once (Linux). Process exit would do the same work
+/// on one thread. Nothing may use arena memory afterwards.
 pub fn release_all(_nthreads: usize) {
     #[cfg(target_os = "linux")]
     {
-        let mut slabs = std::mem::take(&mut *SLABS.lock().unwrap());
-        // The file mappings too (SE_UNMAP=0: leave them to exit), in pieces for the threads.
-        if env_on("SE_UNMAP") {
-            for &(p, len) in MAPS.lock().unwrap().iter() {
-                let mut o = 0;
-                while o < len {
-                    let n = (len - o).min(4 * SLAB);
-                    slabs.push((p + o, n));
-                    o += n;
-                }
-            }
-        }
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        par(vec![(); _nthreads.max(1)], |_, _| {
-            loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if i >= slabs.len() {
-                    break;
-                }
-                unsafe { madvise(slabs[i].0 as *mut c_void, slabs[i].1, 4) }; // MADV_DONTNEED
-            }
-        });
+        release_files(_nthreads);
+        let slabs = std::mem::take(&mut *SLABS.lock().unwrap());
+        drop_ranges(&slabs, _nthreads);
     }
 }
 
@@ -573,7 +591,7 @@ pub const LONG: u64 = 1 << 63;
 //   move and are never freed.
 // - 4096 shards by the low bits of a hash of the bytes. A shard is an open-addressing table
 //   of atomic words (16 hash bits, 48-bit record address); lookups take no lock and touch
-//   the table word and the record. A miss takes the shard's lock, looks again, and inserts.
+//   the shard, one table word and the record (words compared eight bytes at a time). A miss takes the shard's lock, looks again, and inserts.
 //   A full table is replaced by a bigger copy; the old one stays valid (and is never freed)
 //   for readers that still hold it: they can only miss in it, which sends them to the lock.
 // - The index comes from one atomic counter; the record's address by index sits in a
@@ -595,35 +613,59 @@ impl IRec {
         unsafe { std::slice::from_raw_parts((self as *const IRec).add(1) as *const u8, self.len as usize) }
     }
 }
-struct InternTable {
-    mask: usize,
-    slots: Box<[AtomicU64]>,
-}
 struct InternShard {
     /// Guards inserts and table replacement; holds the number of entries.
     lock: Mutex<usize>,
-    table: AtomicPtr<InternTable>,
+    /// The table: the address of `1 << b` zero-initialised atomic words (64-byte aligned)
+    /// with `b` in its low 6 bits; 0 = none yet.
+    table: AtomicUsize,
 }
-static INTERN: std::sync::OnceLock<Box<[InternShard]>> = std::sync::OnceLock::new();
+static INTERN: [InternShard; 1 << INTERN_SHARD_BITS] = [const { InternShard { lock: Mutex::new(0), table: AtomicUsize::new(0) } }; 1 << INTERN_SHARD_BITS];
 static INTERN_NEXT: AtomicU64 = AtomicU64::new(0);
 /// Directory chunks: `1 << DIR_CHUNK_BITS` record addresses each.
 static INTERN_DIR: [AtomicPtr<usize>; 1 << 15] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 1 << 15];
 const ADDR: u64 = (1 << 48) - 1;
 
-#[inline]
+/// Hash of a byte string. From 8 bytes on: whole little-endian words, the last one
+/// overlapping its predecessor (the length is mixed in first, so this is unambiguous); a
+/// 33-byte ID takes five unaligned loads and no copy.
+#[inline(always)]
 fn hash_bytes(s: &[u8]) -> u64 {
-    let mut h = K0 ^ (s.len() as u64).wrapping_mul(K1);
-    let mut c = s.chunks_exact(8);
-    for w in &mut c {
-        h = mum(h ^ u64::from_le_bytes(w.try_into().unwrap()), K1);
-    }
-    let r = c.remainder();
-    if !r.is_empty() {
+    let n = s.len();
+    let mut h = K0 ^ (n as u64).wrapping_mul(K1);
+    let w = |i: usize| unsafe { (s.as_ptr().add(i) as *const u64).read_unaligned() };
+    if n >= 8 {
+        let mut i = 0;
+        while i + 8 < n {
+            h = mum(h ^ w(i), K1);
+            i += 8;
+        }
+        h = mum(h ^ w(n - 8), K1);
+    } else {
         let mut b = [0u8; 8];
-        b[..r.len()].copy_from_slice(r);
+        b[..n].copy_from_slice(s);
         h = mum(h ^ u64::from_le_bytes(b), K1);
     }
     mum(h ^ K1, K0)
+}
+
+/// `a[..s.len()] == s`, by words like `hash_bytes` (no call to memcmp).
+#[inline(always)]
+unsafe fn bytes_eq(a: *const u8, s: &[u8]) -> bool {
+    unsafe {
+        let n = s.len();
+        let w = |p: *const u8, i: usize| (p.add(i) as *const u64).read_unaligned();
+        if n < 8 {
+            return std::slice::from_raw_parts(a, n) == s;
+        }
+        let mut d = w(a, n - 8) ^ w(s.as_ptr(), n - 8);
+        let mut i = 0;
+        while i + 8 < n {
+            d |= w(a, i) ^ w(s.as_ptr(), i);
+            i += 8;
+        }
+        d == 0
+    }
 }
 
 /// The directory entry of index `i`; its chunk is created if `make`.
@@ -655,30 +697,48 @@ fn intern_pos(h: u64, mask: usize) -> (usize, u64) {
     ((h >> INTERN_SHARD_BITS) as usize & mask, h & !ADDR)
 }
 
-/// Finds `s` (hash `h`) in `t`: its index.
-#[inline]
-fn intern_find(t: &InternTable, h: u64, s: &[u8]) -> Option<u64> {
-    let (mut i, tag) = intern_pos(h, t.mask);
+/// The slots and the mask of a table word of `InternShard::table` (not 0).
+#[inline(always)]
+fn intern_slots(t: usize) -> (*const AtomicU64, usize) {
+    ((t & !63) as *const AtomicU64, (1usize << (t & 63)) - 1)
+}
+
+/// Finds `s` (hash `h`) in table `t`: its index. A probe reads one table word and, when its
+/// 16 hash bits agree, the record (one cache line for an ID of up to 48 bytes).
+#[inline(always)]
+fn intern_find(t: usize, h: u64, s: &[u8]) -> Option<u64> {
+    if t == 0 {
+        return None;
+    }
+    let (slots, mask) = intern_slots(t);
+    let (mut i, tag) = intern_pos(h, mask);
     loop {
-        let v = unsafe { t.slots.get_unchecked(i) }.load(Ordering::Acquire);
+        let v = unsafe { &*slots.add(i) }.load(Ordering::Acquire);
         if v == 0 {
             return None;
         }
         if v & !ADDR == tag {
             let r = unsafe { &*((v & ADDR) as *const IRec) };
-            if r.hash == h && r.bytes() == s {
+            if r.hash == h && r.len as usize == s.len() && unsafe { bytes_eq((r as *const IRec).add(1) as *const u8, s) } {
                 return Some(r.idx as u64);
             }
         }
-        i = (i + 1) & t.mask;
+        i = (i + 1) & mask;
     }
 }
 
-fn intern_table(cap: usize) -> *mut InternTable {
-    Box::into_raw(Box::new(InternTable { mask: cap - 1, slots: (0..cap).map(|_| AtomicU64::new(0)).collect() }))
+/// A new table word for `1 << bits` slots.
+fn intern_table(bits: u32) -> usize {
+    let lay = std::alloc::Layout::from_size_align(8usize << bits, 64).unwrap();
+    let p = unsafe { std::alloc::alloc_zeroed(lay) } as usize;
+    if p == 0 {
+        std::alloc::handle_alloc_error(lay);
+    }
+    p | bits as usize
 }
 
-/// A new record for `s` in a bump arena of this thread (64 KiB at first, then 8 MiB slabs on huge pages).
+/// A new record for `s` in a bump arena of this thread (64 KiB at first, then 8 MiB slabs on
+/// huge pages). A record of up to 64 bytes does not cross a cache line.
 fn intern_record(s: &[u8], hash: u64, idx: u32) -> *const IRec {
     thread_local! {
         static BUMP: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 64 << 10)) };
@@ -686,6 +746,9 @@ fn intern_record(s: &[u8], hash: u64, idx: u32) -> *const IRec {
     let need = (std::mem::size_of::<IRec>() + s.len() + 7) & !7;
     BUMP.with(|b| {
         let (mut cur, mut end, mut next) = b.get();
+        if need <= 64 && (cur & 63) + need > 64 {
+            cur = (cur + 63) & !63;
+        }
         if cur + need > end {
             let n = need.max(next);
             cur = os_alloc(n) as usize;
@@ -702,37 +765,39 @@ fn intern_record(s: &[u8], hash: u64, idx: u32) -> *const IRec {
     })
 }
 
-#[inline(never)]
+/// The handle of the byte string `s`: the same for equal strings, from any thread. The
+/// known-ID case is this inlineable lookup; a new ID goes out of line.
+#[inline]
 pub fn intern_long(s: &[u8]) -> Id {
-    let shards = INTERN.get_or_init(|| (0..1usize << INTERN_SHARD_BITS).map(|_| InternShard { lock: Mutex::new(0), table: AtomicPtr::new(std::ptr::null_mut()) }).collect());
     let h = hash_bytes(s);
-    let sh = &shards[h as usize & ((1 << INTERN_SHARD_BITS) - 1)];
-    let t = sh.table.load(Ordering::Acquire);
-    if !t.is_null() {
-        if let Some(i) = intern_find(unsafe { &*t }, h, s) {
-            return i | LONG;
-        }
+    let sh = &INTERN[h as usize & ((1 << INTERN_SHARD_BITS) - 1)];
+    match intern_find(sh.table.load(Ordering::Acquire), h, s) {
+        Some(i) => i | LONG,
+        None => intern_new(sh, h, s),
     }
+}
+
+#[cold]
+#[inline(never)]
+fn intern_new(sh: &InternShard, h: u64, s: &[u8]) -> Id {
     let mut count = sh.lock.lock().unwrap();
     let mut t = sh.table.load(Ordering::Acquire);
-    if !t.is_null() {
-        if let Some(i) = intern_find(unsafe { &*t }, h, s) {
-            return i | LONG;
-        }
+    if let Some(i) = intern_find(t, h, s) {
+        return i | LONG;
     }
     // Insert. First make room: at most 3/4 full.
-    if t.is_null() || (*count + 1) * 4 > (unsafe { &*t }.mask + 1) * 3 {
-        let n = intern_table(if t.is_null() { 16 } else { (unsafe { &*t }.mask + 1) * 2 });
-        if !t.is_null() {
-            let (old, new) = unsafe { (&*t, &*n) };
-            for slot in old.slots.iter() {
-                let v = slot.load(Ordering::Relaxed);
+    if t == 0 || (*count + 1) * 4 > (intern_slots(t).1 + 1) * 3 {
+        let n = intern_table(if t == 0 { 4 } else { (t & 63) as u32 + 1 });
+        if t != 0 {
+            let ((old, omask), (new, nmask)) = (intern_slots(t), intern_slots(n));
+            for k in 0..=omask {
+                let v = unsafe { &*old.add(k) }.load(Ordering::Relaxed);
                 if v != 0 {
-                    let mut i = intern_pos(unsafe { (*((v & ADDR) as *const IRec)).hash }, new.mask).0;
-                    while new.slots[i].load(Ordering::Relaxed) != 0 {
-                        i = (i + 1) & new.mask;
+                    let mut i = intern_pos(unsafe { (*((v & ADDR) as *const IRec)).hash }, nmask).0;
+                    while unsafe { &*new.add(i) }.load(Ordering::Relaxed) != 0 {
+                        i = (i + 1) & nmask;
                     }
-                    new.slots[i].store(v, Ordering::Relaxed);
+                    unsafe { &*new.add(i) }.store(v, Ordering::Relaxed);
                 }
             }
         }
@@ -747,12 +812,12 @@ pub fn intern_long(s: &[u8]) -> Id {
     let rec = intern_record(s, h, idx as u32);
     debug_assert!(rec as u64 & !ADDR == 0);
     unsafe { *intern_dir(idx as usize, true) = rec as usize };
-    let t = unsafe { &*t };
-    let (mut i, tag) = intern_pos(h, t.mask);
-    while t.slots[i].load(Ordering::Relaxed) != 0 {
-        i = (i + 1) & t.mask;
+    let (slots, mask) = intern_slots(t);
+    let (mut i, tag) = intern_pos(h, mask);
+    while unsafe { &*slots.add(i) }.load(Ordering::Relaxed) != 0 {
+        i = (i + 1) & mask;
     }
-    t.slots[i].store(tag | rec as u64, Ordering::Release);
+    unsafe { &*slots.add(i) }.store(tag | rec as u64, Ordering::Release);
     *count += 1;
     idx | LONG
 }
