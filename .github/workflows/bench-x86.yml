@@ -17,7 +17,7 @@ jobs:
       - name: setup
         run: |
           lscpu | grep -E "Model name|^CPU\(s\)"
-          (cd bench/x86/generator && RUSTFLAGS= cargo build -q --release && ./target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output /tmp/s3 >/dev/null && ./target/release/generate --seed 11 --events 5000000 --clicks 1250000 --output /tmp/s11 >/dev/null && ./target/release/generate --seed 249 --events 1000000 --clicks 250000 --output /tmp/s249 >/dev/null)
+          (cd bench/x86/generator && RUSTFLAGS= cargo build -q --release && ./target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output /tmp/s3 >/dev/null && ./target/release/generate --seed 11 --events 5000000 --clicks 1250000 --output /tmp/s11 >/dev/null && ./target/release/generate --seed 249 --events 1000000 --clicks 250000 --output /tmp/s249 >/dev/null && ./target/release/generate --seed 5 --events 60000000 --clicks 15000000 --output /tmp/s5 >/dev/null)
           mkdir -p out/perf
           for rv in old:$OLD new:$NEW; do n=${rv%%:*}; git worktree add -q --detach /tmp/wt-$n ${rv##*:}; (cd /tmp/wt-$n/engine && CARGO_TARGET_DIR=/tmp/t-$n cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/t-$n/$T/release/shopping-engine $GITHUB_WORKSPACE/out/perf/$n); done
           python3 -m venv .venv && .venv/bin/pip -q install polars duckdb==1.5.6 pyarrow >/dev/null 2>&1
@@ -40,3 +40,7 @@ jobs:
           echo "docker s11 vs DuckDB: $(.venv/bin/python scripts/compare.py /tmp/dk /tmp/duck11 2>&1 | tail -1)"
       - name: bench 20M (interleaved)
         run: python3 bench/bench.py --data /tmp/s3 --reps 11 old=out/perf/old new=out/perf/new 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list|tables|links \(join)|rss"
+      - name: 60M (the final's size): output and interleaved bench
+        run: |
+          out/perf/old /tmp/s5 /tmp/a-s5 >/dev/null 2>&1; out/perf/new /tmp/s5 /tmp/b-s5 >/dev/null 2>&1; echo "new s5-60m vs old: $(.venv/bin/python scripts/compare.py /tmp/b-s5 /tmp/a-s5 2>&1 | tail -1)"
+          python3 bench/bench.py --data /tmp/s5 --reps 5 old=out/perf/old new=out/perf/new 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list|tables|links \(join)|rss"
