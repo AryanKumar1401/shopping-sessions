@@ -758,12 +758,55 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
     }
 }
 
+/// A thread's memo of long user IDs -> `Id`, so that the shared interner is asked once per
+/// thread and ID, not once per line. Direct-mapped by `bytes_hash`; an entry holds the ID's
+/// bytes (IDs of more than `UID_INLINE` bytes are not kept) and is used only when they are
+/// equal, so the result is always what `intern_long` returns.
+pub struct UidMemo {
+    e: Vec<UidEnt>,
+}
+const UID_INLINE: usize = 47;
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct UidEnt {
+    id: Id,
+    len: u8,
+    bytes: [u8; UID_INLINE],
+}
+impl UidMemo {
+    pub fn new() -> Self {
+        UidMemo { e: Vec::new() }
+    }
+    #[inline(always)]
+    unsafe fn get(&mut self, p: *const u8, len: usize) -> Id {
+        unsafe {
+            let b = std::slice::from_raw_parts(p, len);
+            if len > UID_INLINE {
+                return intern_long(b);
+            }
+            if self.e.is_empty() {
+                self.e = vec![UidEnt { id: 0, len: 0, bytes: [0; UID_INLINE] }; 1 << 16];
+            }
+            let slot = (bytes_hash(p, len) >> 40) as usize & ((1 << 16) - 1);
+            let e = self.e.get_unchecked_mut(slot);
+            if e.len as usize == len && e.bytes.get_unchecked(..len) == b {
+                return e.id;
+            }
+            let id = intern_long(b);
+            e.id = id;
+            e.len = len as u8;
+            e.bytes.get_unchecked_mut(..len).copy_from_slice(b);
+            id
+        }
+    }
+}
+
 /// `hop_row` for a line whose event_id or user_id is long: the same walk with ID fields of up
 /// to 64 bytes (all in `0x30..=0x7F`), out of line. A user_id of 10 bytes or more is
 /// interned, as `pack_id` does; an event_id of 10 bytes or more gets an `LRec`
 /// (`push_dedup`). Returns the next line's start, `BAIL` or `DATE_MISS`.
 #[inline(never)]
-unsafe fn long_row(ev: &EvRow, hot: &mut Hot, p: *const u8, dates: &HopDates, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, escape: &mut bool) -> usize {
+unsafe fn long_row(ev: &EvRow, hot: &mut Hot, p: *const u8, dates: &HopDates, um: &mut UidMemo, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, escape: &mut bool) -> usize {
     unsafe {
         let q0 = (*p == b'"') as usize;
         let a0 = p.add(q0);
@@ -792,7 +835,7 @@ unsafe fn long_row(ev: &EvRow, hot: &mut Hot, p: *const u8, dates: &HopDates, pw
         if ((ts.wrapping_sub(hot.ws) as u64) < hot.span) && (ing_s * 1000).wrapping_sub(ts) <= DAY && l1 != 0 {
             let pc = if kt < 2 { purchase_pc(ev, s5, mcb, nl, open) } else { 0 };
             if kt >= 2 || pc != 0 {
-                let uid = if l1 <= 9 { pack_id16(a1, l1) } else { intern_long(std::slice::from_raw_parts(a1, l1)) };
+                let uid = if l1 <= 9 { pack_id16(a1, l1) } else { um.get(a1, l1) };
                 prec = push_prec(ev.ctx, pw, escape, uid, (ts - hot.cbase) as u32, pc);
             }
         }
@@ -908,7 +951,7 @@ unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCac
 }
 
 #[inline(always)]
-unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, escape: &mut bool) -> u64 {
+unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, um: &mut UidMemo, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, escape: &mut bool) -> u64 {
     unsafe {
         let ctx = ev.ctx;
         let (ph, pb) = pw.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
@@ -960,7 +1003,7 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
                 continue;
             }
             if code == LONGROW {
-                let r = long_row(ev, &mut hot, p, dates, pw, dw, lw, escape);
+                let r = long_row(ev, &mut hot, p, dates, um, pw, dw, lw, escape);
                 if (r as isize) >= CODES {
                     p = r as *const u8;
                     continue;
@@ -995,12 +1038,12 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
 /// All event lines of `base[..len]` (whole lines; the last may lack its `\n` only when it
 /// ends at `ev.lim`). Returns how many lines took the general path.
 #[inline(always)]
-pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, escape: &mut bool) -> u64 {
+pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, um: &mut UidMemo, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, escape: &mut bool) -> u64 {
     unsafe {
         if pw.raw().is_some() && dw.raw().is_some() && std::mem::size_of::<PRec>() == 16 && std::mem::size_of::<DRec>() == 16 {
-            hop_loop::<true>(ev, base, len, dates, cache, pw, dw, lw, escape)
+            hop_loop::<true>(ev, base, len, dates, um, cache, pw, dw, lw, escape)
         } else {
-            hop_loop::<false>(ev, base, len, dates, cache, pw, dw, lw, escape)
+            hop_loop::<false>(ev, base, len, dates, um, cache, pw, dw, lw, escape)
         }
     }
 }

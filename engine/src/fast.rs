@@ -649,6 +649,7 @@ struct PState {
     buf: ScanBuf,
     cache: DateCache,
     dates: crate::hop::HopDates,
+    um: crate::hop::UidMemo,
     dw: Writers<DRec>,
     lw: Writers<LRec>,
     pw: Writers<PRec>,
@@ -795,7 +796,7 @@ pub unsafe fn click_general(ctx: &Ctx, f: &[Field; 4], row: *const u8, lim: *con
 #[inline(always)]
 unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
     unsafe {
-        let PState { escape, slow, rbuf, rcap, buf, cache, dates, dw, lw, pw, cw } = st;
+        let PState { escape, slow, rbuf, rcap, buf, cache, dates, um, dw, lw, pw, cw } = st;
         // `base[..len]`: the job's lines; `lim`: end of the readable bytes; `fix`: what to add
         // to a row pointer to get its address in the file's mapping (which outlives the job).
         let (base, len, lim, fix) = match read_job(job, *rbuf, *rcap) {
@@ -815,7 +816,7 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
             // (SE_STAGE: 1 = scan only; 2, 3 = the general evaluator without scatter)
             let ev = EvRow { ctx, lim, fast_rows: ctx.ibase % 1000 == 0 && ctx.stage == 0, ibase_s: ctx.ibase / 1000, fix };
             if ctx.hop && ev.fast_rows {
-                *slow += crate::hop::hop_events(&ev, base, len, dates, cache, pw, dw, lw, escape);
+                *slow += crate::hop::hop_events(&ev, base, len, dates, um, cache, pw, dw, lw, escape);
             } else if ctx.stage == 1 {
                 scan_rows::<M, 7>(buf, base, len, |r| {
                     std::hint::black_box(r);
@@ -922,7 +923,7 @@ fn run_rest(
             rcap,
             buf: ScanBuf::new(),
             cache: DateCache::new(),
-            dates: crate::hop::HopDates::new(),
+            dates: crate::hop::HopDates::new(), um: crate::hop::UidMemo::new(),
             dw: Writers::with_wc(1 << dbits, 1024, wc),
             lw: Writers::with_wc(1 << dbits, 128, wc),
             pw: Writers::in_region(1 << pbits, PBLOCK, wc, pregion),
@@ -1122,7 +1123,7 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                 let nt = nt.min(jobs.len().max(1));
                 let next = AtomicUsize::new(0);
                 let states: Vec<PState> = (0..nt)
-                    .map(|_| PState { escape: false, slow: 0, rbuf: std::ptr::null_mut(), rcap: 0, buf: ScanBuf::new(), cache: DateCache::new(), dates: crate::hop::HopDates::new(), dw: Writers::with_wc(1 << dbits, 1024, wc), lw: Writers::with_wc(1 << dbits, 128, wc), pw: Writers::in_region(1 << pbits, PBLOCK, wc, ctx.pregion), cw: Writers::with_wc(1 << pbits, 128, wc) })
+                    .map(|_| PState { escape: false, slow: 0, rbuf: std::ptr::null_mut(), rcap: 0, buf: ScanBuf::new(), cache: DateCache::new(), dates: crate::hop::HopDates::new(), um: crate::hop::UidMemo::new(), dw: Writers::with_wc(1 << dbits, 1024, wc), lw: Writers::with_wc(1 << dbits, 128, wc), pw: Writers::in_region(1 << pbits, PBLOCK, wc, ctx.pregion), cw: Writers::with_wc(1 << pbits, 128, wc) })
                     .collect();
                 let t0 = std::time::Instant::now();
                 let res = par(states, |_, mut st| {
@@ -1408,7 +1409,7 @@ mod hop_tests {
             rcap: 0,
             buf: ScanBuf::new(),
             cache: DateCache::new(),
-            dates: crate::hop::HopDates::new(),
+            dates: crate::hop::HopDates::new(), um: crate::hop::UidMemo::new(),
             dw: Writers::with_wc(1 << ctx.dbits, 8, true),
             lw: Writers::with_wc(1 << ctx.dbits, 8, true),
             pw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.pregion),
@@ -1580,7 +1581,7 @@ mod hop_tests {
             rcap: 0,
             buf: ScanBuf::new(),
             cache: DateCache::new(),
-            dates: crate::hop::HopDates::new(),
+            dates: crate::hop::HopDates::new(), um: crate::hop::UidMemo::new(),
             dw: Writers::with_wc(1 << ctx.dbits, 8, true),
             lw: Writers::with_wc(1 << ctx.dbits, 8, true),
             pw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.pregion),
