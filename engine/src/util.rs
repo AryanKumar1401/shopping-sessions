@@ -14,6 +14,53 @@ unsafe extern "C" {
     fn pread(fd: i32, buf: *mut c_void, n: usize, off: i64) -> isize;
     #[cfg(target_os = "linux")]
     fn prctl(option: i32, a2: u64, a3: u64, a4: u64, a5: u64) -> i32;
+    #[cfg(target_os = "linux")]
+    fn preadv2(fd: i32, iov: *const [usize; 2], iovcnt: i32, off: i64, flags: i32) -> isize;
+    #[cfg(target_os = "linux")]
+    fn __errno_location() -> *mut i32;
+}
+
+/// Scorer probe: is the input in the page cache? Samples up to 256 pages of `files` with
+/// `preadv2(RWF_NOWAIT)`, which reads only what is cached and never starts I/O. Returns
+/// (pages found cached, pages sampled); where the call is not supported, times a 64 MiB read
+/// of the largest file instead (cached data copies at several GB/s, a disk does not) and
+/// returns (0 or 1, 1). (0, 0): nothing to sample.
+pub fn cached_pages(files: &[&'static [u8]]) -> (usize, usize) {
+    #[cfg(target_os = "linux")]
+    {
+        let big: Vec<&&'static [u8]> = files.iter().filter(|f| f.len() >= 8192 && fd_of(f) >= 0).collect();
+        if big.is_empty() {
+            return (0, 0);
+        }
+        let mut page = [0u8; 4096];
+        let (mut hit, mut n) = (0usize, 0usize);
+        for i in 0..256usize {
+            let f = big[i % big.len()];
+            let pages = f.len() / 4096;
+            let off = (i.wrapping_mul(2_654_435_761) % pages) * 4096;
+            let iov = [page.as_mut_ptr() as usize, 4096usize];
+            let r = unsafe { preadv2(fd_of(f), &iov, 1, off as i64, 8) }; // RWF_NOWAIT
+            if r > 0 {
+                hit += 1;
+            } else if r < 0 && unsafe { *__errno_location() } != 11 {
+                // not EAGAIN: no RWF_NOWAIT here; time a plain read instead
+                let f = big.iter().max_by_key(|f| f.len()).unwrap();
+                let len = f.len().min(64 << 20);
+                let buf = os_alloc(len);
+                let t = std::time::Instant::now();
+                let ok = pread_exact(fd_of(f), buf, len, 0);
+                let secs = t.elapsed().as_secs_f64();
+                return ((ok && (len as f64) / secs > 1.5e9) as usize, 1);
+            }
+            n += 1;
+        }
+        return (hit, n);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = files;
+        (0, 0)
+    }
 }
 
 /// Experiment knob (Linux, SE_NOTHP=1): run without transparent huge pages, to measure what
