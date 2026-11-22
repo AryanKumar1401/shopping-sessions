@@ -791,6 +791,26 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
         };
         // (of no meaning for a long line)
         let ids = k::pack2(v0, l0, v1, l1);
+        // Both partitions and both heads now, before the rest of the line is looked at, so
+        // that the addresses of the two record stores at the end of the row are known long
+        // before the stores are reached. With speculative store bypass disabled (a container
+        // whose seccomp filter forces that mitigation) a load cannot start while an older
+        // store's address is unknown: with the heads loaded only at the end, the next
+        // line's first loads waited for this line's hashes and head loads (VM, events only,
+        // 20M, 8 threads: 314 -> 307 ms with the mitigation forced, 300 -> 300 without).
+        // (For a long line the IDs here mean nothing: two loads of some heads, not used.)
+        let (eid, uid) = (k::id0(ids), k::id1(ids));
+        let ps = ((id_hash(uid) >> 1) >> hot.pshift) as usize;
+        let ds = ((id_hash(eid) >> 1) >> hot.dshift) as usize;
+        let (php, dhp, pp, dp);
+        if RAW {
+            php = (hot.ph as *mut u8).add(ps << 4) as *mut (*mut PRec, *mut PRec);
+            dhp = (hot.dh as *mut u8).add(ds << 4) as *mut (*mut DRec, *mut DRec);
+            pp = (*php).0 as usize;
+            dp = (*dhp).0 as usize;
+        } else {
+            (php, dhp, pp, dp) = (std::ptr::null_mut(), std::ptr::null_mut(), 0, 0);
+        }
         let (ts, ing_s, kt, s5, mcb, open, nl, tb) = row_rest!(s2, dates, hot);
         bad |= tb as u64;
         if bad != 0 {
@@ -866,45 +886,53 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
         }
         let mut next = s5 as usize + nl + 1;
         let dd = (ing_s - hot.ibase_s) as u64;
-        let eid = k::id0(ids);
         let mut idx = NOPREC as usize;
         // (`ts` is not negative and the window is ordered: one compare for both ends)
-        if ((ts.wrapping_sub(hot.ws) as u64) < hot.span) && (ing_s * 1000).wrapping_sub(ts) <= DAY {
-            let uid = k::id1(ids);
-            if kt < 2 {
-                hot.pur = Purchase { eid, uid, ts, dd, s5, mcb, open, nl };
-                return PURCHASE;
-            }
-            if uid != 0 {
-                let ps = ((id_hash(uid) >> 1) >> hot.pshift) as usize;
-                let rec = PRec { k: uid, ts: (ts - hot.cbase) as u32, pc: 0 };
-                let prec = if RAW {
-                    let mut full = 0;
-                    let prec = push16(hot.ph, hot.pb, ps, rec, &mut full);
-                    if full != 0 {
+        let good = ((ts.wrapping_sub(hot.ws) as u64) < hot.span) && (ing_s * 1000).wrapping_sub(ts) <= DAY;
+        if good & (kt < 2) {
+            hot.pur = Purchase { eid, uid, ts, dd, s5, mcb, open, nl };
+            return PURCHASE;
+        }
+        hot.max_d |= dd;
+        if RAW {
+            // `push16` twice, with the heads loaded above. The `PRec` is written to its place
+            // in the partition's line whether the event is good or not (the place at the
+            // head is free, and stays free unless the head moves): the store must not hide
+            // behind the branch, or the compiler moves the head's load there with it.
+            let n = pp & 0x30;
+            let line = (hot.pb as *mut u8).add(ps << 6);
+            // (wrapping: for an event outside the window the difference means nothing)
+            (line.add(n) as *mut PRec).write(PRec { k: uid, ts: ts.wrapping_sub(hot.cbase) as u32, pc: 0 });
+            if good & (uid != 0) {
+                (*php).0 = (pp + 16) as *mut PRec;
+                if n == 0x30 {
+                    wc_copy((pp - 0x30) as *mut u8, line, 64);
+                    if (*php).1 as usize == pp + 16 {
                         hot.ps = ps;
                         next |= REFILL;
                     }
-                    prec
-                } else {
-                    pw.push_ptr(ps, rec) as usize
-                };
+                }
+                idx = pp.wrapping_sub(hot.pbase) / std::mem::size_of::<PRec>();
+                hot.max_idx |= idx;
+            }
+            let n = dp & 0x30;
+            let line = (hot.db as *mut u8).add(ds << 6);
+            (line.add(n) as *mut DRec).write(DRec { eid, ing: dd as u32, prec: idx as u32 });
+            (*dhp).0 = (dp + 16) as *mut DRec;
+            if n == 0x30 {
+                wc_copy((dp - 0x30) as *mut u8, line, 64);
+                if (*dhp).1 as usize == dp + 16 {
+                    hot.ds = ds;
+                    next |= REFILL;
+                }
+            }
+        } else {
+            if good & (uid != 0) {
+                let prec = pw.push_ptr(ps, PRec { k: uid, ts: (ts - hot.cbase) as u32, pc: 0 }) as usize;
                 idx = prec.wrapping_sub(hot.pbase) / std::mem::size_of::<PRec>();
                 hot.max_idx |= idx;
             }
-        }
-        hot.max_d |= dd;
-        let ds = ((id_hash(eid) >> 1) >> hot.dshift) as usize;
-        let rec = DRec { eid, ing: dd as u32, prec: idx as u32 };
-        if RAW {
-            let mut full = 0;
-            push16(hot.dh, hot.db, ds, rec, &mut full);
-            if full != 0 {
-                hot.ds = ds;
-                next |= REFILL;
-            }
-        } else {
-            dw.push(ds, rec);
+            dw.push(ds, DRec { eid, ing: dd as u32, prec: idx as u32 });
         }
         next
     }
