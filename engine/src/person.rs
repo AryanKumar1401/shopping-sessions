@@ -208,12 +208,31 @@ impl Out {
             }
         }
     }
+    /// Puts the person's name in `name`: the bytes of an interned ID are `long` (fetched
+    /// ahead, see `fetch_long`), a packed one is decoded without a branch per byte.
     #[inline(always)]
-    fn flush_row(&mut self, ctx: &Ctx, name: Id, day: u32, sess: u64, events: u64, rev: u64) {
-        if self.name.is_empty() {
-            id_bytes(name, &mut self.name);
+    fn set_name(&mut self, id: Id, long: &[u8]) {
+        self.name.clear();
+        if is_long(id) {
+            self.name.extend_from_slice(long);
             self.name.reserve(16);
+        } else {
+            // 9 characters of 7 bits, first one at the top, zero padded: a character is never
+            // 0, so the padding is `trailing_zeros / 7` whole characters
+            let mut b = [0u8; 16];
+            for (j, x) in b.iter_mut().take(9).enumerate() {
+                *x = ((id >> (56 - 7 * j)) & 0x7F) as u8;
+            }
+            let n = 9 - (id.trailing_zeros() / 7) as usize;
+            unsafe {
+                // capacity is at least 32
+                std::ptr::copy_nonoverlapping(b.as_ptr(), self.name.as_mut_ptr(), 16);
+                self.name.set_len(n);
+            }
         }
+    }
+    #[inline(always)]
+    fn flush_row(&mut self, ctx: &Ctx, day: u32, sess: u64, events: u64, rev: u64) {
         unsafe {
             // fixed-width columns have room for the whole group (`reserve_group`)
             let nl = self.name.len();
@@ -288,9 +307,9 @@ impl Out {
 /// by day. So a person with many sessions and many campaigns costs clicks x days, not
 /// sessions x campaigns.
 #[inline(always)]
-fn person(ctx: &Ctx, o: &mut Out, name: Id, sess: &[Sess], pu: &[Pu], cl: &[Clk]) {
+fn person(ctx: &Ctx, o: &mut Out, name: Id, long: &[u8], sess: &[Sess], pu: &[Pu], cl: &[Clk]) {
     let (nd, organic, day_off) = (o.nd, o.organic, o.day_off);
-    o.name.clear();
+    o.set_name(name, long);
     // No counter of `hot` gets more than one per session.
     if o.hot_n as usize + sess.len() > u16::MAX as usize {
         o.fold_hot();
@@ -312,7 +331,7 @@ fn person(ctx: &Ctx, o: &mut Out, name: Id, sess: &[Sess], pu: &[Pu], cl: &[Clk]
         let di = day as usize - 7;
         if day != cur_day {
             if si != 0 {
-                o.flush_row(ctx, name, cur_day, d_sess, d_events, d_rev);
+                o.flush_row(ctx, cur_day, d_sess, d_events, d_rev);
             }
             cur_day = day;
             d_sess = 0;
@@ -395,7 +414,7 @@ fn person(ctx: &Ctx, o: &mut Out, name: Id, sess: &[Sess], pu: &[Pu], cl: &[Clk]
         d_events += cnt as u64;
         d_rev += rev;
     }
-    o.flush_row(ctx, name, cur_day, d_sess, d_events, d_rev);
+    o.flush_row(ctx, cur_day, d_sess, d_events, d_rev);
     let ns = sess.len() as u32;
     for k in lo..hi {
         let c = cl[k].camp as usize;
@@ -439,6 +458,8 @@ struct Scratch {
     ctmp: Vec<Clk>,
     runs: Vec<(u32, usize)>,
     rp: Vec<usize>,
+    /// the bytes of the interned names among `keys` (`fetch_long`)
+    long: Vec<&'static [u8]>,
     /// Section times in ns (SE_TIMING).
     prof: [u64; 16],
     t0: std::time::Instant,
@@ -472,6 +493,7 @@ impl Scratch {
             ctmp: Vec::new(),
             runs: Vec::new(),
             rp: Vec::new(),
+            long: Vec::new(),
             prof: [0; 16],
             t0: std::time::Instant::now(),
         }
@@ -689,6 +711,21 @@ fn sessions_small(t: &mut [u32], sess: &mut Vec<Sess>) {
     sess.push(cur);
 }
 
+/// The bytes of the interned IDs among `ids`, in order, into `out`. Done for a whole partition
+/// before its people: each lookup is two dependent loads that usually miss the cache (the
+/// interner's records were last touched during parse), and here they are independent of each
+/// other, so the misses overlap instead of stalling one person each.
+fn fetch_long(out: &mut Vec<&'static [u8]>, ids: impl Iterator<Item = Id>) {
+    out.clear();
+    for id in ids {
+        if is_long(id) {
+            let s = long_bytes(id);
+            prefetch(s.as_ptr().wrapping_add(s.len().saturating_sub(1)));
+            out.push(s);
+        }
+    }
+}
+
 /// The click_id of the click line at `ptr`.
 unsafe fn click_id(ptr: usize) -> &'static [u8] {
     unsafe {
@@ -901,6 +938,8 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
         }
     }
     sc.lap(7);
+    fetch_long(&mut sc.long, (0..nk).filter(|&i| sc.soff[i] != sc.soff[i + 1]).map(|i| sc.keys[i]));
+    let mut li = 0;
     for i in 0..nk {
         let (sa, sb) = (sc.soff[i] as usize, sc.soff[i + 1] as usize);
         if sa == sb {
@@ -908,7 +947,13 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
         }
         let (ca, cb) = (sc.coff[i] as usize, sc.coff[i + 1] as usize);
         let (pa, pb) = (sc.cur[i] as usize, sc.cur[i + 1] as usize);
-        person(ctx, o, sc.keys[i], &sc.sess[sa..sb], &sc.pu[pa..pb], &sc.clk[ca..cb]);
+        let long = if is_long(sc.keys[i]) {
+            li += 1;
+            sc.long[li - 1]
+        } else {
+            &[]
+        };
+        person(ctx, o, sc.keys[i], long, &sc.sess[sa..sb], &sc.pu[pa..pb], &sc.clk[ca..cb]);
     }
     sc.lap(11);
     // linked IDs: one run each, to the partition of the person's name
@@ -1034,7 +1079,15 @@ fn pass_b(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], sc: &mut Scr
         *c += 1;
     }
     sc.lap(9);
+    fetch_long(&mut sc.long, sc.keys.iter().copied());
+    let mut li = 0;
     for i in 0..nk {
+        let long = if is_long(sc.keys[i]) {
+            li += 1;
+            sc.long[li - 1]
+        } else {
+            &[]
+        };
         let rs = &sc.rp[sc.off[i] as usize..sc.off[i + 1] as usize];
         let mut nts = 0usize;
         let (mut kpu, mut kcl) = (0usize, 0usize);
@@ -1109,7 +1162,7 @@ fn pass_b(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], sc: &mut Scr
             sort_clicks(&mut sc.clk, &mut sc.ckeys, &mut sc.ctmp);
             &sc.clk
         };
-        person(ctx, o, sc.keys[i], &sc.sess, pu, cl);
+        person(ctx, o, sc.keys[i], long, &sc.sess, pu, cl);
     }
     sc.lap(10);
 }
