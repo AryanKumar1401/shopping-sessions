@@ -5,7 +5,7 @@ jobs:
   x86:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env: { RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=+crt-static", T: x86_64-unknown-linux-gnu, OLD: bc430a3, NEW: 349325d }
+    env: { RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=+crt-static", T: x86_64-unknown-linux-gnu, OLD: 349325d, NEW: 349325d }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -14,7 +14,7 @@ jobs:
           lscpu | grep -E "Model name|^CPU\(s\)"
           (cd bench/x86/generator && RUSTFLAGS= cargo build -q --release && ./target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output /tmp/s3 >/dev/null && ./target/release/generate --seed 11 --events 5000000 --clicks 1250000 --output /tmp/s11 >/dev/null)
           mkdir -p out/perf
-          for rv in old:$OLD new:$NEW; do n=${rv%%:*}; git worktree add -q /tmp/wt-$n ${rv##*:}; (cd /tmp/wt-$n/engine && CARGO_TARGET_DIR=/tmp/t-$n cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/t-$n/$T/release/shopping-engine $GITHUB_WORKSPACE/out/perf/$n); done
+          for rv in old:$OLD new:$NEW; do n=${rv%%:*}; git worktree add -q --detach /tmp/wt-$n ${rv##*:}; [ $n = new ] && git -C /tmp/wt-new apply $GITHUB_WORKSPACE/bench/x86/patches/startup.patch; (cd /tmp/wt-$n/engine && CARGO_TARGET_DIR=/tmp/t-$n cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/t-$n/$T/release/shopping-engine $GITHUB_WORKSPACE/out/perf/$n); done
           python3 -m venv .venv && .venv/bin/pip -q install polars duckdb==1.5.6 pyarrow >/dev/null 2>&1
       - name: correctness of new
         run: |
@@ -25,4 +25,4 @@ jobs:
           for t in 1 2 3; do rm -rf /tmp/o; NCPU=$t out/perf/new fixtures/E1/input /tmp/o >/dev/null 2>&1; echo "new NCPU=$t rc=$?"; done
           for d in s3 s11; do out/perf/old /tmp/$d /tmp/a-$d >/dev/null 2>&1; out/perf/new /tmp/$d /tmp/b-$d >/dev/null 2>&1; echo "new $d vs old: $($PY scripts/compare.py /tmp/b-$d /tmp/a-$d 2>&1 | tail -1)"; done
       - name: bench 20M (interleaved)
-        run: python3 bench/bench.py --data /tmp/s3 --reps 11 old=out/perf/old new=out/perf/new 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list|tables|links \(join)"
+        run: python3 bench/bench.py --data /tmp/s3 --reps 15 old=out/perf/old new=out/perf/new 2>&1 | grep -vE "^ +(campaign_daily|release|links \(join)"
