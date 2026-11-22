@@ -41,6 +41,7 @@ unless noted. Run: `.venv/bin/python scripts/run_fixtures.py fixtures_extra -- <
 | X29_unknown_product_case | Product and campaign lookups are exact: 'P1' and 'p1 ' are unknown products; 'C_1' is an unknown campaign |
 | X30_header_only_everything | Every events/clicks/links file holds only the header: both tables are empty (but must exist as Parquet) |
 | X31_event_type_and_ids | event_type exact ('cart ' , 'CART', 'click' dropped); a view/cart with an empty price is fine; event_id case matters for dedup |
+| X40_click_tie_long_ids | Tie-break on long click IDs (33 bytes and more): whole IDs byte-wise, prefix first, quotes not counted, long vs short; a 33-byte user_id |
 
 Mutation check (oracle with one rule broken; the official 36 pass every one of these mutants):
 `is_leap = y%4==0` fails X03; dropping a last line without `\n` fails X11, X12; F3 parsed mod 2^64 fails X23; UTF-16 name order fails X13;
