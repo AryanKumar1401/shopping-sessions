@@ -1049,8 +1049,7 @@ pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, dates: &mut Ho
 ///
 /// The click_id is never turned into an `Id`: only its end is looked for (the tie-break reads
 /// it again from the line, `person::click_id`). A user_id of up to 9 bytes is packed as
-/// before; a longer one is interned exactly as `pack_id` does, and only for a click that is
-/// kept.
+/// before; a longer one goes into a `UCRec` (`fast::push_uclick`) and is interned after the parse.
 struct ClickHot {
     cbase: i64,
     /// `we - cbase`
@@ -1104,14 +1103,8 @@ unsafe fn id_scan80(a: *const u8) -> (k::V16, usize) {
     }
 }
 
-/// A user_id of `len` (10..=79) bytes at `a`, as `pack_id` gives it.
-#[inline(never)]
-unsafe fn long_uid(a: *const u8, len: usize) -> Id {
-    unsafe { intern_long(std::slice::from_raw_parts(a, len)) }
-}
-
 #[inline(always)]
-unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDates, cw: &mut Writers<CRec>) -> usize {
+unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDates, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>) -> usize {
     unsafe {
         // click_id
         let q0 = (*p == b'"') as usize;
@@ -1179,8 +1172,14 @@ unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDate
         if ((ts.wrapping_sub(hot.cbase) as u64) < hot.span) & (l1 != 0) & (cid != 0) {
             let camp = ctx.campaigns.get(cid);
             if camp != u32::MAX {
-                let uid = if l1 <= 9 { k::id0(ids) } else { long_uid(a1, l1) };
-                cw.push(part_of(id_hash(uid), ctx.pbits), CRec { k: uid, ts: (ts - hot.cbase) as u32, camp, ptr: (p as usize).wrapping_add(hot.fix) });
+                let (ts, ptr) = ((ts - hot.cbase) as u32, (p as usize).wrapping_add(hot.fix));
+                if l1 <= 9 {
+                    let uid = k::id0(ids);
+                    cw.push(part_of(id_hash(uid), ctx.pbits), CRec { k: uid, ts, camp, ptr });
+                } else {
+                    // (10 bytes or more: not packable; interned after the parse)
+                    push_uclick(ctx, ucw, a1, l1, hot.fix, ts, camp, ptr);
+                }
             }
         }
         next as usize
@@ -1190,14 +1189,14 @@ unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDate
 /// The click line at `p` (ending before `end`) by the general rules; returns the next line's start.
 #[cold]
 #[inline(never)]
-unsafe fn slow_click(ctx: &Ctx, p: *const u8, end: *const u8, lim: *const u8, fix: usize, cache: &mut DateCache, cw: &mut Writers<CRec>) -> *const u8 {
+unsafe fn slow_click(ctx: &Ctx, p: *const u8, end: *const u8, lim: *const u8, fix: usize, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>) -> *const u8 {
     unsafe {
         let mut e = p;
         while e < end && *e != b'\n' {
             e = e.add(1);
         }
         if let Some(f) = crate::scan::split_row::<4>(p, e as usize - p as usize) {
-            click_general(ctx, &f, p, lim, fix, cache, cw);
+            click_general(ctx, &f, p, lim, fix, cache, cw, ucw);
         }
         e.add(1)
     }
@@ -1206,7 +1205,7 @@ unsafe fn slow_click(ctx: &Ctx, p: *const u8, end: *const u8, lim: *const u8, fi
 /// All click lines of `base[..len]` (whole lines; the last may lack its `\n` only when it
 /// ends at `lim`, the end of the readable bytes). Returns how many lines took the general path.
 #[inline(always)]
-pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8, fix: usize, dates: &mut HopDates, cache: &mut DateCache, cw: &mut Writers<CRec>) -> u64 {
+pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8, fix: usize, dates: &mut HopDates, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>) -> u64 {
     unsafe {
         let mut hot = ClickHot { cbase: ctx.cbase, span: (ctx.we - ctx.cbase) as u64, fix, miss: base };
         let end = base.add(len);
@@ -1218,7 +1217,7 @@ pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8,
         loop {
             let mut code = BAIL;
             while p < fast_end {
-                let r = click_row(ctx, &mut hot, p, dates, cw);
+                let r = click_row(ctx, &mut hot, p, dates, cw, ucw);
                 if (r as isize) < CODES {
                     code = r;
                     break;
@@ -1240,7 +1239,7 @@ pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8,
                 break;
             }
             slow += 1;
-            p = slow_click(ctx, p, end, lim, fix, cache, cw);
+            p = slow_click(ctx, p, end, lim, fix, cache, cw, ucw);
         }
         slow
     }
