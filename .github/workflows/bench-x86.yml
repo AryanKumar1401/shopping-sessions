@@ -1,4 +1,4 @@
-# Scratch: speed-of-light probe vs the engine on x86. Not for main.
+# Scratch: line-level profile of the person pass on x86. Not for main.
 name: bench-x86
 on: { push: { branches: [bench-x86] }, workflow_dispatch: {} }
 jobs:
@@ -11,27 +11,15 @@ jobs:
         with: { fetch-depth: 0 }
       - name: setup
         run: |
-          lscpu | grep -E "Model name|^CPU\(s\)|L1d|L2|L3"
+          lscpu | grep -E "Model name|^CPU\(s\)"
+          sudo apt-get -qq install -y linux-tools-common linux-tools-$(uname -r) binutils >/dev/null 2>&1 || true
+          sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 || true
           (cd bench/x86/generator && cargo build -q --release && ./target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output /tmp/s3 >/dev/null)
-          (cd bench/x86/sol && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build -q --release && cp target/release/sol /tmp/sol)
           git worktree add -q /tmp/wt origin/main
-          git -C /tmp/wt apply $GITHUB_WORKSPACE/bench/x86/patches/skip.patch
-          (cd /tmp/wt/engine && RUSTFLAGS="$RF" cargo build -q --release --locked --target $T 2>/dev/null && cp target/$T/release/shopping-engine /tmp/eng)
-          du -sh /tmp/s3/events /tmp/s3/clicks
-      - name: floors
+          (cd /tmp/wt/engine && CARGO_PROFILE_RELEASE_DEBUG=1 RUSTFLAGS="$RF -C relocation-model=static" cargo build -q --release --locked --target $T 2>/dev/null && cp target/$T/release/shopping-engine /tmp/dbg)
+      - name: profile
         run: |
-          echo "pre-populated mapping:"; for m in 0 3; do POP=1 /tmp/sol /tmp/s3 4 $m; done
-          echo "faulting inside the timer (fresh mapping per rep is not done: rep 1 faults, later reps reuse) -> run once each:"
-          for m in 0 3; do /tmp/sol /tmp/s3 4 $m; done
-          for i in 1 2 3; do s=$(date +%s%N); find /tmp/s3/events /tmp/s3/clicks -name '*.csv' | xargs -P4 -n8 wc -l >/dev/null; e=$(date +%s%N); echo "xargs -P4 wc -l: $(( (e-s)/1000000 )) ms"; done
-      - name: engine (main + probe knob)
-        run: |
-          best() { sort -n | head -1; }
-          for kn in "" "SE_DROP=0" "SE_READ=1" "SE_READ=1 SE_CHUNK=1048576" "SE_DROP=0 SE_POPULATE=1"; do
-            for st in 1 0; do
-              printf "%-32s stage %s: " "${kn:-default}" $st; for i in 1 2 3 4 5; do env $kn SE_STAGE=$st SE_TIMING=1 /tmp/eng /tmp/s3 /tmp/o 2>&1 | grep 'parse events' | awk '{print $5, $8, $11}'; done | best
-            done
-          done
-          echo "wall / user / sys of the parse phase"
-          for kn in "" "SE_DROP=0" "SE_READ=1"; do printf "%-12s total: " "${kn:-default}"; for i in 1 2 3 4 5; do env $kn SE_TIMING=1 /tmp/eng /tmp/s3 /tmp/o 2>&1 | grep 'release' | awk '{print $NF}'; done | sort -n | head -1; done
-          for i in 1 2 3; do SE_TIMING=1 /tmp/eng /tmp/s3 /tmp/o 2>&1 | grep -E "timing\] (list|links|parse|dedup|people|campaign|release)" ; echo; done | tail -9
+          SE_TIMING=1 /tmp/dbg /tmp/s3 /tmp/o 2>&1 | grep -E "prof|timing\] (parse|dedup|people)"
+          sudo perf record -q -F 9999 -o /tmp/perf.data /tmp/dbg /tmp/s3 /tmp/o >/dev/null 2>&1
+          sudo perf script -i /tmp/perf.data -F ip 2>/dev/null > /tmp/ips.txt; wc -l /tmp/ips.txt
+          python3 bench/x86/lineprof.py /tmp/dbg person.rs < /tmp/ips.txt
