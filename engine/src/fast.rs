@@ -1035,6 +1035,8 @@ pub unsafe fn eval_event(ctx: &Ctx, f: &[Field; 7], lim: *const u8, cache: &mut 
 
 /// Most sub-bucket bits of a dedup partition (see `run_rest`).
 const SUB_MAX_BITS: u32 = 6;
+/// How many records the dedup copy into sub-buckets takes at a time.
+const DB: usize = 8;
 
 /// Records per block of the person partitions.
 const PBLOCK: usize = 512;
@@ -1447,6 +1449,13 @@ fn run_rest(
             // The partition's records are first copied into sub-buckets by further hash bits,
             // each small enough that it and its table (slots: 1 + index in the bucket) stay
             // in the second-level cache; the copies have all that is needed.
+            //
+            // Neither loop makes a load wait for a store whose address hangs on that load's
+            // own predecessor: the copy takes `DB` records at a time (loads and hashes first,
+            // then the stores), the insert loop hashes one record ahead. With the speculative
+            // store bypass mitigation forced on (Docker's seccomp profile does that on kernels
+            // before 5.16) a load waits until the address of every earlier store is known, and
+            // "load a record, hash it, store where the hash says" runs one record at a time.
             let sb = env_sub.unwrap_or_else(|| ceil_log2(n / 6000).min(SUB_MAX_BITS));
             for v in subs[..1usize << sb].iter_mut() {
                 v.clear();
@@ -1460,8 +1469,19 @@ fn run_rest(
             } else {
                 for d in dparts_ref {
                     for sl in d.slices(p) {
-                        for rec in sl.iter() {
-                            // the bits below the partition's
+                        let mut it = sl.chunks_exact(DB);
+                        for ch in &mut it {
+                            let recs: [DRec; DB] = unsafe { (ch.as_ptr() as *const [DRec; DB]).read() };
+                            let mut qs = [0usize; DB];
+                            for k in 0..DB {
+                                // the bits below the partition's
+                                qs[k] = ((id_hash(recs[k].eid) << dbits) >> (64 - sb)) as usize;
+                            }
+                            for k in 0..DB {
+                                unsafe { subs.get_unchecked_mut(qs[k]) }.push(recs[k]);
+                            }
+                        }
+                        for rec in it.remainder() {
                             let q = ((id_hash(rec.eid) << dbits) >> (64 - sb)) as usize;
                             unsafe { subs.get_unchecked_mut(q) }.push(*rec);
                         }
@@ -1476,8 +1496,11 @@ fn run_rest(
                 tab32.clear();
                 tab32.resize(cap, 0);
                 let mask = cap - 1;
+                // (the next record's slot is worked out before this record's store)
+                let mut nx = id_hash(a[0].eid) as usize & mask;
                 for (j, rec) in a.iter().enumerate() {
-                    let mut i = id_hash(rec.eid) as usize & mask;
+                    let mut i = nx;
+                    nx = id_hash(unsafe { a.get_unchecked((j + 1).min(a.len() - 1)) }.eid) as usize & mask;
                     loop {
                         let t = unsafe { *tab32.get_unchecked(i) };
                         if t == 0 {

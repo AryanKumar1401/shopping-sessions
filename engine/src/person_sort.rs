@@ -70,6 +70,9 @@ struct Flat {
     sa: Vec<u32>,
     sw: Vec<u32>,
     fpu: Vec<(u64, u32)>,
+    /// per event / per click of the partition: how many earlier ones have the same ID
+    pos: Vec<u32>,
+    cpos: Vec<u32>,
     prof: [u64; 32],
     t0: std::time::Instant,
 }
@@ -91,6 +94,8 @@ impl Flat {
             sa: Vec::new(),
             sw: Vec::new(),
             fpu: Vec::new(),
+            pos: Vec::new(),
+            cpos: Vec::new(),
             prof: [0; 32],
             t0: std::time::Instant::now(),
         }
@@ -547,6 +552,92 @@ fn sort_fclk(c: &mut [FClk]) {
     }
 }
 
+/// How many records the scatter loops of pass A take at a time: the loads of a batch (which
+/// ID, its offset) come before its stores. Where the kernel forces the speculative store
+/// bypass mitigation on (Docker's seccomp profile does, before Linux 5.16), a load waits until
+/// the address of every earlier store is known, so a loop that alternates "load a cursor,
+/// store where it says" runs one record at a time; this form is no slower without it.
+const SB: usize = 8;
+
+/// How far the counting of pass A's scans runs behind the table lookups.
+const LAG: usize = 8;
+
+/// Pass A, events of partition `q`: `sc.pidx` (which ID), `sc.tstmp`, `pos` (how many earlier
+/// events have the same ID) and `sc.purch`; counts into `sc.cnt`. Returns the live events.
+///
+/// The count of an event is taken `LAG` events later, from the index stored then: that way
+/// the address of the counter's store does not hang on the table probe of the event being
+/// looked up (see `SB`).
+#[inline(never)]
+fn scan_events(q: usize, ev: &[Parts<PRec>], sc: &mut Scratch, pos: &mut Vec<u32>) -> usize {
+    let mut m = 0usize;
+    let (pi, tt, pp) = (sc.pidx.as_mut_ptr(), sc.tstmp.as_mut_ptr(), pos.as_mut_ptr());
+    unsafe {
+        for p in ev {
+            for sl in p.slices(q) {
+                for r in sl.iter() {
+                    if r.ts == DEAD {
+                        continue;
+                    }
+                    let idx = sc.get_or_insert(r.k);
+                    *pi.add(m) = idx;
+                    *tt.add(m) = r.ts;
+                    if m >= LAG {
+                        let c = sc.cnt.as_mut_ptr().add(*pi.add(m - LAG) as usize);
+                        *pp.add(m - LAG) = *c;
+                        *c += 1;
+                    }
+                    m += 1;
+                    if r.pc != 0 {
+                        sc.purch.push((((idx as u64) << 32) | r.ts as u64, r.pc));
+                    }
+                }
+            }
+        }
+        for j in m.saturating_sub(LAG)..m {
+            let c = sc.cnt.as_mut_ptr().add(*pi.add(j) as usize);
+            *pp.add(j) = *c;
+            *c += 1;
+        }
+        sc.pidx.set_len(m);
+        sc.tstmp.set_len(m);
+        pos.set_len(m);
+    }
+    m
+}
+
+/// The same for the clicks: `sc.cidx`, `cptr` (the click's line), `cpos`, `sc.ccnt`.
+#[inline(never)]
+fn scan_clicks(q: usize, cl: &[Parts<CRec>], sc: &mut Scratch, cptr: &mut Vec<usize>, cpos: &mut Vec<u32>) {
+    let mut m = 0usize;
+    let (ci, cp, pp) = (sc.cidx.as_mut_ptr(), cptr.as_mut_ptr(), cpos.as_mut_ptr());
+    unsafe {
+        for p in cl {
+            for sl in p.slices(q) {
+                for r in sl.iter() {
+                    let idx = sc.get_or_insert(r.k);
+                    *ci.add(m) = idx;
+                    *cp.add(m) = r.ptr;
+                    if m >= LAG {
+                        let c = sc.ccnt.as_mut_ptr().add(*ci.add(m - LAG) as usize);
+                        *pp.add(m - LAG) = *c;
+                        *c += 1;
+                    }
+                    m += 1;
+                }
+            }
+        }
+        for j in m.saturating_sub(LAG)..m {
+            let c = sc.ccnt.as_mut_ptr().add(*ci.add(j) as usize);
+            *pp.add(j) = *c;
+            *c += 1;
+        }
+        sc.cidx.set_len(m);
+        cptr.set_len(m);
+        cpos.set_len(m);
+    }
+}
+
 fn pass_a_flat(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut Scratch, f: &mut Flat, o: &mut Out, runs: &mut RunOut) {
     let n: usize = ev.iter().map(|p| p.count(q)).sum();
     let nc: usize = cl.iter().map(|p| p.count(q)).sum();
@@ -560,33 +651,9 @@ fn pass_a_flat(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: 
     sc.tstmp.clear();
     sc.pidx.reserve(n);
     sc.tstmp.reserve(n);
-    let mut m = 0usize;
-    {
-        let (pi, tt) = (sc.pidx.as_mut_ptr(), sc.tstmp.as_mut_ptr());
-        for p in ev {
-            for sl in p.slices(q) {
-                for r in sl.iter() {
-                    if r.ts == DEAD {
-                        continue;
-                    }
-                    let idx = sc.get_or_insert(r.k);
-                    unsafe {
-                        *sc.cnt.get_unchecked_mut(idx as usize) += 1;
-                        *pi.add(m) = idx;
-                        *tt.add(m) = r.ts;
-                    }
-                    m += 1;
-                    if r.pc != 0 {
-                        sc.purch.push((((idx as u64) << 32) | r.ts as u64, r.pc));
-                    }
-                }
-            }
-        }
-        unsafe {
-            sc.pidx.set_len(m);
-            sc.tstmp.set_len(m);
-        }
-    }
+    f.pos.clear();
+    f.pos.reserve(n);
+    let m = scan_events(q, ev, sc, &mut f.pos);
     let n = m;
     if env_recycle() {
         for p in ev {
@@ -605,28 +672,9 @@ fn pass_a_flat(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: 
     sc.cidx.reserve(nc);
     f.cptr.clear();
     f.cptr.reserve(nc);
-    {
-        let ci = sc.cidx.as_mut_ptr();
-        let cp = f.cptr.as_mut_ptr();
-        let mut m = 0usize;
-        for p in cl {
-            for sl in p.slices(q) {
-                for r in sl.iter() {
-                    let idx = sc.get_or_insert(r.k);
-                    unsafe {
-                        *sc.ccnt.get_unchecked_mut(idx as usize) += 1;
-                        *ci.add(m) = idx;
-                        *cp.add(m) = r.ptr;
-                    }
-                    m += 1;
-                }
-            }
-        }
-        unsafe {
-            sc.cidx.set_len(m);
-            f.cptr.set_len(m);
-        }
-    }
+    f.cpos.clear();
+    f.cpos.reserve(nc);
+    scan_clicks(q, cl, sc, &mut f.cptr, &mut f.cpos);
     let nk = sc.keys.len();
     f.lap(1);
     sc.names.clear();
@@ -661,11 +709,23 @@ fn pass_a_flat(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: 
     sc.ts.reserve(n + OVER);
     unsafe {
         let ts = sc.ts.as_mut_ptr();
-        for j in 0..n {
-            let i = *sc.pidx.get_unchecked(j) as usize;
-            let c = sc.cur.get_unchecked_mut(i);
-            *ts.add(*c as usize) = *sc.tstmp.get_unchecked(j);
-            *c += 1;
+        let (pidx, pos, tstmp, off) = (sc.pidx.as_ptr(), f.pos.as_ptr(), sc.tstmp.as_ptr(), sc.off.as_ptr());
+        let mut j = 0usize;
+        while j + SB <= n {
+            let mut d = [0usize; SB];
+            let mut t = [0u32; SB];
+            for k in 0..SB {
+                d[k] = (*off.add(*pidx.add(j + k) as usize) + *pos.add(j + k)) as usize;
+                t[k] = *tstmp.add(j + k);
+            }
+            for k in 0..SB {
+                *ts.add(d[k]) = t[k];
+            }
+            j += SB;
+        }
+        while j < n {
+            *ts.add((*off.add(*pidx.add(j) as usize) + *pos.add(j)) as usize) = *tstmp.add(j);
+            j += 1;
         }
         sc.ts.set_len(n);
     }
@@ -674,13 +734,10 @@ fn pass_a_flat(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: 
     // their part of the array is what the sweep reads
     sc.coff.clear();
     sc.coff.resize(nk, 0);
-    sc.cur.clear();
-    sc.cur.resize(nk, 0);
     let mut sum = 0u32;
     for i in 0..nk {
         if sc.names[i] == 0 {
             sc.coff[i] = sum;
-            sc.cur[i] = sum;
             sum += sc.ccnt[i];
         }
     }
@@ -688,7 +745,6 @@ fn pass_a_flat(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: 
     for i in 0..nk {
         if sc.names[i] != 0 {
             sc.coff[i] = sum;
-            sc.cur[i] = sum;
             sum += sc.ccnt[i];
         }
     }
@@ -696,15 +752,28 @@ fn pass_a_flat(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: 
     f.fc.reserve(nc + 2);
     unsafe {
         let ck = f.fc.as_mut_ptr();
+        let (cidx, cpos, coff) = (sc.cidx.as_ptr(), f.cpos.as_ptr(), sc.coff.as_ptr());
         let mut j = 0usize;
         for p in cl {
             for sl in p.slices(q) {
-                for r in sl.iter() {
-                    let i = *sc.cidx.get_unchecked(j) as usize;
+                let mut it = sl.chunks_exact(SB);
+                for ch in &mut it {
+                    let mut d = [0usize; SB];
+                    let mut v = [FClk { key: 0, camp: 0, j: 0 }; SB];
+                    for k in 0..SB {
+                        let i = *cidx.add(j + k) as usize;
+                        d[k] = (*coff.add(i) + *cpos.add(j + k)) as usize;
+                        v[k] = FClk { key: ((i as u64) << 33) | ch[k].ts as u64, camp: ch[k].camp, j: (j + k) as u32 };
+                    }
+                    for k in 0..SB {
+                        *ck.add(d[k]) = v[k];
+                    }
+                    j += SB;
+                }
+                for r in it.remainder() {
+                    let i = *cidx.add(j) as usize;
+                    *ck.add((*coff.add(i) + *cpos.add(j)) as usize) = FClk { key: ((i as u64) << 33) | r.ts as u64, camp: r.camp, j: j as u32 };
                     j += 1;
-                    let c = sc.cur.get_unchecked_mut(i);
-                    *ck.add(*c as usize) = FClk { key: ((i as u64) << 33) | r.ts as u64, camp: r.camp, j: j as u32 - 1 };
-                    *c += 1;
                 }
             }
         }
