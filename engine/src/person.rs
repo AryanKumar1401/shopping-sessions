@@ -170,6 +170,10 @@ struct Out {
     /// bytes of a value of the sessions and events columns: 4 (INT32) or 8
     cw: usize,
     file: PqFile,
+    /// The flat sweep: per campaign, the first session (in `mark_top` coordinates) of the
+    /// click of that campaign handled last by the backward assist scan
+    mark: Vec<u32>,
+    mark_top: u32,
 }
 unsafe impl Send for Out {}
 
@@ -440,7 +444,7 @@ struct Scratch {
     runs: Vec<(u32, usize)>,
     rp: Vec<usize>,
     /// Section times in ns (SE_TIMING).
-    prof: [u64; 16],
+    prof: [u64; 32],
     t0: std::time::Instant,
 }
 
@@ -472,7 +476,7 @@ impl Scratch {
             ctmp: Vec::new(),
             runs: Vec::new(),
             rp: Vec::new(),
-            prof: [0; 16],
+            prof: [0; 32],
             t0: std::time::Instant::now(),
         }
     }
@@ -1114,6 +1118,8 @@ fn pass_b(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], sc: &mut Scr
     sc.lap(10);
 }
 
+include!("person_sort.rs");
+
 fn day_params(ctx: &Ctx) -> (usize, i64, u64) {
     let day0 = ctx.cbase.div_euclid(DAY);
     let day_off = ctx.cbase.rem_euclid(DAY) as u64;
@@ -1149,6 +1155,7 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
     let schema = &schema;
     let order = largest_first(np, |q| ev.iter().map(|p| p.count(q)).sum::<usize>() * 2 + cl.iter().map(|p| p.count(q)).sum::<usize>() * 3);
     let next = AtomicUsize::new(0);
+    let mode = people_mode();
     let res = par((0..nthreads).collect::<Vec<usize>>(), |tid, _| {
         let file = PqFile::create(&dir.join(format!("part-{tid:03}.parquet")), schema).expect("create user_daily file");
         let mut o = Out {
@@ -1170,44 +1177,65 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
             rows: 0,
             cw: if narrow { 4 } else { 8 },
             file,
+            mark: vec![u32::MAX; ncamp],
+            // (debug knob SE_MARK_TOP: start low, to exercise the refill)
+            mark_top: env_usize("SE_MARK_TOP").map_or(u32::MAX - 1, |v| v as u32),
         };
         o.reserve_group();
         let mut sc = Scratch::new((ctx.we - ctx.cbase) as u32);
         let mut runs = RunOut::new(np);
+        let mut fl = Flat::new();
         loop {
             let j = next.fetch_add(1, Relaxed);
             if j >= np {
                 break;
             }
-            pass_a(ctx, order[j] as usize, ev, cl, &mut sc, &mut o, &mut runs);
+            match mode {
+                1 => pass_a_flat(ctx, order[j] as usize, ev, cl, &mut sc, &mut fl, &mut o, &mut runs),
+                _ => pass_a(ctx, order[j] as usize, ev, cl, &mut sc, &mut o, &mut runs),
+            }
         }
-        (o, sc, runs.finish())
+        (o, sc, fl, runs.finish())
     });
     tm.lap("people A (by user id)");
     let mut states = Vec::new();
     let mut blocks = Vec::new();
-    for (o, sc, b) in res {
-        states.push((o, sc));
+    for (o, sc, fl, b) in res {
+        states.push((o, sc, fl));
         blocks.push(b);
     }
     let blocks = &blocks;
     let order = largest_first(np, |d| blocks.iter().map(|b| b[d].iter().map(|x| x.1).sum::<usize>()).sum());
     let next = AtomicUsize::new(0);
-    let accs = par(states, |_, (mut o, mut sc)| {
+    let accs = par(states, |_, (mut o, mut sc, mut fl)| {
         loop {
             let j = next.fetch_add(1, Relaxed);
             if j >= np {
                 break;
             }
-            pass_b(ctx, order[j] as usize, blocks, &mut sc, &mut o);
+            match mode {
+                1 => pass_b_flat(ctx, order[j] as usize, blocks, &mut sc, &mut fl, &mut o),
+                _ => pass_b(ctx, order[j] as usize, blocks, &mut sc, &mut o),
+            }
         }
         o.write_group();
         o.fold_hot();
         o.file.finish().expect("finish user_daily");
         sc.prof[12] = o.write_ns;
+        if mode != 0 {
+            sc.prof = fl.prof;
+            sc.prof[31] = o.write_ns;
+        }
         (o.acc, sc.prof)
     });
-    if tm.on {
+    if tm.on && mode != 0 {
+        for (i, nm) in FLAT_PROF.iter().enumerate() {
+            let t: u64 = accs.iter().map(|a| a.1[i]).sum();
+            if !nm.is_empty() {
+                eprintln!("[prof] {:<16} {:>9.1} ms (summed over threads)", nm, t as f64 / 1e6);
+            }
+        }
+    } else if tm.on {
         let names = ["A scan events", "A scan clicks", "A link lookups", "A group ts", "A group clicks", "A purchases", "A sessions", "A sort clicks", "A write runs", "B group runs", "B people", "A sweep", "(write calls)"];
         for (i, nm) in names.iter().enumerate() {
             let t: u64 = accs.iter().map(|a| a.1[i]).sum();
