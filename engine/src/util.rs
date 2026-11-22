@@ -626,9 +626,10 @@ fn intern_dir(i: usize, make: bool) -> *mut (usize, usize) {
     unsafe { p.add(i & ((1 << DIR_CHUNK_BITS) - 1)) }
 }
 
-/// The bytes of an interned ID.
+/// The bytes of an interned ID (`is_long`). No lock; the storage never moves, so this is valid
+/// for any handle obtained before the call, from any thread, while others are still interning.
 #[inline]
-fn long_bytes(id: Id) -> &'static [u8] {
+pub fn long_bytes(id: Id) -> &'static [u8] {
     let (p, n) = unsafe { *intern_dir((id & !LONG) as usize, false) };
     unsafe { std::slice::from_raw_parts(p as *const u8, n) }
 }
