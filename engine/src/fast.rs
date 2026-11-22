@@ -1031,3 +1031,278 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
     }
     println!("{}", if same { "RECORDS IDENTICAL" } else { "RECORDS DIFFER" });
 }
+
+#[cfg(test)]
+mod hop_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn one_in(&mut self, n: u64) -> bool {
+            self.below(n) == 0
+        }
+        fn pick<'a>(&mut self, v: &[&'a [u8]]) -> &'a [u8] {
+            v[self.below(v.len() as u64) as usize]
+        }
+    }
+
+    fn id(r: &mut Rng, lead: u8, out: &mut Vec<u8>) {
+        match r.below(60) {
+            0 => {}
+            1 => out.extend_from_slice(b"E12"),
+            2 => out.extend_from_slice(b"e123456789012"),
+            3 => out.extend_from_slice(b"u1234567890"),
+            4 => out.extend_from_slice(b"u12345-78"),
+            5 => out.extend_from_slice(b"u1\xC3\xA9x"),
+            6 => out.extend_from_slice(b" u1"),
+            7 => out.extend_from_slice(b"u1\x00a"),
+            8 => out.extend_from_slice(b"u~{|}zz"),
+            _ => {
+                out.push(lead);
+                let n = if r.one_in(8) { r.below(16) } else { 7 + r.below(2) };
+                for _ in 0..n {
+                    out.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[r.below(36) as usize]);
+                }
+            }
+        }
+    }
+
+    fn two(v: u64, out: &mut Vec<u8>) {
+        out.push(b'0' + (v / 10 % 10) as u8);
+        out.push(b'0' + (v % 10) as u8);
+    }
+
+    fn civil(r: &mut Rng, out: &mut Vec<u8>) {
+        let year: &[u8] = if r.one_in(40) { r.pick(&[b"1999", b"2100", b"2028", b"202x", b"2027"]) } else { b"2026" };
+        out.extend_from_slice(year);
+        out.push(b'-');
+        two(if r.one_in(30) { r.below(15) } else { 9 + r.below(3) }, out);
+        out.push(b'-');
+        two(if r.one_in(30) { r.below(34) } else { 1 + r.below(30) }, out);
+        out.push(if r.one_in(60) { *r.pick(&[b" ", b"t", b"-"]).first().unwrap() } else { b'T' });
+        two(if r.one_in(30) { r.below(31) } else { r.below(24) }, out);
+        out.push(b':');
+        two(if r.one_in(40) { r.below(70) } else { r.below(60) }, out);
+        out.push(if r.one_in(80) { b'.' } else { b':' });
+        two(if r.one_in(40) { r.below(70) } else { r.below(60) }, out);
+    }
+
+    fn ts(r: &mut Rng, ingest: bool, out: &mut Vec<u8>) {
+        let k = if ingest { if r.one_in(50) { r.below(12) } else { 0 } } else { r.below(12) };
+        match k {
+            0..=4 => {
+                civil(r, out);
+                out.push(if r.one_in(50) { *r.pick(&[b"z", b"", b"+", b","]).first().unwrap_or(&b'Z') } else { b'Z' });
+            }
+            5 | 6 => {
+                civil(r, out);
+                out.push(if r.one_in(30) { *r.pick(&[b"Z", b" ", b"*"]).first().unwrap() } else if r.one_in(2) { b'+' } else { b'-' });
+                two(if r.one_in(20) { r.below(30) } else { r.below(14) }, out);
+                if !r.one_in(40) {
+                    out.push(b':');
+                }
+                two(if r.one_in(20) { r.below(70) } else { r.below(60) }, out);
+            }
+            7..=9 => {
+                // around 2026-10-01 .. 2026-10-20 in ms
+                let v = 1_790_812_800_000u64 + r.below(20 * 86_400_000);
+                let s = format!("{v}");
+                match r.below(40) {
+                    0 => out.extend_from_slice(&s.as_bytes()[..r.below(13) as usize]),
+                    1 => {
+                        out.extend_from_slice(b"000");
+                        out.extend_from_slice(s.as_bytes());
+                    }
+                    2 => {
+                        out.extend_from_slice(s.as_bytes());
+                        out.extend_from_slice(b".0");
+                    }
+                    3 => {
+                        out.extend_from_slice(&s.as_bytes()[..12]);
+                        out.push(b'x');
+                    }
+                    4 => out.extend_from_slice(b"99999999999999999999999"),
+                    _ => out.extend_from_slice(s.as_bytes()),
+                }
+            }
+            10 => out.extend_from_slice(r.pick(&[b"", b"-5", b"1.79e12", b"2026-10-03", b"2026-10-03T23:58:10", b"86400000", b"2026-10-03T23:58:10.5Z", b"2026-10-03T23:58:10+0200"])),
+            _ => {
+                // late and boundary pairs are made by the caller's window; here: exact window edges
+                out.extend_from_slice(r.pick(&[b"2026-10-01T00:00:00Z", b"2026-10-15T00:00:00Z", b"2026-10-14T23:59:59Z", b"2026-09-30T23:59:59Z", b"2026-10-01T02:00:00+02:00", b"2026-09-30T23:00:00-01:00", b"2026-02-29T10:00:00Z", b"2028-02-29T10:00:00Z"]));
+            }
+        }
+    }
+
+    fn row(r: &mut Rng, n: usize, out: &mut Vec<u8>) {
+        let mut f: Vec<Vec<u8>> = vec![Vec::new(); 7];
+        if r.one_in(25) {
+            id(r, b'e', &mut f[0]);
+        } else {
+            // mostly unique, now and then a duplicate of an earlier line
+            let k = if r.one_in(10) { r.below(n as u64 + 1) } else { n as u64 };
+            f[0] = format!("e{:07}", k).into_bytes();
+        }
+        id(r, b'u', &mut f[1]);
+        ts(r, false, &mut f[2]);
+        ts(r, true, &mut f[3]);
+        f[4] = if r.one_in(25) { r.pick(&[b"Purchase", b"cart ", b"viewx", b"", b"vie", b"purchas", b"VIEW", b"xiew", b"zart", b"vart", b"purchasd"]).to_vec() } else { r.pick(&[b"view", b"view", b"view", b"cart", b"purchase", b"purchase"]).to_vec() };
+        f[5] = if r.one_in(25) { r.pick(&[b"", b"P1", b"p123456789012345678901234567890", b"p\xFF1", b"p 1", b"x"]).to_vec() } else { format!("p{}", r.below(40)).into_bytes() };
+        f[6] = if r.one_in(6) { r.pick(&[b"", b"19.99", b"-5", b"0", b"00", b"0250", b"10000000", b"10000001", b"1000\r", b"99999999999999999999", b"12a", b"123456789012345678901234567890123"]).to_vec() } else { format!("{}", 1 + r.below(60_000)).into_bytes() };
+        let mut nf = 7;
+        if r.one_in(60) {
+            nf = r.below(10) as usize;
+        }
+        let start = out.len();
+        for k in 0..nf {
+            if k > 0 {
+                out.push(b',');
+            }
+            let v: &[u8] = if k < 7 { &f[k] } else { b"x" };
+            let q = r.one_in(5);
+            if q {
+                out.push(b'"');
+            }
+            out.extend_from_slice(v);
+            if q && !r.one_in(150) {
+                out.push(b'"');
+            }
+        }
+        // byte-level dirt
+        if r.one_in(30) && out.len() > start {
+            let pos = start + r.below((out.len() - start) as u64) as usize;
+            let c = *r.pick(&[b"\"", b",", b"\n", b"\r", b"\x00", b"\xE2", b" ", b"Z", b"0", b":"]).first().unwrap();
+            match r.below(3) {
+                0 => out[pos] = c,
+                1 => out.insert(pos, c),
+                _ => {
+                    out.remove(pos);
+                }
+            }
+        }
+        if r.one_in(100) {
+            out.push(b'\r');
+        }
+        out.push(b'\n');
+        if r.one_in(200) {
+            out.push(b'\n');
+        }
+    }
+
+    type Rec = (Id, u32, Option<(Id, u32, u32)>);
+
+    fn run_kernel(ctx: &mut Ctx, data: &'static [u8], hop: bool, level: Level, chunk: usize) -> (bool, Vec<Rec>) {
+        ctx.hop = hop;
+        ctx.pregion = Region::new(64 << 20);
+        let mut st = PState {
+            escape: false,
+            slow: 0,
+            rbuf: std::ptr::null_mut(),
+            rcap: 0,
+            buf: ScanBuf::new(),
+            cache: DateCache::new(),
+            dates: crate::hop::HopDates::new(),
+            dw: Writers::with_wc(1 << ctx.dbits, 8, true),
+            pw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.pregion),
+            cw: Writers::with_wc(1 << ctx.pbits, 8, true),
+        };
+        let mut jobs = Vec::new();
+        make_jobs(&[data], 0, chunk, false, &mut jobs);
+        for j in &jobs {
+            unsafe { main_d(level, ctx, &mut st, j) };
+        }
+        let (d, _p) = (st.dw.finish(), st.pw.finish());
+        let pbase = ctx.pregion.base as *const PRec;
+        let mut out = Vec::new();
+        for part in 0..(1usize << ctx.dbits) {
+            for sl in d.slices(part) {
+                for r in sl.iter() {
+                    let p = if r.prec == NOPREC {
+                        None
+                    } else {
+                        let p = unsafe { &*pbase.add(r.prec as usize) };
+                        Some((p.k, p.ts, p.pc))
+                    };
+                    out.push((r.eid, r.ing, p));
+                }
+            }
+        }
+        out.sort();
+        (st.escape, out)
+    }
+
+    fn test_ctx() -> Ctx {
+        let ws = parse_ts_slice(b"2026-10-01T00:00:00Z");
+        let we = parse_ts_slice(b"2026-10-15T00:00:00Z");
+        let mut products = IdMap::new(64);
+        for i in 0..30u32 {
+            let name = format!("p{i}");
+            products.insert(unsafe { pack_id(name.as_ptr(), name.len(), name.as_ptr().add(name.len())) }, i % 5);
+        }
+        Ctx {
+            ws,
+            we,
+            cbase: ws - WEEK,
+            links: std::sync::OnceLock::new(),
+            products,
+            unknown_cat: 7,
+            cats: Vec::new(),
+            campaigns: IdMap::new(1),
+            camp_names: Vec::new(),
+            camp_channels: Vec::new(),
+            dbits: 2,
+            pbits: 1,
+            stage: 0,
+            drop_pages: false,
+            ibase: ws - (1i64 << 31) * 1000,
+            pregion: Region::new(1 << 20),
+            hop: false,
+        }
+    }
+
+    /// The row-hopping kernel against the scalar reference scanner on adversarial lines:
+    /// the same records, whatever the chunking.
+    #[test]
+    fn hop_equals_reference() {
+        let mut ctx = test_ctx();
+        let level = pick_level();
+        let rounds: u64 = std::env::var("HOP_FUZZ_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        let mut r = Rng(0x9E37_79B9_7F4A_7C15);
+        for round in 0..rounds {
+            let mut v = b"event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n".to_vec();
+            let rows = 1 + r.below(if round % 4 == 0 { 30 } else { 3000 }) as usize;
+            for n in 0..rows {
+                row(&mut r, n, &mut v);
+            }
+            if round % 3 == 0 {
+                v.pop();
+            }
+            let data: &'static [u8] = Box::leak(v.into_boxed_slice());
+            let want = run_kernel(&mut ctx, data, false, Level::Scalar, 1 << 30);
+            // (`want.0`, the escape flag, is set by lines whose ingest_ts does not fit a `DRec`;
+            // both kernels must agree on it too)
+            for chunk in [1usize << 30, 7, 193, 4096] {
+                let got = run_kernel(&mut ctx, data, true, level, chunk);
+                if got != want {
+                    let (a, b) = (&got.1, &want.1);
+                    let i = (0..a.len().min(b.len())).find(|&i| a[i] != b[i]).unwrap_or(a.len().min(b.len()));
+                    let mut name = Vec::new();
+                    if let Some(x) = a.get(i).or(b.get(i)) {
+                        id_bytes(x.0, &mut name);
+                    }
+                    panic!("round {round} chunk {chunk}: {} vs {} records; first difference at {i}: {:?} vs {:?} (event {:?})", a.len(), b.len(), a.get(i), b.get(i), String::from_utf8_lossy(&name));
+                }
+            }
+            let got = run_kernel(&mut ctx, data, false, level, 4096);
+            assert!(got == want, "scan kernel differs in round {round}");
+        }
+    }
+}

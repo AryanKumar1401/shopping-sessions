@@ -193,10 +193,26 @@ const TOD_BIAS: i64 = 48 * (11 * 3600 + 10 * 60 + 60 + 11);
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 mod k {
     use super::{TS_PAT, TYPE_PAT};
-    use crate::util::{Id, LEN_MASK};
+    use crate::util::Id;
     use std::arch::x86_64::*;
 
     pub type V16 = __m128i;
+    pub type Ids = __m256i;
+
+    /// Byte masks of the first `len` of 16 bytes for `len` 0..=9; zero for 10..=16.
+    static LEN_MASK: [[u8; 16]; 17] = {
+        let mut t = [[0u8; 16]; 17];
+        let mut l = 0;
+        while l < 10 {
+            let mut i = 0;
+            while i < l {
+                t[l][i] = 0xFF;
+                i += 1;
+            }
+            l += 1;
+        }
+        t
+    };
 
     /// The 16 bytes at `a`, and how many of them come before the first byte outside
     /// `0x30..=0x7F` (16 when there is none).
@@ -210,19 +226,27 @@ mod k {
         }
     }
 
-    /// `pack_id16` of two IDs of 1..=9 bytes, all in `0x30..=0x7F` (see `pack2_id16`).
+    /// `pack_id16` of two IDs of 0..=9 bytes, all in `0x30..=0x7F` (see `pack2_id16`);
+    /// lengths up to 16 are allowed and give a meaningless value.
     #[inline(always)]
-    pub unsafe fn pack2(v0: V16, l0: usize, v1: V16, l1: usize) -> (Id, Id) {
+    pub unsafe fn pack2(v0: V16, l0: usize, v1: V16, l1: usize) -> Ids {
         unsafe {
-            let m0 = _mm_loadu_si128(LEN_MASK.get_unchecked(l0).as_ptr() as *const __m128i);
-            let m1 = _mm_loadu_si128(LEN_MASK.get_unchecked(l1).as_ptr() as *const __m128i);
+            let m0 = _mm_load_si128(LEN_MASK.get_unchecked(l0).as_ptr() as *const __m128i);
+            let m1 = _mm_load_si128(LEN_MASK.get_unchecked(l1).as_ptr() as *const __m128i);
             let d = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_and_si128(v0, m0)), _mm_and_si128(v1, m1), 1);
             let w = _mm256_maddubs_epi16(_mm256_set1_epi16(0x0180), d);
             let dd = _mm256_madd_epi16(w, _mm256_set1_epi32(0x0001_4000));
             let q = _mm256_or_si256(_mm256_mul_epu32(dd, _mm256_set1_epi64x(1 << 28)), _mm256_srli_epi64(dd, 32));
-            let id = _mm256_or_si256(_mm256_slli_epi64(q, 7), _mm256_srli_si256(d, 8));
-            (_mm_cvtsi128_si64(_mm256_castsi256_si128(id)) as u64, _mm_cvtsi128_si64(_mm256_extracti128_si256(id, 1)) as u64)
+            _mm256_or_si256(_mm256_slli_epi64(q, 7), _mm256_srli_si256(d, 8))
         }
+    }
+    #[inline(always)]
+    pub unsafe fn id0(ids: Ids) -> Id {
+        unsafe { _mm_cvtsi128_si64(_mm256_castsi256_si128(ids)) as u64 }
+    }
+    #[inline(always)]
+    pub unsafe fn id1(ids: Ids) -> Id {
+        unsafe { _mm_cvtsi128_si64(_mm256_extracti128_si256(ids, 1)) as u64 }
     }
 
     /// True when the 32 bytes at `s` do not fit timestamp template `k`.
@@ -300,6 +324,7 @@ mod k {
     use crate::util::{Id, pack_id16};
 
     pub type V16 = *const u8;
+    pub type Ids = (Id, Id);
 
     #[inline(always)]
     pub unsafe fn id_scan(a: *const u8) -> (V16, usize) {
@@ -313,8 +338,16 @@ mod k {
     }
 
     #[inline(always)]
-    pub unsafe fn pack2(v0: V16, l0: usize, v1: V16, l1: usize) -> (Id, Id) {
-        unsafe { (pack_id16(v0, l0), pack_id16(v1, l1)) }
+    pub unsafe fn pack2(v0: V16, l0: usize, v1: V16, l1: usize) -> Ids {
+        unsafe { (if l0 <= 9 { pack_id16(v0, l0) } else { 0 }, if l1 <= 9 { pack_id16(v1, l1) } else { 0 }) }
+    }
+    #[inline(always)]
+    pub unsafe fn id0(ids: Ids) -> Id {
+        ids.0
+    }
+    #[inline(always)]
+    pub unsafe fn id1(ids: Ids) -> Id {
+        ids.1
     }
 
     #[inline(always)]
@@ -396,8 +429,9 @@ impl HopDates {
 /// not a date (nothing is stored).
 #[cold]
 #[inline(never)]
-unsafe fn date_miss(a: *const u8, dates: &mut HopDates, slot: usize) -> i64 {
+unsafe fn date_miss(a: *const u8, dates: &mut HopDates) -> i64 {
     unsafe {
+        let slot = k::date_slot(rd64(a.add(2)));
         let v = date_secs(a);
         if v == NONE || *a != b'2' || *a.add(1) != b'0' {
             return NONE;
@@ -409,27 +443,22 @@ unsafe fn date_miss(a: *const u8, dates: &mut HopDates, slot: usize) -> i64 {
 }
 
 /// `20YY-MM-DDTHH:MM:SS` at `$a`, already compared with its template (so every digit is one,
-/// and `20`, `-`, `T`, `:` are in place) -> epoch seconds; leaves the row function with null
-/// for an impossible date or hour.
+/// and `20`, `-`, `T`, `:` are in place) -> epoch seconds. Leaves the row function with
+/// `DATE_MISS` when the date is not in the memo, with `BAIL` for an impossible hour.
 macro_rules! civil {
-    ($a:expr, $dates:expr) => {{
+    ($a:expr, $dates:expr, $hot:expr) => {{
         let a = $a;
         let key = rd64(a.add(2));
         let slot = k::date_slot(key);
-        let day = if *$dates.k.get_unchecked(slot) == key {
-            *$dates.v.get_unchecked(slot)
-        } else {
-            let v = date_miss(a, $dates, slot);
-            if v == NONE {
-                return std::ptr::null();
-            }
-            v
-        };
+        if *$dates.k.get_unchecked(slot) != key {
+            $hot.miss = a;
+            return DATE_MISS;
+        }
         let t = k::tod(a.add(11));
         if t >= TOD_BIAS + 86_400 {
-            return std::ptr::null();
+            return BAIL;
         }
-        day + t
+        *$dates.v.get_unchecked(slot) + t
     }};
 }
 
@@ -438,8 +467,6 @@ macro_rules! civil {
 /// The purchase's `category * PRICE_MUL + price`, or 0 when the price is bad. Product: the
 /// tail's first field (ends at bit `mcb`), price: its second (ends at `nl`); `open`: the
 /// tail's opening quotes.
-#[cold]
-#[inline(never)]
 unsafe fn purchase_pc(ev: &EvRow, s5: *const u8, mcb: u32, nl: usize, open: u32) -> u32 {
     unsafe {
         let c = mcb.trailing_zeros() as usize;
@@ -457,7 +484,8 @@ unsafe fn purchase_pc(ev: &EvRow, s5: *const u8, mcb: u32, nl: usize, open: u32)
     }
 }
 
-/// What the row loop keeps in registers or on its stack instead of reading through `Ctx`.
+/// What the row loop keeps in registers or on its stack instead of reading through `Ctx`,
+/// and what a row hands to the loop when it leaves with a code.
 struct Hot {
     ws: i64,
     /// `we - ws`
@@ -475,31 +503,67 @@ struct Hot {
     /// Largest `PRec` index and `DRec::ing` seen: `escape` when one does not fit.
     max_idx: usize,
     max_d: u64,
+    /// `DATE_MISS`: the date that is not in the memo.
+    miss: *const u8,
+    /// `REFILL`: the partitions the row wrote to.
+    ps: usize,
+    ds: usize,
+    /// `PURCHASE`: the row so far.
+    pur: Purchase,
+}
+#[derive(Clone, Copy)]
+struct Purchase {
+    eid: Id,
+    uid: Id,
+    ts: i64,
+    dd: u64,
+    s5: *const u8,
+    mcb: u32,
+    open: u32,
+    nl: usize,
 }
 
-/// `Writers::push_ptr` for the aligned write-combining form of 16-byte records
-/// (`heads`, `buf` from `Writers::raw`).
+/// What `hop_row` returns instead of the next line's start (which is never below `CODES`):
+/// the line is not of the usual shape and nothing was done;
+const BAIL: usize = 0;
+/// nothing was done, `Hot::miss` is a date for the memo, then the line can be tried again;
+const DATE_MISS: usize = 1;
+/// the line is a purchase inside the window, to be finished by `purchase_finish`.
+const PURCHASE: usize = 2;
+const CODES: isize = 4;
+/// Added to the next line's start: a block the row wrote to is full (`Writers::refill_full`
+/// for `Hot::ps` and `Hot::ds`).
+const REFILL: usize = 1 << 63;
+
+/// `Writers::push_ptr` for the aligned write-combining form of 16-byte records (`heads`,
+/// `buf` from `Writers::raw`), without the call that gets a new block: returns the record's
+/// place, and `REFILL` in `full` when the block is full now.
 #[inline(always)]
-unsafe fn push16<T: Copy>(w: &mut Writers<T>, heads: *mut (*mut T, *mut T), buf: *mut T, s: usize, v: T) -> usize {
+unsafe fn push16<T: Copy>(heads: *mut (*mut T, *mut T), buf: *mut T, s: usize, v: T, full: &mut usize) -> usize {
     unsafe {
         let so = s << 4;
-        let hp = ((&raw mut (*heads).0) as *mut u8).add(so) as *mut usize;
-        let p = *hp;
+        let h = (heads as *mut u8).add(so) as *mut (*mut T, *mut T);
+        let p = (*h).0 as usize;
         // which of the line's four records
         let n = p & 0x30;
-        ((buf as *mut u8).add(so * 4 + n) as *mut T).write(v);
-        *hp = p + 16;
+        let line = (buf as *mut u8).add(so * 4);
+        (line.add(n) as *mut T).write(v);
+        (*h).0 = (p + 16) as *mut T;
         if n == 0x30 {
-            w.flush_line(s, p as *mut T);
+            wc_copy((p - 0x30) as *mut u8, line, 64);
+            if (*h).1 as usize == p + 16 {
+                *full = REFILL;
+            }
         }
         p
     }
 }
 
 /// One line at `p` (with `GUARD` readable bytes): handles it and returns the start of the next
-/// line, or returns null having done nothing when the line is not of the usual shape.
+/// line (plus `REFILL`), or one of the codes above. No calls in here: the loop around it
+/// keeps its constants in registers.
 #[inline(always)]
-unsafe fn hop_row<const RAW: bool>(ev: &EvRow, hot: &mut Hot, p: *const u8, dates: &mut HopDates, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>) -> *const u8 {
+unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>) -> usize {
     unsafe {
         // event_id
         let q0 = (*p == b'"') as usize;
@@ -514,32 +578,32 @@ unsafe fn hop_row<const RAW: bool>(ev: &EvRow, hot: &mut Hot, p: *const u8, date
         let (v1, l1) = k::id_scan(a1);
         let t1 = a1.add(l1);
         bad |= term(t1, q1);
-        // at most 9 bytes, and the event_id not empty
+        // at most 9 bytes, and the event_id not empty (an empty user_id packs to 0)
         bad |= (*LEN_BAD.get_unchecked(l0) | *LEN_BAD0.get_unchecked(l1)) as u64;
+        let ids = k::pack2(v0, l0, v1, l1);
         // ts: F1 / F2 have a '-' after the year, a 13-digit F3 a digit
         let s2 = t1.add(q1 + 1);
         let q2 = (*s2 == b'"') as usize;
         let a2 = s2.add(q2);
         let (ts, s3);
         if *a2.add(4) == b'-' {
-            let z = *a2.add(19);
-            let f2 = (z != b'Z') as usize;
-            if k::ts_misfit(s2, (F1 + f2) * 2 + q2) {
-                return std::ptr::null();
-            }
-            let t = civil!(a2, dates);
-            if f2 == 0 {
-                ts = t * 1000;
+            if !k::ts_misfit(s2, F1 * 2 + q2) {
+                ts = civil!(a2, dates, hot) * 1000;
                 s3 = a2.add(21 + q2);
             } else {
-                // "+HH:MM" / "-HH:MM": the template has checked the digits' ranges
+                // "+HH:MM" / "-HH:MM" (the template lets a comma pass for the sign)
+                let z = *a2.add(19);
+                if k::ts_misfit(s2, F2 * 2 + q2) | (z == b',') {
+                    return BAIL;
+                }
+                let t = civil!(a2, dates, hot);
                 let o = rd64(a2.add(19));
                 let v = ((o >> 8) ^ 0x30_303A_3030) & 0xFF_FFFF_FFFF;
                 let x = v.wrapping_mul(2561);
                 let hh = (x >> 8) & 0xFF;
                 let mm = (x >> 32) & 0xFF;
-                if (hh > 23) | (z == b',') {
-                    return std::ptr::null();
+                if hh > 23 {
+                    return BAIL;
                 }
                 let off = ((hh * 60 + mm) * 60_000) as i64;
                 ts = if z == b'+' { t * 1000 - off } else { t * 1000 + off };
@@ -547,7 +611,7 @@ unsafe fn hop_row<const RAW: bool>(ev: &EvRow, hot: &mut Hot, p: *const u8, date
             }
         } else {
             if k::ts_misfit(s2, F3 * 2 + q2) {
-                return std::ptr::null();
+                return BAIL;
             }
             ts = k::f3_13(a2);
             s3 = a2.add(14 + q2);
@@ -556,15 +620,15 @@ unsafe fn hop_row<const RAW: bool>(ev: &EvRow, hot: &mut Hot, p: *const u8, date
         let q3 = (*s3 == b'"') as usize;
         let a3 = s3.add(q3);
         if k::ts_misfit(s3, F1 * 2 + q3) {
-            return std::ptr::null();
+            return BAIL;
         }
-        let ing_s = civil!(a3, dates);
+        let ing_s = civil!(a3, dates, hot);
         // event_type
         let s4 = a3.add(21 + q3);
         let q4 = (*s4 == b'"') as usize;
         let kt = (*s4.add(q4) as usize & 6) + q4;
         if k::type_misfit(s4, kt) {
-            return std::ptr::null();
+            return BAIL;
         }
         // product_id , price_cents \n : one comma before the first newline; every quote opens
         // or closes a field, a field that opens closes, and no quote does both
@@ -583,34 +647,67 @@ unsafe fn hop_row<const RAW: bool>(ev: &EvRow, hot: &mut Hot, p: *const u8, date
         let tb = (nl as u32 >> 5) | (mcb.wrapping_sub(1) & d) | (opened ^ (close << 1)) | (open & close) | (mqb ^ (open | close)) | ((mcb | ((mcb >> 2) & open)) & 1);
         bad |= tb as u64;
         if bad != 0 {
-            return std::ptr::null();
+            return BAIL;
         }
-        let ing = ing_s * 1000;
-        // (`ts` is not negative and the window is ordered: one compare for both ends)
-        let mut ok = ((ts.wrapping_sub(hot.ws) as u64) < hot.span) && ing.wrapping_sub(ts) <= DAY && l1 != 0;
-        let mut pc = 0u32;
-        if kt < 2 && ok {
-            pc = purchase_pc(ev, s5, mcb, nl, open);
-            ok = pc != 0;
-        }
-        let (eid, uid) = k::pack2(v0, l0, v1, l1);
+        let mut next = s5 as usize + nl + 1;
         let dd = (ing_s - hot.ibase_s) as u64;
+        let eid = k::id0(ids);
+        let mut idx = NOPREC as usize;
+        // (`ts` is not negative and the window is ordered: one compare for both ends)
+        if ((ts.wrapping_sub(hot.ws) as u64) < hot.span) && (ing_s * 1000).wrapping_sub(ts) <= DAY {
+            let uid = k::id1(ids);
+            if kt < 2 {
+                hot.pur = Purchase { eid, uid, ts, dd, s5, mcb, open, nl };
+                return PURCHASE;
+            }
+            if uid != 0 {
+                let ps = ((id_hash(uid) >> 1) >> hot.pshift) as usize;
+                let rec = PRec { k: uid, ts: (ts - hot.cbase) as u32, pc: 0 };
+                let prec = if RAW {
+                    let mut full = 0;
+                    let prec = push16(hot.ph, hot.pb, ps, rec, &mut full);
+                    if full != 0 {
+                        hot.ps = ps;
+                        next |= REFILL;
+                    }
+                    prec
+                } else {
+                    pw.push_ptr(ps, rec) as usize
+                };
+                idx = prec.wrapping_sub(hot.pbase) / std::mem::size_of::<PRec>();
+                hot.max_idx = hot.max_idx.max(idx);
+            }
+        }
         hot.max_d = hot.max_d.max(dd);
         let ds = ((id_hash(eid) >> 1) >> hot.dshift) as usize;
-        let mut idx = NOPREC as usize;
-        if ok {
-            let ps = ((id_hash(uid) >> 1) >> hot.pshift) as usize;
-            let rec = PRec { k: uid, ts: (ts - hot.cbase) as u32, pc };
-            let prec = if RAW { push16(pw, hot.ph, hot.pb, ps, rec) } else { pw.push_ptr(ps, rec) as usize };
-            idx = prec.wrapping_sub(hot.pbase) / std::mem::size_of::<PRec>();
-            hot.max_idx = hot.max_idx.max(idx);
-        }
+        hot.ds = ds;
         let rec = DRec { eid, ing: dd as u32, prec: idx as u32 };
         if RAW {
-            push16(dw, hot.dh, hot.db, ds, rec);
+            let mut full = 0;
+            push16(hot.dh, hot.db, ds, rec, &mut full);
+            next |= full;
         } else {
             dw.push(ds, rec);
         }
+        next
+    }
+}
+
+/// The rest of a row that left `hop_row` with `PURCHASE`; returns the next line's start.
+#[cold]
+#[inline(never)]
+unsafe fn purchase_finish(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>) -> *const u8 {
+    unsafe {
+        let Purchase { eid, uid, ts, dd, s5, mcb, open, nl } = hot.pur;
+        let pc = purchase_pc(ev, s5, mcb, nl, open);
+        let mut idx = NOPREC as usize;
+        if pc != 0 && uid != 0 {
+            let prec = pw.push_ptr(((id_hash(uid) >> 1) >> hot.pshift) as usize, PRec { k: uid, ts: (ts - hot.cbase) as u32, pc });
+            idx = (prec as usize).wrapping_sub(hot.pbase) / std::mem::size_of::<PRec>();
+            hot.max_idx = hot.max_idx.max(idx);
+        }
+        hot.max_d = hot.max_d.max(dd);
+        dw.push(((id_hash(eid) >> 1) >> hot.dshift) as usize, DRec { eid, ing: dd as u32, prec: idx as u32 });
         s5.add(nl + 1)
     }
 }
@@ -635,20 +732,64 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
         let ctx = ev.ctx;
         let (ph, pb) = pw.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
         let (dh, db) = dw.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
-        let mut hot = Hot { ws: ctx.ws, span: (ctx.we - ctx.ws) as u64, cbase: ctx.cbase, ibase_s: ev.ibase_s, pshift: 63 - ctx.pbits, dshift: 63 - ctx.dbits, pbase: ctx.pregion.base, ph, pb, dh, db, max_idx: 0, max_d: 0 };
+        let mut hot = Hot {
+            ws: ctx.ws,
+            span: (ctx.we - ctx.ws) as u64,
+            cbase: ctx.cbase,
+            ibase_s: ev.ibase_s,
+            pshift: 63 - ctx.pbits,
+            dshift: 63 - ctx.dbits,
+            pbase: ctx.pregion.base,
+            ph,
+            pb,
+            dh,
+            db,
+            max_idx: 0,
+            max_d: 0,
+            miss: base,
+            ps: 0,
+            ds: 0,
+            pur: Purchase { eid: 0, uid: 0, ts: 0, dd: 0, s5: base, mcb: 0, open: 0, nl: 0 },
+        };
         let end = base.add(len);
         // lines that start before `fast_end` have `GUARD` readable bytes
         let room = ev.lim as usize - base as usize;
         let fast_end = if room >= GUARD { base.add((room - GUARD + 1).min(len)) } else { base };
         let mut p = base;
         let mut slow = 0u64;
+        let (mut retry_p, mut retry_n) = (std::ptr::null::<u8>(), 0u32);
         loop {
+            let mut code = BAIL;
             while p < fast_end {
-                let nx = hop_row::<RAW>(ev, &mut hot, p, dates, pw, dw);
-                if nx.is_null() {
+                let r = hop_row::<RAW>(&mut hot, p, dates, pw, dw);
+                if (r as isize) < CODES {
+                    code = r;
                     break;
                 }
-                p = nx;
+                p = r as *const u8;
+            }
+            if code & REFILL != 0 {
+                pw.refill_full(hot.ps);
+                dw.refill_full(hot.ds);
+                p = (code & !REFILL) as *const u8;
+                continue;
+            }
+            if code == PURCHASE {
+                p = purchase_finish(ev, &mut hot, pw, dw);
+                continue;
+            }
+            if code == DATE_MISS {
+                // A line misses at most twice (its two dates) before it passes; one whose
+                // dates share a memo slot would evict each other for ever, so it gets the
+                // general path after that.
+                if retry_p != p {
+                    retry_p = p;
+                    retry_n = 0;
+                }
+                retry_n += 1;
+                if retry_n <= 2 && date_miss(hot.miss, dates) != NONE {
+                    continue;
+                }
             }
             if p >= end {
                 break;
