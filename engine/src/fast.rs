@@ -609,19 +609,15 @@ struct EvRow<'a> {
     ctx: &'a Ctx,
     /// End of the readable bytes.
     lim: *const u8,
-    stage: u32,
     /// `DRec::ing` is a whole number of seconds from `ibase` for every F1 `ingest_ts`.
     fast_rows: bool,
     ibase_s: i64,
 }
 
 /// One well-formed event line.
-#[inline(never)]
+#[inline(always)]
 unsafe fn event_row(ev: &EvRow, r: &Row, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) {
     unsafe {
-        if ev.stage == 1 {
-            return;
-        }
         let l0 = r.len(0);
         if l0 == 0 {
             return;
@@ -664,28 +660,25 @@ unsafe fn event_row(ev: &EvRow, r: &Row, cache: &mut DateCache, pw: &mut Writers
         } else {
             ok = false;
         }
-        if ev.stage == 2 {
-            std::hint::black_box((ok, pc, ts));
-            return;
-        }
-        let eid = pack_id16(r.ptr(0), l0);
+        // Both IDs at once when they are short and plain (the rule); else one by one,
+        // and the user ID only for a good event.
+        let both = pack2_id16(r.ptr(0), l0, r.ptr(1), r.len(1));
+        let eid = match both {
+            Some(x) => x.0,
+            None => pack_id16(r.ptr(0), l0),
+        };
         let d = ing_s - ev.ibase_s;
-        *escape |= (d < 0) | (d > u32::MAX as i64);
-        if ev.stage >= 3 {
-            let uid = pack_id16(r.ptr(1), r.len(1));
-            std::hint::black_box((id_hash(eid) ^ id_hash(uid), d));
-            if ev.stage == 6 {
-                dw.push(part_of(id_hash(eid), ev.ctx.dbits), DRec { eid, ing: d as u32, prec: NOPREC });
-            }
-            if ev.stage == 7 {
-                pw.push(part_of(id_hash(uid), ev.ctx.pbits), PRec { k: uid, ts: 0, pc });
-            }
-            return;
-        }
         if ok {
-            let uid = pack_id16(r.ptr(1), r.len(1));
-            emit_event(ev.ctx, pw, dw, escape, uid, (ts - ev.ctx.cbase) as u32, pc, eid, d as u32);
+            let uid = match both {
+                Some(x) => x.1,
+                None => pack_id16(r.ptr(1), r.len(1)),
+            };
+            let prec = pw.push_ptr(part_of(id_hash(uid), ev.ctx.pbits), PRec { k: uid, ts: (ts - ev.ctx.cbase) as u32, pc });
+            let idx = (prec as usize).wrapping_sub(ev.ctx.pregion.base) / std::mem::size_of::<PRec>();
+            *escape |= (idx >= NOPREC as usize) | (d as u64 > u32::MAX as u64);
+            dw.push(part_of(id_hash(eid), ev.ctx.dbits), DRec { eid, ing: d as u32, prec: idx as u32 });
         } else {
+            *escape |= d as u64 > u32::MAX as u64;
             dw.push(part_of(id_hash(eid), ev.ctx.dbits), DRec { eid, ing: d as u32, prec: NOPREC });
         }
     }
@@ -711,8 +704,15 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
         }
         let drop_after = ctx.drop_pages && fix == 0;
         if job.kind == 0 {
-            let ev = EvRow { ctx, lim, stage: ctx.stage, fast_rows: ctx.ibase % 1000 == 0, ibase_s: ctx.ibase / 1000 };
-            scan_rows::<M, 7>(buf, base, len, #[inline(always)] |r| event_row(&ev, r, cache, pw, dw, escape));
+            // (SE_STAGE: 1 = scan only; 2, 3 = the general evaluator without scatter)
+            let ev = EvRow { ctx, lim, fast_rows: ctx.ibase % 1000 == 0 && ctx.stage == 0, ibase_s: ctx.ibase / 1000 };
+            if ctx.stage == 1 {
+                scan_rows::<M, 7>(buf, base, len, |r| {
+                    std::hint::black_box(r);
+                });
+            } else {
+                scan_rows::<M, 7>(buf, base, len, #[inline(always)] |r| event_row(&ev, r, cache, pw, dw, escape));
+            }
         } else {
             scan::<M, 4>(buf, base, len, #[inline(always)] |f, row| {
                 if f[0].1 == 0 || f[1].1 == 0 || f[2].1 == 0 {

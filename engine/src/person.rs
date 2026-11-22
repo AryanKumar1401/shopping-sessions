@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 const GAP: u32 = 1_800_000;
 const GROUP_ROWS: usize = 1 << 16;
 const LF: usize = 2;
+const PR_ONE: u64 = 1 << 48;
+const PR_LIM: u64 = 1 << 47;
+const TAGMASK: u32 = 0xFF00_0000;
 
 pub const UD_SCHEMA: [(&str, Kind); 6] = [
     ("user_id", Kind::Str),
@@ -60,7 +63,7 @@ struct Pu {
 // ---------------------------------------------------------------- runs
 
 /// Bytes of a run block. A run of at least a quarter of it gets a block of its own.
-const RUN_BLOCK: usize = 16 << 10;
+const RUN_BLOCK: usize = 8 << 10;
 /// Run header: name u64, timestamps u32, purchases u32, clicks u32, 0u32. Then the
 /// timestamps (u32, unsorted, padded to 8 bytes), the purchases (`Pu`, sorted), the clicks (`Clk`).
 const RUN_HDR: usize = 24;
@@ -78,19 +81,22 @@ struct RunOut {
     open: Vec<usize>,
     /// closed blocks: (start, used bytes)
     blocks: Vec<Vec<(usize, usize)>>,
+    /// `RUN_BLOCK`-sized pieces of memory to use before the arena: the event blocks pass A
+    /// has finished reading. They are mapped and in cache, new arena memory is neither.
+    free: Vec<usize>,
     arena: Arena,
 }
 unsafe impl Send for RunOut {}
 
 impl RunOut {
     fn new(parts: usize) -> Self {
-        RunOut { heads: vec![(0, 0); parts], open: vec![0; parts], blocks: vec![Vec::new(); parts], arena: Arena::new() }
+        RunOut { heads: vec![(0, 0); parts], open: vec![0; parts], blocks: vec![Vec::new(); parts], free: Vec::new(), arena: Arena::new() }
     }
     /// `bytes` (a multiple of 8) of 8-aligned space in partition `d`.
     #[inline(always)]
     fn alloc(&mut self, d: usize, bytes: usize) -> *mut u8 {
         let h = unsafe { self.heads.get_unchecked_mut(d) };
-        if h.0 + bytes <= h.1 {
+        if h.0 + bytes + OVER <= h.1 {
             let p = h.0;
             h.0 += bytes;
             return p as *mut u8;
@@ -101,12 +107,15 @@ impl RunOut {
     #[inline(never)]
     fn alloc_slow(&mut self, d: usize, bytes: usize) -> *mut u8 {
         if bytes >= RUN_BLOCK / 4 {
-            let p = self.arena.alloc(bytes) as usize;
+            let p = self.arena.alloc(bytes + OVER) as usize;
             self.blocks[d].push((p, bytes));
             return p as *mut u8;
         }
         self.close(d);
-        let p = self.arena.alloc(RUN_BLOCK) as usize;
+        let p = match self.free.pop() {
+            Some(p) => p,
+            None => self.arena.alloc(RUN_BLOCK) as usize,
+        };
         self.open[d] = p;
         self.heads[d] = (p + bytes, p + RUN_BLOCK);
         p as *mut u8
@@ -144,14 +153,22 @@ struct Out {
     hot: Vec<[u16; 2]>,
     /// Sessions counted into `hot` since the last fold.
     hot_n: u32,
-    acnt: Vec<u32>,
-    apos: Vec<u32>,
-    active: Vec<u32>,
+    /// ns spent in the user_daily write calls (for SE_TIMING)
+    write_ns: u64,
+    /// `[campaign][day]`: purchasing sessions (top 16 bits) and their revenue (low 48 bits)
+    /// since the last fold; narrow for the same reason as `hot`.
+    pr: Vec<u64>,
+    /// per campaign: [its clicks in the window, session and day segment at which it went on]
+    on: Vec<[u32; 3]>,
+    /// the current person's days so far: (day index, first session)
+    segs: Vec<(u32, u32)>,
     catsum: Vec<u64>,
     touched: Vec<u32>,
     name: Vec<u8>,
     cols: Vec<Col>,
     rows: usize,
+    /// bytes of a value of the sessions and events columns: 4 (INT32) or 8
+    cw: usize,
     file: PqFile,
 }
 unsafe impl Send for Out {}
@@ -165,7 +182,31 @@ impl Out {
             a[0] += x[1] as u64;
             *x = [0, 0];
         }
+        // at most one purchasing session per session: the 16-bit counts are due as well
+        for (a, p) in self.acc.iter_mut().zip(self.pr.iter_mut()) {
+            a[1] += *p >> 48;
+            a[2] += *p & (PR_ONE - 1);
+            *p = 0;
+        }
         self.hot_n = 0;
+    }
+    /// Campaign `c`, on since `on[c]`, went off before session `end`: count its assists.
+    #[inline(always)]
+    fn assist(&mut self, c: usize, end: u32) {
+        let [_, from, seg] = self.on[c];
+        if from >= end {
+            return;
+        }
+        let n = self.segs.len();
+        let base = c * self.nd;
+        for k in seg as usize..n {
+            let (di, first) = self.segs[k];
+            let s0 = first.max(from);
+            let s1 = if k + 1 < n { self.segs[k + 1].1.min(end) } else { end };
+            if s1 > s0 {
+                self.hot[base + di as usize][0] += (s1 - s0) as u16;
+            }
+        }
     }
     #[inline(always)]
     fn flush_row(&mut self, ctx: &Ctx, name: Id, day: u32, sess: u64, events: u64, rev: u64) {
@@ -189,8 +230,10 @@ impl Out {
             c0.set_len(l0 + 4 + nl);
             let r = self.rows;
             (self.cols[1].data.as_mut_ptr().add(r * 4) as *mut i32).write_unaligned((self.day0 + day as i64) as i32);
-            (self.cols[2].data.as_mut_ptr().add(r * 8) as *mut i64).write_unaligned(sess as i64);
-            (self.cols[3].data.as_mut_ptr().add(r * 8) as *mut i64).write_unaligned(events as i64);
+            // little-endian: the low half of the 8 bytes is the INT32 value
+            let cw = self.cw;
+            (self.cols[2].data.as_mut_ptr().add(r * cw) as *mut i64).write_unaligned(sess as i64);
+            (self.cols[3].data.as_mut_ptr().add(r * cw) as *mut i64).write_unaligned(events as i64);
             (self.cols[4].data.as_mut_ptr().add(r * 8) as *mut i64).write_unaligned(rev as i64);
         }
         let mut best = u32::MAX;
@@ -218,17 +261,19 @@ impl Out {
     fn reserve_group(&mut self) {
         self.cols[1].data.reserve(GROUP_ROWS * 4);
         for c in 2..5 {
-            self.cols[c].data.reserve(GROUP_ROWS * 8);
+            self.cols[c].data.reserve(GROUP_ROWS * 8 + 8);
         }
     }
     fn write_group(&mut self) {
         unsafe {
             self.cols[1].data.set_len(self.rows * 4);
-            for c in 2..5 {
-                self.cols[c].data.set_len(self.rows * 8);
-            }
+            self.cols[2].data.set_len(self.rows * self.cw);
+            self.cols[3].data.set_len(self.rows * self.cw);
+            self.cols[4].data.set_len(self.rows * 8);
         }
+        let t = std::time::Instant::now();
         self.file.write_group(&mut self.cols, self.rows).expect("write user_daily");
+        self.write_ns += t.elapsed().as_nanos() as u64;
         self.rows = 0;
         self.reserve_group();
     }
@@ -236,23 +281,44 @@ impl Out {
 
 /// One person: `sess` = their sessions in order, not empty; `pu` = their purchases sorted by
 /// timestamp; `cl` = their clicks sorted by timestamp.
+///
+/// Assists are counted per stretch, not per session: a campaign is "on" from the session at
+/// which its first click enters the 7-day window until the session at which its last one has
+/// left it, and when it goes off, the sessions of that stretch are added to its counters day
+/// by day. So a person with many sessions and many campaigns costs clicks x days, not
+/// sessions x campaigns.
 #[inline(always)]
 fn person(ctx: &Ctx, o: &mut Out, name: Id, sess: &[Sess], pu: &[Pu], cl: &[Clk]) {
     let (nd, organic, day_off) = (o.nd, o.organic, o.day_off);
     o.name.clear();
+    // No counter of `hot` gets more than one per session.
+    if o.hot_n as usize + sess.len() > u16::MAX as usize {
+        o.fold_hot();
+        if sess.len() > u16::MAX as usize {
+            // cannot happen (sessions are over 30 minutes apart and timestamps fit u32)
+            crate::fast::die("internal: too many sessions for one person");
+        }
+    }
+    o.hot_n += sess.len() as u32;
     let (mut lo, mut hi) = (0usize, 0usize);
     let mut pj = 0usize;
-    let mut cur_day = ((sess[0].start as u64 + day_off) / DAY as u64) as u32;
+    let mut cur_day = u32::MAX;
     let (mut d_sess, mut d_events, mut d_rev) = (0u64, 0u64, 0u64);
-    for se in sess {
+    o.segs.clear();
+    for (si, se) in sess.iter().enumerate() {
+        let si = si as u32;
         let (start, end, cnt) = (se.start, se.end, se.n);
         let day = ((start as u64 + day_off) / DAY as u64) as u32;
+        let di = day as usize - 7;
         if day != cur_day {
-            o.flush_row(ctx, name, cur_day, d_sess, d_events, d_rev);
+            if si != 0 {
+                o.flush_row(ctx, name, cur_day, d_sess, d_events, d_rev);
+            }
             cur_day = day;
             d_sess = 0;
             d_events = 0;
             d_rev = 0;
+            o.segs.push((di as u32, si));
         }
         let mut rev = 0u64;
         while pj < pu.len() && pu[pj].ts <= end {
@@ -266,28 +332,24 @@ fn person(ctx: &Ctx, o: &mut Out, name: Id, sess: &[Sess], pu: &[Pu], cl: &[Clk]
             o.catsum[cat] += price;
             pj += 1;
         }
-        let di = day as usize - 7;
         let mut camp = organic;
         if !cl.is_empty() {
+            let seg = o.segs.len() as u32 - 1;
             while hi < cl.len() && cl[hi].ts <= start {
                 let c = cl[hi].camp as usize;
-                if o.acnt[c] == 0 {
-                    o.apos[c] = o.active.len() as u32;
-                    o.active.push(c as u32);
+                let e = unsafe { o.on.get_unchecked_mut(c) };
+                if e[0] == 0 {
+                    e[1] = si;
+                    e[2] = seg;
                 }
-                o.acnt[c] += 1;
+                e[0] += 1;
                 hi += 1;
             }
             while lo < hi && (cl[lo].ts as u64 + WEEK as u64) < start as u64 {
                 let c = cl[lo].camp as usize;
-                o.acnt[c] -= 1;
-                if o.acnt[c] == 0 {
-                    let pos = o.apos[c] as usize;
-                    let last = o.active.pop().unwrap();
-                    if last as usize != c {
-                        o.active[pos] = last;
-                        o.apos[last as usize] = pos as u32;
-                    }
+                o.on[c][0] -= 1;
+                if o.on[c][0] == 0 {
+                    o.assist(c, si);
                 }
                 lo += 1;
             }
@@ -315,38 +377,43 @@ fn person(ctx: &Ctx, o: &mut Out, name: Id, sess: &[Sess], pu: &[Pu], cl: &[Clk]
                         }
                     }
                 }
-                for &c in &o.active {
-                    unsafe { o.hot.get_unchecked_mut(c as usize * nd + di)[0] += 1 };
-                }
             }
         }
         o.hot[camp * nd + di][1] += 1;
         if rev > 0 {
-            let acc = &mut o.acc[camp * nd + di];
-            acc[1] += 1;
-            acc[2] += rev;
-        }
-        o.hot_n += 1;
-        if o.hot_n == u16::MAX as u32 {
-            o.fold_hot();
+            // one more purchasing session (top 16 bits) and its revenue (low 48 bits)
+            let i = camp * nd + di;
+            let p = o.pr[i];
+            if rev >= PR_LIM || (p & (PR_ONE - 1)) + rev >= PR_LIM {
+                o.acc[i][2] += (p & (PR_ONE - 1)) + rev;
+                o.pr[i] = (p & !(PR_ONE - 1)) + PR_ONE;
+            } else {
+                o.pr[i] = p + rev + PR_ONE;
+            }
         }
         d_sess += 1;
         d_events += cnt as u64;
         d_rev += rev;
     }
     o.flush_row(ctx, name, cur_day, d_sess, d_events, d_rev);
+    let ns = sess.len() as u32;
     for k in lo..hi {
-        o.acnt[cl[k].camp as usize] = 0;
+        let c = cl[k].camp as usize;
+        if o.on[c][0] != 0 {
+            o.on[c][0] = 0;
+            o.assist(c, ns);
+        }
     }
-    o.active.clear();
 }
 
 // ---------------------------------------------------------------- grouping scratch
 
 struct Scratch {
-    /// Open addressing `Id -> index`; key 0 = empty.
-    slots: Vec<(Id, u32)>,
+    /// Open addressing `Id -> index` (see `get_or_insert`).
+    slots: Vec<u32>,
     mask: usize,
+    /// the tag bits of a slot (0 once a partition has too many keys for tags)
+    tagmask: u32,
     keys: Vec<Id>,
     kslot: Vec<u32>,
     /// per key: events (pass A) or runs (pass B)
@@ -361,12 +428,15 @@ struct Scratch {
     tstmp: Vec<u32>,
     ts: Vec<u32>,
     sess: Vec<Sess>,
+    soff: Vec<u32>,
     bk: Buckets,
     purch: Vec<(u64, u32)>,
     pu: Vec<Pu>,
     coff: Vec<u32>,
     cidx: Vec<u32>,
     clk: Vec<Clk>,
+    ckeys: Vec<u64>,
+    ctmp: Vec<Clk>,
     runs: Vec<(u32, usize)>,
     rp: Vec<usize>,
     /// Section times in ns (SE_TIMING).
@@ -377,8 +447,9 @@ struct Scratch {
 impl Scratch {
     fn new(span: u32) -> Self {
         Scratch {
-            slots: vec![(0, 0); 4096],
+            slots: vec![0; 4096],
             mask: 4095,
+            tagmask: TAGMASK,
             keys: Vec::new(),
             kslot: Vec::new(),
             cnt: Vec::new(),
@@ -390,12 +461,15 @@ impl Scratch {
             tstmp: Vec::new(),
             ts: Vec::new(),
             sess: Vec::new(),
+            soff: Vec::new(),
             bk: Buckets::new(span),
             purch: Vec::new(),
             pu: Vec::new(),
             coff: Vec::new(),
             cidx: Vec::new(),
             clk: Vec::new(),
+            ckeys: Vec::new(),
+            ctmp: Vec::new(),
             runs: Vec::new(),
             rp: Vec::new(),
             prof: [0; 16],
@@ -410,62 +484,87 @@ impl Scratch {
     }
     fn reset(&mut self) {
         for &s in &self.kslot {
-            self.slots[s as usize].0 = 0;
+            self.slots[s as usize] = 0;
         }
         self.keys.clear();
         self.kslot.clear();
         self.cnt.clear();
         self.ccnt.clear();
     }
+    /// The index of `k` (in first-seen order), adding it if it is new.
+    ///
+    /// A slot is 4 bytes: 8 bits of the hash and `index + 1` (0 = empty); the key itself is
+    /// compared in `keys`. The whole table of a partition then is a few dozen KB and stays in
+    /// the core's cache while the records stream past it.
     #[inline(always)]
     fn get_or_insert(&mut self, k: Id) -> u32 {
-        let mut i = id_hash(k) as usize & self.mask;
-        loop {
-            let s = unsafe { self.slots.get_unchecked(i) };
-            if s.0 == k {
-                return s.1;
+        let h = id_hash(k);
+        // bits 32..40 of the hash: not the partition's (top) nor the slot's (low) bits
+        let tag = (h >> 8) as u32 & self.tagmask;
+        let mut i = h as usize & self.mask;
+        unsafe {
+            loop {
+                let s = *self.slots.get_unchecked(i);
+                if s == 0 {
+                    break;
+                }
+                if (s ^ tag) & self.tagmask == 0 {
+                    let idx = (s & !self.tagmask) - 1;
+                    if *self.keys.get_unchecked(idx as usize) == k {
+                        return idx;
+                    }
+                }
+                i = (i + 1) & self.mask;
             }
-            if s.0 == 0 {
-                break;
-            }
-            i = (i + 1) & self.mask;
         }
         self.insert_at(i, k)
     }
     #[inline(never)]
-    fn insert_at(&mut self, i: usize, k: Id) -> u32 {
+    fn insert_at(&mut self, mut i: usize, k: Id) -> u32 {
         let idx = self.keys.len() as u32;
-        self.slots[i] = (k, idx);
+        if idx + 1 > !self.tagmask {
+            // more keys than fit beside the tag: go on without tags
+            self.tagmask = 0;
+            self.rehash(self.slots.len());
+            i = id_hash(k) as usize & self.mask;
+            while self.slots[i] != 0 {
+                i = (i + 1) & self.mask;
+            }
+        }
+        self.slots[i] = ((id_hash(k) >> 8) as u32 & self.tagmask) | (idx + 1);
         self.keys.push(k);
         self.kslot.push(i as u32);
         self.cnt.push(0);
         self.ccnt.push(0);
         if self.keys.len() * LF > self.slots.len() {
-            self.grow();
+            self.rehash(self.slots.len() * 2);
         }
         idx
     }
     #[cold]
-    fn grow(&mut self) {
-        let cap = self.slots.len() * 2;
+    fn rehash(&mut self, cap: usize) {
         self.slots.clear();
-        self.slots.resize(cap, (0, 0));
+        self.slots.resize(cap, 0);
         self.mask = cap - 1;
         for (idx, &k) in self.keys.iter().enumerate() {
-            let mut i = id_hash(k) as usize & self.mask;
-            while self.slots[i].0 != 0 {
+            let h = id_hash(k);
+            let mut i = h as usize & self.mask;
+            while self.slots[i] != 0 {
                 i = (i + 1) & self.mask;
             }
-            self.slots[i] = (k, idx as u32);
+            self.slots[i] = ((h >> 8) as u32 & self.tagmask) | (idx as u32 + 1);
             self.kslot[idx] = i as u32;
         }
     }
 }
 
+/// Sorts clicks by timestamp (ties in any order). More than a few are sorted as 8-byte keys
+/// `ts << 32 | position` and then gathered.
 #[inline]
-fn sort_clicks(c: &mut [Clk]) {
-    if c.len() <= 16 {
-        for i in 1..c.len() {
+fn sort_clicks(c: &mut [Clk], keys: &mut Vec<u64>, tmp: &mut Vec<Clk>) {
+    let n = c.len();
+    if n <= 16 {
+        for i in 1..n {
             let x = c[i];
             let mut j = i;
             while j > 0 && c[j - 1].ts > x.ts {
@@ -474,6 +573,13 @@ fn sort_clicks(c: &mut [Clk]) {
             }
             c[j] = x;
         }
+    } else if n < u32::MAX as usize {
+        keys.clear();
+        keys.extend(c.iter().enumerate().map(|(i, x)| ((x.ts as u64) << 32) | i as u64));
+        keys.sort_unstable();
+        tmp.clear();
+        tmp.extend(keys.iter().map(|&k| c[k as u32 as usize]));
+        c.copy_from_slice(tmp);
     } else {
         c.sort_unstable_by_key(|c| c.ts);
     }
@@ -501,16 +607,20 @@ struct Buckets {
     b: Vec<[u32; 3]>,
     /// which buckets are in use
     bm: Vec<u64>,
+    /// which words of `bm` are not zero
+    wm: u64,
 }
 
 impl Buckets {
     /// `span`: every timestamp is below it.
     fn new(span: u32) -> Self {
         let nb = (span / BW) as usize + 1;
-        Buckets { b: vec![[u32::MAX, 0, 0]; nb], bm: vec![0; nb.div_ceil(64)] }
+        // at most 2^32 / BW + 1 buckets: fewer than 64 words
+        Buckets { b: vec![[u32::MAX, 0, 0]; nb], bm: vec![0; nb.div_ceil(64)], wm: 0 }
     }
     #[inline(always)]
     fn add(&mut self, t: &[u32]) {
+        let mut wm = self.wm;
         for &x in t {
             let b = (x / BW) as usize;
             unsafe {
@@ -520,19 +630,19 @@ impl Buckets {
                 e[2] += 1;
                 *self.bm.get_unchecked_mut(b >> 6) |= 1u64 << (b & 63);
             }
+            wm |= 1u64 << (b >> 6);
         }
+        self.wm = wm;
     }
-    /// Writes the sessions of the timestamps added so far to `sess` and empties the buckets.
+    /// Appends the sessions of the timestamps added so far to `sess` and empties the buckets.
     #[inline(always)]
     fn drain(&mut self, sess: &mut Vec<Sess>) {
-        sess.clear();
         let mut cur = Sess { start: 0, end: 0, n: 0 };
-        for w in 0..self.bm.len() {
-            let mut m = self.bm[w];
-            if m == 0 {
-                continue;
-            }
-            self.bm[w] = 0;
+        let mut wm = std::mem::take(&mut self.wm);
+        while wm != 0 {
+            let w = wm.trailing_zeros() as usize;
+            wm &= wm - 1;
+            let mut m = std::mem::take(unsafe { self.bm.get_unchecked_mut(w) });
             while m != 0 {
                 let b = w * 64 + m.trailing_zeros() as usize;
                 m &= m - 1;
@@ -554,10 +664,9 @@ impl Buckets {
     }
 }
 
-/// Sessions of a few timestamps: sorts `t`.
+/// Appends the sessions of a few timestamps to `sess`; sorts `t`.
 #[inline(always)]
 fn sessions_small(t: &mut [u32], sess: &mut Vec<Sess>) {
-    sess.clear();
     let n = t.len();
     for i in 1..n {
         let x = t[i];
@@ -594,6 +703,12 @@ unsafe fn click_id(ptr: usize) -> &'static [u8] {
 
 
 // ---------------------------------------------------------------- pass A
+
+/// SE_RECYCLE=0: runs go to fresh arena memory instead of finished event blocks.
+fn env_recycle() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_on("SE_RECYCLE"))
+}
 
 fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut Scratch, o: &mut Out, runs: &mut RunOut) {
     let n: usize = ev.iter().map(|p| p.count(q)).sum();
@@ -636,6 +751,19 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
         }
     }
     let n = m;
+    // The event records of this partition are not read again: their blocks take the runs.
+    if env_recycle() {
+        for p in ev {
+            for sl in p.slices(q) {
+                let base = sl.as_ptr() as usize;
+                if base % 8 == 0 {
+                    for k in 0..sl.len() * std::mem::size_of::<PRec>() / RUN_BLOCK {
+                        runs.free.push(base + k * RUN_BLOCK);
+                    }
+                }
+            }
+        }
+    }
     sc.lap(0);
     // clicks: count per ID
     sc.cidx.clear();
@@ -689,7 +817,7 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
     }
     sc.off.push(sum);
     sc.ts.clear();
-    sc.ts.reserve(n);
+    sc.ts.reserve(n + OVER);
     unsafe {
         let ts = sc.ts.as_mut_ptr();
         for j in 0..n {
@@ -712,7 +840,7 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
     }
     sc.coff.push(sum);
     sc.clk.clear();
-    sc.clk.reserve(nc);
+    sc.clk.reserve(nc + OVER);
     unsafe {
         let ck = sc.clk.as_mut_ptr();
         let mut j = 0usize;
@@ -732,6 +860,7 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
     sc.lap(4);
     // purchases by (ID, timestamp)
     sc.pu.clear();
+    sc.pu.reserve(sc.purch.len() + OVER);
     if !sc.purch.is_empty() {
         sc.purch.sort_unstable();
         for &(k, pc) in &sc.purch {
@@ -748,24 +877,40 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
     for i in 0..nk {
         sc.cur[i + 1] += sc.cur[i];
     }
-    // people of their own
+    // people of their own: sessions, then clicks in order, then the sweep
+    sc.sess.clear();
+    sc.soff.clear();
     for i in 0..nk {
+        sc.soff.push(sc.sess.len() as u32);
         let (a, b) = (sc.off[i] as usize, sc.off[i + 1] as usize);
         if sc.names[i] != 0 || a == b {
             continue;
         }
-        let (ca, cb) = (sc.coff[i] as usize, sc.coff[i + 1] as usize);
-        let (pa, pb) = (sc.cur[i] as usize, sc.cur[i + 1] as usize);
         if b - a <= SMALL {
             sessions_small(&mut sc.ts[a..b], &mut sc.sess);
         } else {
             sc.bk.add(&sc.ts[a..b]);
             sc.bk.drain(&mut sc.sess);
         }
-        sort_clicks(&mut sc.clk[ca..cb]);
-        person(ctx, o, sc.keys[i], &sc.sess, &sc.pu[pa..pb], &sc.clk[ca..cb]);
+    }
+    sc.soff.push(sc.sess.len() as u32);
+    sc.lap(6);
+    for i in 0..nk {
+        if sc.soff[i] != sc.soff[i + 1] {
+            sort_clicks(&mut sc.clk[sc.coff[i] as usize..sc.coff[i + 1] as usize], &mut sc.ckeys, &mut sc.ctmp);
+        }
     }
     sc.lap(7);
+    for i in 0..nk {
+        let (sa, sb) = (sc.soff[i] as usize, sc.soff[i + 1] as usize);
+        if sa == sb {
+            continue;
+        }
+        let (ca, cb) = (sc.coff[i] as usize, sc.coff[i + 1] as usize);
+        let (pa, pb) = (sc.cur[i] as usize, sc.cur[i + 1] as usize);
+        person(ctx, o, sc.keys[i], &sc.sess[sa..sb], &sc.pu[pa..pb], &sc.clk[ca..cb]);
+    }
+    sc.lap(11);
     // linked IDs: one run each, to the partition of the person's name
     for i in 0..nk {
         let name = sc.names[i];
@@ -776,9 +921,12 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
         let (ca, cb) = (sc.coff[i] as usize, sc.coff[i + 1] as usize);
         let (pa, pb) = (sc.cur[i] as usize, sc.cur[i + 1] as usize);
         let (nts, npu, ncl) = (b - a, pb - pa, cb - ca);
-        if i + 4 < nk && sc.names[i + 4] != 0 {
-            let d = part_of(id_hash(sc.names[i + 4]), ctx.pbits);
-            prefetch(runs.heads[d].0 as *const u8);
+        if i + PF_RUNS < nk && sc.names[i + PF_RUNS] != 0 {
+            let d = part_of(id_hash(sc.names[i + PF_RUNS]), ctx.pbits);
+            let p = runs.heads[d].0 as *const u8;
+            prefetch(p);
+            prefetch(p.wrapping_add(64));
+            prefetch(p.wrapping_add(128));
         }
         let d = part_of(id_hash(name), ctx.pbits);
         let p = runs.alloc(d, run_bytes(nts, npu, ncl));
@@ -790,15 +938,45 @@ fn pass_a(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut 
             h.add(2).write(ncl as u32);
             h.add(3).write(0);
             let mut w = p.add(RUN_HDR);
-            std::ptr::copy_nonoverlapping(sc.ts.as_ptr().add(a), w as *mut u32, nts);
+            copy_over(sc.ts.as_ptr().add(a) as *const u8, w, nts * 4);
             w = w.add((nts * 4 + 7) & !7);
-            std::ptr::copy_nonoverlapping(sc.pu.as_ptr().add(pa), w as *mut Pu, npu);
+            copy_over(sc.pu.as_ptr().add(pa) as *const u8, w, npu * 8);
             w = w.add(npu * 8);
-            std::ptr::copy_nonoverlapping(sc.clk.as_ptr().add(ca), w as *mut Clk, ncl);
+            copy_over(sc.clk.as_ptr().add(ca) as *const u8, w, ncl * 16);
         }
     }
     sc.lap(8);
 }
+
+/// Copies `n` bytes in 32-byte steps without a call: may read and write up to 31 bytes past
+/// `n` (the sources have that much capacity, the run blocks that much slack; see `OVER`).
+#[inline(always)]
+unsafe fn copy_over(src: *const u8, dst: *mut u8, n: usize) {
+    unsafe {
+        if n > 256 {
+            std::ptr::copy_nonoverlapping(src, dst, n);
+            return;
+        }
+        let mut o = 0;
+        while o < n {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::*;
+                _mm_storeu_si128(dst.add(o) as *mut __m128i, _mm_loadu_si128(src.add(o) as *const __m128i));
+                _mm_storeu_si128(dst.add(o + 16) as *mut __m128i, _mm_loadu_si128(src.add(o + 16) as *const __m128i));
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let v = (src.add(o) as *const [u64; 4]).read_unaligned();
+                (dst.add(o) as *mut [u64; 4]).write_unaligned(v);
+            }
+            o += 32;
+        }
+    }
+}
+const OVER: usize = 32;
+/// How many IDs ahead the destination of a run is prefetched.
+const PF_RUNS: usize = 8;
 
 // ---------------------------------------------------------------- pass B
 
@@ -912,6 +1090,7 @@ fn pass_b(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], sc: &mut Scr
                 }
             }
         }
+        sc.sess.clear();
         if small {
             sessions_small(&mut few[..nfew], &mut sc.sess);
         } else {
@@ -924,10 +1103,10 @@ fn pass_b(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], sc: &mut Scr
             &sc.pu
         };
         let cl: &[Clk] = if direct_cl {
-            sort_clicks(cl_one);
+            sort_clicks(cl_one, &mut sc.ckeys, &mut sc.ctmp);
             cl_one
         } else {
-            sort_clicks(&mut sc.clk);
+            sort_clicks(&mut sc.clk, &mut sc.ckeys, &mut sc.ctmp);
             &sc.clk
         };
         person(ctx, o, sc.keys[i], &sc.sess, pu, cl);
@@ -958,10 +1137,20 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
     let ncamp = ctx.camp_names.len();
     let np = 1usize << ctx.pbits;
     let dir = out.join("user_daily");
+    // sessions and events of a person-day are at most the number of events: INT32 columns
+    // unless there could be 2^31 of them (revenue stays INT64)
+    let total: usize = (0..np).map(|q| ev.iter().map(|p| p.count(q)).sum::<usize>()).sum();
+    let narrow = total < i32::MAX as usize && cfg!(target_endian = "little");
+    let mut schema = UD_SCHEMA;
+    if narrow {
+        schema[2].1 = Kind::I32;
+        schema[3].1 = Kind::I32;
+    }
+    let schema = &schema;
     let order = largest_first(np, |q| ev.iter().map(|p| p.count(q)).sum::<usize>() * 2 + cl.iter().map(|p| p.count(q)).sum::<usize>() * 3);
     let next = AtomicUsize::new(0);
     let res = par((0..nthreads).collect::<Vec<usize>>(), |tid, _| {
-        let file = PqFile::create(&dir.join(format!("part-{tid:03}.parquet")), &UD_SCHEMA).expect("create user_daily file");
+        let file = PqFile::create(&dir.join(format!("part-{tid:03}.parquet")), schema).expect("create user_daily file");
         let mut o = Out {
             nd,
             day0,
@@ -970,14 +1159,16 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
             acc: vec![[0; 4]; (ncamp + 1) * nd.max(1)],
             hot: vec![[0; 2]; (ncamp + 1) * nd.max(1)],
             hot_n: 0,
-            acnt: vec![0; ncamp],
-            apos: vec![0; ncamp],
-            active: Vec::new(),
+            write_ns: 0,
+            pr: vec![0; (ncamp + 1) * nd.max(1)],
+            on: vec![[0; 3]; ncamp],
+            segs: Vec::new(),
             catsum: vec![0; ctx.cats.len()],
             touched: Vec::new(),
             name: Vec::with_capacity(32),
-            cols: UD_SCHEMA.iter().map(|&(_, k)| Col::new(k)).collect(),
+            cols: schema.iter().map(|&(_, k)| Col::new(k)).collect(),
             rows: 0,
+            cw: if narrow { 4 } else { 8 },
             file,
         };
         o.reserve_group();
@@ -1013,10 +1204,11 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
         o.write_group();
         o.fold_hot();
         o.file.finish().expect("finish user_daily");
+        sc.prof[12] = o.write_ns;
         (o.acc, sc.prof)
     });
     if tm.on {
-        let names = ["A scan events", "A scan clicks", "A link lookups", "A group ts", "A group clicks", "A purchases", "-", "A singletons", "A write runs", "B group runs", "B people"];
+        let names = ["A scan events", "A scan clicks", "A link lookups", "A group ts", "A group clicks", "A purchases", "A sessions", "A sort clicks", "A write runs", "B group runs", "B people", "A sweep", "(write calls)"];
         for (i, nm) in names.iter().enumerate() {
             let t: u64 = accs.iter().map(|a| a.1[i]).sum();
             eprintln!("[prof] {:<16} {:>9.1} ms (summed over threads)", nm, t as f64 / 1e6);

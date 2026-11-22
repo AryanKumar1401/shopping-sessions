@@ -398,7 +398,7 @@ pub unsafe fn scan_rows<M: Masker, const N: usize>(buf: &mut ScanBuf, base: *con
                         *o.add(k) = pos as u32 + m.trailing_zeros();
                         m &= m.wrapping_sub(1);
                     }
-                    (fo as *mut u64).write_unaligned(spread8(fa) | (spread8(fb) << 1) | (spread8(fn_) << 2));
+                    (fo as *mut u64).write_unaligned(spread8(fa) * AQ as u64 | spread8(fb) * BQ as u64 | spread8(fn_) * NL as u64);
                     if m == 0 {
                         break;
                     }
