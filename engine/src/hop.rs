@@ -785,9 +785,8 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
 /// The rest of a line that left `hop_row` with `LONGROW` (walked and of the usual shape, IDs
 /// of up to 64 bytes all in `0x30..=0x7F`); returns the next line's start. A user_id of 10
 /// bytes or more gets a `URec`, an event_id of 10 bytes or more an `LRec`: for these bytes
-/// `packable` is the length alone. Inlined: a call here costs about one row in four the
-/// vector constants of the loop (`vzeroupper` and a dozen broadcasts after it).
-#[inline(always)]
+/// `packable` is the length alone.
+#[inline(never)]
 unsafe fn long_emit<const RAW: bool>(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> *const u8 {
     unsafe {
         let (a0, l0, a1, l1) = hot.lr.ids;
