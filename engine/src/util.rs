@@ -333,7 +333,8 @@ pub fn wc_default() -> bool {
 /// instead of one cache line and one page per partition scattered over the arena.
 ///
 /// Records whose size divides 64 take the `aligned` form of it: every partition always has an
-/// open block, a buffer is exactly one cache line of the block, and the only per-partition
+/// open block, a buffer is exactly one cache line of the block (two for 32-byte records, so
+/// that a push flushes one time in four, not one in two), and the only per-partition
 /// state a push reads is the address its record will have (which also says how full the
 /// buffer is); the end of the block is looked at only when a buffer is flushed.
 pub struct Writers<T> {
@@ -352,10 +353,11 @@ pub struct Writers<T> {
 unsafe impl<T> Send for Writers<T> {}
 
 impl<T: Copy> Writers<T> {
-    /// Records per cache line when `T` can use the aligned form, else 0.
+    /// Records per buffer when `T` can use the aligned form (a cache line of them, two lines
+    /// of 32-byte records), else 0.
     const LINE: usize = {
         let size = std::mem::size_of::<T>();
-        if size >= 8 && size <= 32 && size.is_power_of_two() && std::mem::align_of::<T>() <= 16 { 64 / size } else { 0 }
+        if size >= 8 && size <= 32 && size.is_power_of_two() && std::mem::align_of::<T>() <= 16 { if size == 32 { 4 } else { 64 / size } } else { 0 }
     };
 
     pub fn new(parts: usize, block_len: usize) -> Self {
@@ -377,6 +379,8 @@ impl<T: Copy> Writers<T> {
         }
         let wc = wc && unit <= 16 && std::mem::align_of::<T>() <= 16 && size % 8 == 0;
         let aligned = wc && Self::LINE != 0;
+        // (the aligned form: a block is whole buffers, and starts at a multiple of their size)
+        let unit = if aligned { Self::LINE } else { unit };
         let block_len = block_len.max(4).div_ceil(unit) * unit;
         let mut w = Writers {
             heads: vec![(std::ptr::null_mut(), std::ptr::null_mut()); parts],
@@ -401,6 +405,8 @@ impl<T: Copy> Writers<T> {
     #[inline(never)]
     fn refill(&mut self, s: usize) {
         let p = self.arena.alloc(self.block_len * std::mem::size_of::<T>()) as *mut T;
+        // (the arena's slabs are page-aligned and its blocks all of this size)
+        assert!(!self.aligned || p as usize % (Self::LINE * std::mem::size_of::<T>()) == 0);
         self.blocks[s].push((p as usize, self.block_len));
         self.heads[s] = (p, unsafe { p.add(self.block_len) });
     }
@@ -421,7 +427,7 @@ impl<T: Copy> Writers<T> {
                 b.add(n).write(v);
                 h.0 = p.add(1);
                 if n + 1 == Self::LINE {
-                    wc_copy((p as *mut u8).add(std::mem::size_of::<T>()).sub(64), b as *const u8, 64);
+                    wc_copy((p as *mut u8).add(std::mem::size_of::<T>()).sub(Self::LINE * std::mem::size_of::<T>()), b as *const u8, Self::LINE * std::mem::size_of::<T>());
                     if h.0 == h.1 {
                         self.refill(s);
                     }
