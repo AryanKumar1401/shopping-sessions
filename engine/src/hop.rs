@@ -1331,8 +1331,16 @@ unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDate
                     let uid = k::id0(ids);
                     cw.push(part_of(id_hash(uid), ctx.pbits), CRec { k: uid, ts, camp, ptr });
                 } else {
-                    // (10 bytes or more: not packable; interned after the parse)
-                    push_uclick(ctx, ucw, a1, l1, hot.fix, ts, camp, ptr);
+                    // (10 bytes or more: not packable; interned after the parse. The
+                    // hexadecimal shape gets the 32-byte record; either kind gives the same
+                    // Id, so the general path need not make the same choice.)
+                    match k::hex33(a1, l1) {
+                        Some((hi, lo)) => {
+                            let pre = *a1 as u32;
+                            ucw.h.push(part_of(hex_hash(hi, lo, pre), ctx.lbits), UCHRec { hi, lo, ptr, ts, cp: camp | (pre << 24) });
+                        }
+                        None => push_uclick(ctx, ucw, a1, l1, hot.fix, ts, camp, ptr),
+                    }
                 }
             }
         }

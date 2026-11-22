@@ -253,9 +253,9 @@ const UCBLOCK: usize = 64;
 #[inline(always)]
 pub(crate) unsafe fn push_uclick(ctx: &Ctx, ucw: &mut UCW, p: *const u8, len: usize, fix: usize, ts: u32, camp: u32, ptr: usize) {
     unsafe {
-        // (Not split by `hex_key` like the event records: with that test in the click loop
-        // the whole parse was 25 ms slower at 20M. `UCHRec` and its half of `resolve_long`
-        // are ready for a version that decides it outside the loop.)
+        // (Always the general record here; the click kernel writes a `UCHRec` for the
+        // hexadecimal shape itself. A scalar `hex_key` test here, inlined into the click loop,
+        // made the whole parse 25 ms slower at 20M.)
         let h = bytes_hash(p, len);
         let mut rec = UCRec { h, ptr, ts, camp, len: len as u32, bytes: [0; UCINLINE] };
         if len <= UCINLINE {
