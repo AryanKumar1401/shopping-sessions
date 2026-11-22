@@ -1946,6 +1946,27 @@ mod hop_tests {
             };
         }
         id(r, b'u', &mut f[1]);
+        if r.one_in(15) {
+            // traps for hop.rs taking an ID with no end in its first 16 bytes to be 33 bytes:
+            // an event_id of 16 to 32 bytes and a user_id that puts its `,` (or `"`) at byte 33;
+            // 33-byte IDs that are not of the hexadecimal shape
+            let hexish = |r: &mut Rng, lead: u8, n: usize| -> Vec<u8> { (0..n).map(|i| if i == 0 { lead } else { b"0123456789abcdef"[r.below(16) as usize] }).collect() };
+            match r.below(3) {
+                0 => {
+                    let l0 = 16 + r.below(17) as usize;
+                    f[0] = hexish(r, b'e', l0);
+                    let l1 = (32 - l0).saturating_sub(r.below(3) as usize);
+                    f[1] = hexish(r, b'u', l1);
+                }
+                1 => f[r.below(2) as usize] = hexish(r, b'E', 33).to_ascii_uppercase(),
+                _ => {
+                    let k = r.below(2) as usize;
+                    f[k] = hexish(r, b"eu"[k], 33);
+                    let (at, c) = (16 + r.below(17) as usize, r.pick(&[b"\x80", b"\xFF", b"-", b"/", b"G", b"z", b"\"", b" "])[0]);
+                    f[k][at] = c;
+                }
+            }
+        }
         ts(r, false, &mut f[2]);
         ts(r, true, &mut f[3]);
         f[4] = if r.one_in(25) { r.pick(&[b"Purchase", b"cart ", b"viewx", b"", b"vie", b"purchas", b"VIEW", b"xiew", b"zart", b"vart", b"purchasd"]).to_vec() } else { r.pick(&[b"view", b"view", b"view", b"cart", b"purchase", b"purchase"]).to_vec() };
