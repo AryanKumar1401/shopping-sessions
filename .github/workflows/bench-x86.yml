@@ -7,9 +7,10 @@ on:
       old: { description: "last verified commit", required: false, default: "" }
       new: { description: "commit to check (or, with probe, the commit to build)", required: true }
       probe: { description: "if set: only build `new` and run bench/x86/probes/<probe>.sh", required: false, default: "" }
+      quick: { description: "if set: only build old and new, compare 20M/60M outputs, run the hop tests and the interleaved benches", required: false, default: "" }
 jobs:
   x86:
-    if: ${{ inputs.probe == '' }}
+    if: ${{ inputs.probe == '' && inputs.quick == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env: { RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=+crt-static", T: x86_64-unknown-linux-gnu, OLD: "${{ inputs.old }}", NEW: "${{ inputs.new }}" }
@@ -62,3 +63,28 @@ jobs:
           (cd /tmp/wt/engine && CARGO_TARGET_DIR=/tmp/t cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/t/$T/release/shopping-engine /tmp/eng)
       - name: probe
         run: bash bench/x86/probes/${{ inputs.probe }}.sh
+  quick:
+    if: ${{ inputs.quick != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env: { RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=+crt-static", T: x86_64-unknown-linux-gnu, OLD: "${{ inputs.old }}", NEW: "${{ inputs.new }}" }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: setup
+        run: |
+          lscpu | grep -E "Model name|^CPU\(s\)"
+          (cd bench/x86/generator && RUSTFLAGS= cargo build -q --release && ./target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output /tmp/s3 >/dev/null && ./target/release/generate --seed 5 --events 60000000 --clicks 15000000 --output /tmp/s5 >/dev/null)
+          mkdir -p out/perf
+          for rv in old:$OLD new:$NEW; do n=${rv%%:*}; git worktree add -q --detach /tmp/wt-$n ${rv##*:}; (cd /tmp/wt-$n/engine && CARGO_TARGET_DIR=/tmp/t-$n cargo build -q --release --locked --target $T 2>/dev/null && cp /tmp/t-$n/$T/release/shopping-engine $GITHUB_WORKSPACE/out/perf/$n); done
+          python3 -m venv .venv && .venv/bin/pip -q install polars pyarrow >/dev/null 2>&1
+      - name: outputs and unit tests of new
+        run: |
+          echo "checking $(git -C /tmp/wt-new log --oneline -1) against $(git -C /tmp/wt-old log --oneline -1)"
+          (cd /tmp/wt-new && for d in fixtures fixtures_extra; do $GITHUB_WORKSPACE/.venv/bin/python scripts/run_fixtures.py $d -- $GITHUB_WORKSPACE/out/perf/new | tail -1; done)
+          for d in s3 s5; do out/perf/old /tmp/$d /tmp/a-$d >/dev/null 2>&1; out/perf/new /tmp/$d /tmp/b-$d >/dev/null 2>&1; echo "new $d vs old: $(.venv/bin/python scripts/compare.py /tmp/b-$d /tmp/a-$d 2>&1 | tail -1)"; done
+          (cd /tmp/wt-new/engine && HOP_FUZZ_ROUNDS=300 CARGO_TARGET_DIR=/tmp/t-test cargo test -q --release --target $T 2>&1 | grep -E "^test result|FAILED|panicked" | head -5)
+      - name: bench 20M (interleaved)
+        run: python3 bench/bench.py --data /tmp/s3 --reps 9 old=out/perf/old new=out/perf/new 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list|tables|links \(join)|rss"
+      - name: bench 60M (interleaved)
+        run: python3 bench/bench.py --data /tmp/s5 --reps 5 old=out/perf/old new=out/perf/new 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list|tables|links \(join)|rss"
