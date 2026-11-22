@@ -322,6 +322,10 @@ pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<U
     if !any_ev && !any_cl {
         return (Vec::new(), Vec::new());
     }
+    // largest partitions first: a heavy user makes its partition ten times the median
+    let size = |p: usize| uparts.iter().map(|u| u.count(p)).sum::<usize>() + uhparts.iter().map(|u| u.count(p)).sum::<usize>() + ucparts.iter().map(|u| u.0.count(p) + u.1.count(p)).sum::<usize>();
+    let mut order: Vec<(usize, usize)> = (0..np).map(|p| (size(p), p)).collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
     let next = AtomicUsize::new(0);
     let res = par((0..nthreads.max(1)).collect::<Vec<usize>>(), |_, _| {
         let mut pw: Writers<PRec> = Writers::with_wc(if any_ev { 1 << ctx.pbits } else { 1 }, PBLOCK, wc);
@@ -332,11 +336,7 @@ pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<U
         let mut seen: Vec<(*const u8, u32, u64, Id)> = Vec::new();
         // (hi, lo, first byte, Id)
         let mut hseen: Vec<(u64, u64, u32, Id)> = Vec::new();
-        loop {
-            let p = next.fetch_add(1, Relaxed);
-            if p >= np {
-                break;
-            }
+        while let Some(&(_, p)) = order.get(next.fetch_add(1, Relaxed)) {
             // the hexadecimal kind: keys compared as words
             let n: usize = uhparts.iter().map(|u| u.count(p)).sum::<usize>() + ucparts.iter().map(|u| u.1.count(p)).sum::<usize>();
             if n > 0 {
