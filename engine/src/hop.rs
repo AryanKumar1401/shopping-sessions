@@ -839,7 +839,14 @@ unsafe fn long_row(ev: &EvRow, hot: &mut Hot, p: *const u8, dates: &HopDates, um
                 prec = push_prec(ev.ctx, pw, escape, uid, (ts - hot.cbase) as u32, pc);
             }
         }
-        push_dedup(ev.ctx, dw, lw, a0, l0, ev.lim, ev.fix, dd as u32, prec);
+        // (the bytes are all in 0x30..=0x7F: `packable` is the length alone here)
+        if l0 <= 9 {
+            let eid = pack_id16(a0, l0);
+            dw.push(((id_hash(eid) >> 1) >> hot.dshift) as usize, DRec { eid, ing: dd as u32, prec });
+        } else {
+            let h = bytes_hash(a0, l0);
+            lw.push(((h >> 1) >> hot.dshift) as usize, LRec { h, ptr: (a0 as usize).wrapping_add(ev.fix), len: l0 as u32, ing: dd as u32, prec, pad: 0 });
+        }
         s5 as usize + nl + 1
     }
 }
