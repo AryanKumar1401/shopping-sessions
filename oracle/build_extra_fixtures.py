@@ -509,6 +509,31 @@ case("X31_event_type_and_ids", "event_type exact ('cart ' , 'CART', 'click' drop
      ["organic,organic,2026-10-03,1,0,0,0"])
 
 
+# Long click IDs (the organisers' 33-byte form, and longer): the tie-break compares the whole
+# IDs byte-wise, quotes are not part of them, and a prefix is smaller than its extension.
+# By hand: every user has one session at Oct 3 10:00 and two clicks at 09:00.000 (one F1, one
+# F3), one per campaign, so both campaigns assist all 6 sessions.
+#   u1: k<H>e (c_2) < k<H>f (c_1): differ in byte 33                         -> c_2
+#   u2: kabc (c_1) is a prefix of kabc<H> (c_2)                              -> c_1
+#   u3: k1<H> bare (c_1) < "k2<H>" quoted (c_2); counting the quote would flip it -> c_1
+#   u<H> (a 33-byte user): ka<H> (c_2) < kzzzzzzzz (c_1), long against short   -> c_2
+#   u5: "k5<H>" quoted (c_1) is a prefix of k5<H>0 (c_2)                     -> c_1
+#   u6: k + 70 x '7' + a (c_2) < k + 70 x '7' + b (c_1): differ in byte 72   -> c_2
+HX = "0123456789abcdef" * 2
+case("X40_click_tie_long_ids", "Tie-break on long click IDs (33 bytes and more): whole IDs byte-wise, prefix first, quotes not counted, long vs short; a 33-byte user_id",
+     {"events/part-00000.csv": lines(EV_H, [
+         ev(f"e{i}", u, "2026-10-03T10:00:00Z", I12, "view", "p1", "") for i, u in enumerate(["u1", "u2", "u3", "u" + HX, "u5", "u6"])]),
+      "clicks/part-00000.csv": lines(CL_H, [
+          f"k{HX[:-1]}f,u1,c_1,2026-10-03T09:00:00Z", f"k{HX[:-1]}e,u1,c_2," + octms(3, 9),
+          f"kabc{HX},u2,c_2,2026-10-03T09:00:00Z", "kabc,u2,c_1," + octms(3, 9),
+          f'"k2{HX}",u3,c_2,2026-10-03T09:00:00Z', f"k1{HX},u3,c_1," + octms(3, 9),
+          f'kzzzzzzzz,u{HX},c_1,2026-10-03T09:00:00Z', f'ka{HX},"u{HX}",c_2,' + octms(3, 9),
+          f"k5{HX}0,u5,c_2,2026-10-03T09:00:00Z", f'"k5{HX}",u5,c_1,' + octms(3, 9),
+          "k" + "7" * 70 + "b,u6,c_1,2026-10-03T09:00:00Z", "k" + "7" * 70 + "a,u6,c_2," + octms(3, 9)])},
+     ["u1,2026-10-03,1,1,0,", "u2,2026-10-03,1,1,0,", "u3,2026-10-03,1,1,0,", f"u{HX},2026-10-03,1,1,0,", "u5,2026-10-03,1,1,0,", "u6,2026-10-03,1,1,0,"],
+     ["c_1,search,2026-10-03,3,0,0,6", "c_2,social,2026-10-03,3,0,0,6"])
+
+
 def main():
     if os.path.isdir(ROOT):
         for d in os.listdir(ROOT):
