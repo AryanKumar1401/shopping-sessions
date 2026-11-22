@@ -7,7 +7,7 @@ COPY engine/Cargo.toml engine/Cargo.lock ./
 COPY engine/src ./src
 RUN set -eux; \
     case "$(uname -m)" in \
-      x86_64)  T=x86_64-unknown-linux-gnu;  F="-C target-cpu=x86-64-v3" ;; \
+      x86_64)  T=x86_64-unknown-linux-gnu;  F="-C target-cpu=x86-64-v3 -C llvm-args=-x86-branches-within-32B-boundaries" ;; \
       aarch64) T=aarch64-unknown-linux-gnu; F="" ;; \
       *) echo "unsupported arch" >&2; exit 1 ;; \
     esac; \
