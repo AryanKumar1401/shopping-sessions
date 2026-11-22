@@ -18,7 +18,7 @@ fn files(dir: &std::path::Path) -> Vec<&'static [u8]> {
             let n = f.metadata().unwrap().len() as usize;
             if n == 0 { continue; }
             let a = unsafe { mmap(std::ptr::null_mut(), n, 1, 2, f.as_raw_fd(), 0) };
-            unsafe { madvise(a, n, 22) }; // MADV_POPULATE_READ (ignored if unsupported)
+            if std::env::var("POP").is_ok() { unsafe { madvise(a, n, 22) }; } // MADV_POPULATE_READ
             v.push(unsafe { std::slice::from_raw_parts(a as *const u8, n) });
             std::mem::forget(f);
         }

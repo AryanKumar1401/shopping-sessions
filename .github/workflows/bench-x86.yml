@@ -20,13 +20,18 @@ jobs:
           du -sh /tmp/s3/events /tmp/s3/clicks
       - name: floors
         run: |
-          for t in 4; do for m in 0 1 2 3; do /tmp/sol /tmp/s3 $t $m; done; done
+          echo "pre-populated mapping:"; for m in 0 3; do POP=1 /tmp/sol /tmp/s3 4 $m; done
+          echo "faulting inside the timer (fresh mapping per rep is not done: rep 1 faults, later reps reuse) -> run once each:"
+          for m in 0 3; do /tmp/sol /tmp/s3 4 $m; done
           for i in 1 2 3; do s=$(date +%s%N); find /tmp/s3/events /tmp/s3/clicks -name '*.csv' | xargs -P4 -n8 wc -l >/dev/null; e=$(date +%s%N); echo "xargs -P4 wc -l: $(( (e-s)/1000000 )) ms"; done
       - name: engine (main + probe knob)
         run: |
           best() { sort -n | head -1; }
-          for cfg in "full:0:" "scan-only:1:" "events-scan-only:1:clicks" "events-full:0:clicks" "clicks-full:0:events"; do
-            IFS=: read name st sk <<< "$cfg"
-            printf "%-18s " $name; for i in 1 2 3 4 5; do SE_STAGE=$st SE_SKIP=$sk SE_TIMING=1 /tmp/eng /tmp/s3 /tmp/o 2>&1 | grep 'parse events' | awk '{print $5, $8}'; done | best
+          for kn in "" "SE_DROP=0" "SE_READ=1" "SE_READ=1 SE_CHUNK=1048576" "SE_DROP=0 SE_POPULATE=1"; do
+            for st in 1 0; do
+              printf "%-32s stage %s: " "${kn:-default}" $st; for i in 1 2 3 4 5; do env $kn SE_STAGE=$st SE_TIMING=1 /tmp/eng /tmp/s3 /tmp/o 2>&1 | grep 'parse events' | awk '{print $5, $8, $11}'; done | best
+            done
           done
+          echo "wall / user / sys of the parse phase"
+          for kn in "" "SE_DROP=0" "SE_READ=1"; do printf "%-12s total: " "${kn:-default}"; for i in 1 2 3 4 5; do env $kn SE_TIMING=1 /tmp/eng /tmp/s3 /tmp/o 2>&1 | grep 'release' | awk '{print $NF}'; done | sort -n | head -1; done
           for i in 1 2 3; do SE_TIMING=1 /tmp/eng /tmp/s3 /tmp/o 2>&1 | grep -E "timing\] (list|links|parse|dedup|people|campaign|release)" ; echo; done | tail -9
