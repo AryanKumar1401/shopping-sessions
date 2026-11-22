@@ -3,7 +3,8 @@
 //!
 //!   id , id , ts , ingest_ts , type , product , price \n
 //!
-//! where each `id` is 1 to 9 bytes that are all in `0x30..=0x7F`, `ts` is a 13-digit F3, or
+//! where each `id` is 1 to 15 bytes that are all in `0x30..=0x7F` or 33 bytes of the
+//! hexadecimal shape (`fast::hex_key`), `ts` is a 13-digit F3, or
 //! an F1 or F2 of the years 2000 to 2099, `ingest_ts` is such an F1, `type` is `view`, `cart`
 //! or `purchase`, the product is not empty, and product, price and the newline fit in 32
 //! bytes. Any of the first five fields may be wrapped in quotes; quotes in the last two are
@@ -25,17 +26,15 @@ use crate::ts::*;
 use crate::util::*;
 
 /// Bytes that must be readable from a line's start for the speculative walk: it never reads
-/// further than this, whatever the bytes are (2 x (1 + 16 + 2) for the IDs, 28 + 23 for the
-/// timestamps, 11 for the type, 32 for the tail = 132, and the 32-byte loads behind each).
+/// further than this, whatever the bytes are (2 x (1 + 33 + 2) for the IDs, 28 + 23 for the
+/// timestamps, 11 for the type, 32 for the tail = 166, and the 32-byte loads behind each).
 pub const GUARD: usize = 320;
 
 /// What must follow an ID's bytes: `,` (index 0) or `",` (index 1), as a little-endian
 /// 16-bit word and the mask of the bytes that count.
 static TERM_WANT: [u16; 2] = [0x002C, 0x2C22];
 static TERM_MASK: [u16; 2] = [0x00FF, 0xFFFF];
-/// Nonzero for an ID length that is not 1..=9.
-static LEN_BAD: [u8; 17] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1];
-/// The same for 0..=9 (an empty user_id is handled here: the event is not a good one).
+/// Nonzero for an ID length that is not 0..=9 (click_row's campaign_id).
 static LEN_BAD0: [u8; 17] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1];
 
 /// Nonzero unless the bytes at `t` are `,` (q = 0) or `",` (q = 1).
@@ -203,9 +202,9 @@ mod k {
     pub type V16 = __m128i;
     pub type Ids = __m256i;
 
-    /// Byte masks of the first `len` of 16 bytes for `len` 0..=9; zero for 10..=16.
-    static LEN_MASK: [[u8; 16]; 17] = {
-        let mut t = [[0u8; 16]; 17];
+    /// Byte masks of the first `len` of 16 bytes for `len` 0..=9; zero for 10..=33.
+    static LEN_MASK: [[u8; 16]; 34] = {
+        let mut t = [[0u8; 16]; 34];
         let mut l = 0;
         while l < 10 {
             let mut i = 0;
@@ -230,18 +229,14 @@ mod k {
         }
     }
 
-    /// How many of the bytes at `a` come before the first byte outside `0x30..=0x7F`:
-    /// 0..=64, or 65 when there are more (64 bytes are read).
+    /// `id_scan` with 33 in place of 16: the length the ID has if it is of the hexadecimal
+    /// shape (to be checked), at no extra cost.
     #[inline(always)]
-    pub unsafe fn id_len(a: *const u8) -> usize {
+    pub unsafe fn id_scan33(a: *const u8) -> (V16, usize) {
         unsafe {
-            let lo = _mm256_set1_epi8(0x30);
-            let m = _mm256_movemask_epi8(_mm256_cmpgt_epi8(lo, _mm256_loadu_si256(a as *const __m256i))) as u32;
-            if m != 0 {
-                return m.trailing_zeros() as usize;
-            }
-            let m = _mm256_movemask_epi8(_mm256_cmpgt_epi8(lo, _mm256_loadu_si256(a.add(32) as *const __m256i))) as u32;
-            if m != 0 { 32 + m.trailing_zeros() as usize } else { 65 }
+            let v = _mm_loadu_si128(a as *const __m128i);
+            let m = _mm_movemask_epi8(_mm_cmpgt_epi8(_mm_set1_epi8(0x30), v)) as u32 as u64 | (1 << 33);
+            (v, m.trailing_zeros() as usize)
         }
     }
 
@@ -388,13 +383,10 @@ mod k {
     }
 
     #[inline(always)]
-    pub unsafe fn id_len(a: *const u8) -> usize {
+    pub unsafe fn id_scan33(a: *const u8) -> (V16, usize) {
         unsafe {
-            let mut l = 0;
-            while l < 65 && (0x30..=0x7F).contains(&*a.add(l)) {
-                l += 1;
-            }
-            l
+            let (v, l) = id_scan(a);
+            (v, if l == 16 { 33 } else { l })
         }
     }
 
@@ -621,8 +613,8 @@ const BAIL: usize = 0;
 const DATE_MISS: usize = 1;
 /// the line is a purchase inside the window, to be finished by `purchase_finish`.
 const PURCHASE: usize = 2;
-/// the line has an ID of 10 bytes or more, is of the usual shape, and is to be finished by
-/// `long_emit` from `Hot::lr`.
+/// the line has an ID of 10 bytes or more (10 to 15, or 33), is of the usual shape, and is to
+/// be finished by `long_emit` from `Hot::lr`.
 const LONGROW: usize = 3;
 const CODES: isize = 4;
 /// Added to the next line's start: a block the row wrote to is full (`Writers::refill_full`
@@ -749,68 +741,63 @@ unsafe fn push32<T: Copy>(heads: *mut (*mut T, *mut T), buf: *mut T, s: usize, v
     }
 }
 
+/// Whether bytes 16..=32 at `a` are all in `0x30..=0x7F` (an ID that `id_scan33` took to be
+/// 33 bytes and that is not of the hexadecimal shape: then it is 33 bytes).
+#[cold]
+#[inline(never)]
+unsafe fn len33(a: *const u8) -> bool {
+    unsafe { (16..33).all(|i| (0x30..=0x7F).contains(&*a.add(i))) }
+}
+
 /// One line at `p` (with `GUARD` readable bytes): handles it and returns the start of the next
 /// line (plus `REFILL`), or one of the codes above. No calls in here: the loop around it
 /// keeps its constants in registers.
 #[inline(always)]
 unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>) -> usize {
     unsafe {
-        // event_id
+        // event_id: 1 to 15 bytes, or 33 when the scan saw no end in 16 (the hexadecimal
+        // shape, checked below: the long and the short lines are walked alike)
         let q0 = (*p == b'"') as usize;
         let a0 = p.add(q0);
-        let (v0, l0) = k::id_scan(a0);
+        let (v0, l0) = k::id_scan33(a0);
         let t0 = a0.add(l0);
-        // user_id
+        // user_id: 0 to 15 bytes, or 33
         let s1 = t0.add(q0 + 1);
         let q1 = (*s1 == b'"') as usize;
         let a1 = s1.add(q1);
-        let (v1, l1) = k::id_scan(a1);
-        let long = (l0 > 9) | (l1 > 9);
-        let (s2, mut bad) = if !long {
-            let t1 = a1.add(l1);
-            // the event_id not empty (an empty user_id packs to 0)
-            (t1.add(q1 + 1), term(t0, q0) | term(t1, q1) | (*LEN_BAD.get_unchecked(l0) | *LEN_BAD0.get_unchecked(l1)) as u64)
-        } else {
-            // An ID of 10 bytes or more: both fields again, up to 64 bytes each; the line is
-            // walked here and finished by `long_emit`.
-            let l0 = k::id_len(a0);
-            if l0.wrapping_sub(1) > 63 {
-                return BAIL;
-            }
-            let t0 = a0.add(l0);
-            let s1 = t0.add(q0 + 1);
-            let q1 = (*s1 == b'"') as usize;
-            let a1 = s1.add(q1);
-            let l1 = k::id_len(a1);
-            if l1 > 64 {
-                return BAIL;
-            }
-            let t1 = a1.add(l1);
-            hot.lr.ids = (a0, l0, a1, l1);
-            (t1.add(q1 + 1), term(t0, q0) | term(t1, q1))
-        };
-        // (of no meaning for a long line)
+        let (v1, l1) = k::id_scan33(a1);
+        let t1 = a1.add(l1);
+        // the event_id not empty (an empty user_id packs to 0)
+        let mut bad = term(t0, q0) | term(t1, q1) | (l0 == 0) as u64;
+        // (of no meaning for an ID of 10 bytes or more)
         let ids = k::pack2(v0, l0, v1, l1);
-        let (ts, ing_s, kt, s5, mcb, open, nl, tb) = row_rest!(s2, dates, hot);
+        let (ts, ing_s, kt, s5, mcb, open, nl, tb) = row_rest!(t1.add(q1 + 1), dates, hot);
         bad |= tb as u64;
         if bad != 0 {
             return BAIL;
         }
-        if long {
-            hot.lr.rest = (ts, ing_s, kt, s5, mcb, open, nl);
-            // The usual long line - an ID of the hexadecimal shape, the other one short or of
-            // that shape too, not a purchase in the window - is finished here like a short
-            // one; every other goes to `long_emit` (the same records, see there).
+        if (l0 > 9) | (l1 > 9) {
+            // An ID taken to be 33 bytes is when bytes 1..=32 are hexadecimal digits (byte 0
+            // and the `,` or `"` after byte 32 were checked); the walk is then exact. When
+            // they are not, but are all in `0x30..=0x7F`, the ID is still 33 bytes.
             if !RAW {
+                if (l0 == 33 && !len33(a0)) || (l1 == 33 && !len33(a1)) {
+                    return BAIL;
+                }
+                hot.lr = LongRow { ids: (a0, l0, a1, l1), rest: (ts, ing_s, kt, s5, mcb, open, nl) };
                 return LONGROW;
             }
-            let (a0, l0, a1, l1) = hot.lr.ids;
+            let he = if l0 == 33 { k::hex33(a0, 33) } else { None };
+            let hu = if l1 == 33 { k::hex33(a1, 33) } else { None };
             let good = ((ts.wrapping_sub(hot.ws) as u64) < hot.span) && (ing_s * 1000).wrapping_sub(ts) <= DAY && l1 != 0;
-            if good & (kt < 2) {
-                return LONGROW;
-            }
-            let (he, hu) = (k::hex33(a0, l0), k::hex33(a1, l1));
-            if ((l0 > 9) & he.is_none()) | ((l1 > 9) & hu.is_none()) {
+            // The usual long line - IDs of the hexadecimal shape or short, not a purchase in
+            // the window - is finished here like a short one; every other goes to `long_emit`
+            // (the same records, see there).
+            if ((l0 == 33) & he.is_none()) | ((l1 == 33) & hu.is_none()) | (l0.wrapping_sub(10) < 6) | (l1.wrapping_sub(10) < 6) | (good & (kt < 2)) {
+                if ((l0 == 33) & he.is_none() && !len33(a0)) || ((l1 == 33) & hu.is_none() && !len33(a1)) {
+                    return BAIL;
+                }
+                hot.lr = LongRow { ids: (a0, l0, a1, l1), rest: (ts, ing_s, kt, s5, mcb, open, nl) };
                 return LONGROW;
             }
             let mut next = s5 as usize + nl + 1;
@@ -832,7 +819,7 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
                     hot.max_uidx |= idx;
                     prec = idx as u32 | UFLAG | HFLAG;
                 } else {
-                    let uid = pack_id16(a1, l1);
+                    let uid = k::id1(ids);
                     let ps = ((id_hash(uid) >> 1) >> hot.pshift) as usize;
                     let r = push16(hot.ph, hot.pb, ps, PRec { k: uid, ts: pts, pc: 0 }, &mut full);
                     if full != 0 {
@@ -854,7 +841,7 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
                     next |= REFILL;
                 }
             } else {
-                let eid = pack_id16(a0, l0);
+                let eid = k::id0(ids);
                 let ds = ((id_hash(eid) >> 1) >> hot.dshift) as usize;
                 push16(hot.dh, hot.db, ds, DRec { eid, ing: dd as u32, prec }, &mut full);
                 if full != 0 {
@@ -911,7 +898,7 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
 }
 
 /// The rest of a line that left `hop_row` with `LONGROW` (walked and of the usual shape, IDs
-/// of up to 64 bytes all in `0x30..=0x7F`); returns the next line's start. A user_id of 10
+/// of up to 33 bytes all in `0x30..=0x7F`); returns the next line's start. A user_id of 10
 /// bytes or more gets a `URec`, an event_id of 10 bytes or more an `LRec`: for these bytes
 /// `packable` is the length alone.
 #[inline(never)]
