@@ -109,3 +109,18 @@ Nulls on x86 (none landed; all MATCH, all within the run's noise of the same-run
 - Clicks only, writer knobs `SE_WC`/`SE_PBITS` 1/9, 1/6, 0/9, 0/6: 473 / 495 / 460 / 460 user (3% at best).
 
 Mac (arm64) results do not carry over for the scanner: ca6f306's parse was 2x slower than 5e0f5d9's on the M4 but 17% faster on x86.
+
+### Click row-hopping kernel (24f0def), GitHub x86 runner (AMD EPYC 7763, 4 vCPU), 2026-11-21
+
+Interleaved against b1e616b in one run. Times in ms, wall min / med.
+
+| data | N | b1e616b | 24f0def | parse wall min |
+| --- | --- | --- | --- | --- |
+| seed 3, 20M | 11 | 899 / 907 | **878 / 885** | 542 -> 526 |
+| seed 5, 60M | 5 | 2668 / 2683 | **2603 / 2618** | 1616 -> 1549 |
+
+Outputs MATCH b1e616b at 1M (leap-day window), 5M, 20M and 60M, and MATCH DuckDB at 5M, also through the Docker image. Fixtures, 400 oracle fuzz seeds and 100 more with `SE_SLOW=1` pass on x86.
+`hop_clicks_equal_reference` (adversarial click lines against the scalar scanner, 800 rounds) passes on arm64 and on the AVX2 path.
+Not timed on the benchmark VM or the scorer.
+
+Also measured the same day on the runner, not landed: tables on a background thread during file mapping (branch `startup`), 808 -> 803 ms min, 818 -> 811 med on a Xeon 6975P-C runner (within noise; the VM measured it slower).

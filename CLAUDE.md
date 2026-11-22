@@ -56,7 +56,8 @@ Everything runs on `NCPU` threads over work queues; the process ends with `_exit
    - events: `hop.rs` row-hopping kernel (default on x86-64 AVX2; `SE_KERNEL=scan` restores the old one).
      Walks a row left to right using fixed-shape templates; anything unusual (0.74% of rows) goes to the
      exact path (`split_row` + `eval_event`). ~316 instructions per row.
-   - clicks and links: `scan.rs` generic scanner (SIMD masks -> delimiter flag bytes via pext/pdep).
+   - clicks: `hop.rs::hop_clicks`, the same walk for the four click fields (since 24f0def); links and the
+     fallbacks: `scan.rs` generic scanner (SIMD masks -> delimiter flag bytes via pext/pdep).
    - IDs are packed 7 bits/char into a u64 when <= 9 bytes and ASCII; anything else is interned exactly.
    - Each good event writes `PRec{uid u64, ts u32, cat*K+price u32}` to the partition of its **user-ID hash**
      and every well-formed copy writes `DRec{eid u64, ingest u32 (seconds), prec index u32}` to the partition
@@ -150,7 +151,8 @@ Details and numbers are in `bench/NOTES.md`.
 1. Record writes in the event kernel (~94 of 253 ms, memory-bound): WC unit/stream count, first-touch cost,
    or one 32-byte record per event into the event-ID partition with dedup forwarding survivors as PRecs to
    user-ID partitions (removes one stream and the dead-marking). In progress when this was written.
-2. A hop-style kernel for click rows (their delimiter scan is ~38% of the ~80 ms click cost).
+2. ~~A hop-style kernel for click rows~~ Done in 24f0def (`hop.rs::hop_clicks`, generic scanner as the exact fallback):
+   GitHub x86 runner, interleaved, 20M 899 -> 878 ms, 60M 2668 -> 2603 ms (-2.4% both); not yet timed on the VM or the scorer.
 3. Two cheap hop cuts: quote flags from masks already loaded; midnight in ms in the date memo.
 4. People: the general sweep for people with 17-256 sessions (40% of sessions) and row formatting
    (~180 thread-ms); bucket aggregation directly in pass A's event scan (est. 12-17 ms).
