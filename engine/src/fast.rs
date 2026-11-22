@@ -1027,6 +1027,9 @@ pub unsafe fn eval_event(ctx: &Ctx, f: &[Field; 7], lim: *const u8, cache: &mut 
     }
 }
 
+/// Most sub-bucket bits of a dedup partition (see `run_rest`).
+const SUB_MAX_BITS: u32 = 6;
+
 /// Records per block of the person partitions.
 const PBLOCK: usize = 512;
 
@@ -1414,6 +1417,9 @@ fn run_rest(
     let (pbase_addr, ubase_addr) = (ctx.pregion.base, ctx.uregion.base);
     par((0..nthreads).collect::<Vec<usize>>(), |_, _| {
         let mut table: Vec<u64> = Vec::new();
+        let mut tab32: Vec<u32> = Vec::new();
+        let mut subs: Vec<Vec<DRec>> = (0..1usize << SUB_MAX_BITS).map(|_| Vec::new()).collect();
+        let env_sub = env_usize("SE_SUBBITS").map(|b| b.min(SUB_MAX_BITS as usize) as u32);
         let (pbase, ubase) = (pbase_addr as *mut PRec, ubase_addr as *mut u8);
         loop {
             let p = next.fetch_add(1, Relaxed);
@@ -1424,38 +1430,58 @@ fn run_rest(
             if n < 2 {
                 continue;
             }
-            let cap = (n * 2).next_power_of_two();
-            table.clear();
-            table.resize(cap, 0);
-            let mask = cap - 1;
-            for d in dparts_ref {
-                for sl in d.slices(p) {
-                    for rec in sl.iter_mut() {
-                        let h = id_hash(rec.eid);
-                        let tag = (h >> 32) << 48;
-                        let me = (rec as *mut DRec as u64) | tag;
-                        let mut i = h as usize & mask;
-                        loop {
-                            let s = unsafe { *table.get_unchecked(i) };
-                            if s == 0 {
-                                unsafe { *table.get_unchecked_mut(i) = me };
-                                break;
-                            }
-                            if s & (0xFFFF << 48) == tag {
-                                let other = unsafe { &*((s & ((1 << 48) - 1)) as *const DRec) };
-                                if other.eid == rec.eid {
-                                    let loser = if rec.ing < other.ing {
-                                        table[i] = me;
-                                        other.prec
-                                    } else {
-                                        rec.prec
-                                    };
-                                    unsafe { kill(pbase, ubase, loser) };
-                                    break;
-                                }
-                            }
-                            i = (i + 1) & mask;
+            // The partition's records are first copied into sub-buckets by further hash bits,
+            // each small enough that it and its table (slots: 1 + index in the bucket) stay
+            // in the second-level cache; the copies have all that is needed.
+            let sb = env_sub.unwrap_or_else(|| ceil_log2(n / 6000).min(SUB_MAX_BITS));
+            for v in subs[..1usize << sb].iter_mut() {
+                v.clear();
+            }
+            if sb == 0 {
+                for d in dparts_ref {
+                    for sl in d.slices(p) {
+                        subs[0].extend_from_slice(sl);
+                    }
+                }
+            } else {
+                for d in dparts_ref {
+                    for sl in d.slices(p) {
+                        for rec in sl.iter() {
+                            // the bits below the partition's
+                            let q = ((id_hash(rec.eid) << dbits) >> (64 - sb)) as usize;
+                            unsafe { subs.get_unchecked_mut(q) }.push(*rec);
                         }
+                    }
+                }
+            }
+            for a in subs[..1usize << sb].iter() {
+                if a.len() < 2 {
+                    continue;
+                }
+                let cap = (a.len() * 2).next_power_of_two();
+                tab32.clear();
+                tab32.resize(cap, 0);
+                let mask = cap - 1;
+                for (j, rec) in a.iter().enumerate() {
+                    let mut i = id_hash(rec.eid) as usize & mask;
+                    loop {
+                        let t = unsafe { *tab32.get_unchecked(i) };
+                        if t == 0 {
+                            unsafe { *tab32.get_unchecked_mut(i) = j as u32 + 1 };
+                            break;
+                        }
+                        let other = unsafe { a.get_unchecked(t as usize - 1) };
+                        if other.eid == rec.eid {
+                            let loser = if rec.ing < other.ing {
+                                unsafe { *tab32.get_unchecked_mut(i) = j as u32 + 1 };
+                                other.prec
+                            } else {
+                                rec.prec
+                            };
+                            unsafe { kill(pbase, ubase, loser) };
+                            break;
+                        }
+                        i = (i + 1) & mask;
                     }
                 }
             }
