@@ -1426,7 +1426,7 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                 // clicks with a long user_id: resolved after the parse (timed apart)
                 let mut res = res;
                 let ucparts: Vec<Parts<UCRec>> = res.iter_mut().map(|r| std::mem::replace(&mut r.6, Writers::<UCRec>::new(1, 4).finish())).collect();
-                let nuc: usize = ucparts.iter().map(|u| (0..1usize << lbits).map(|q| u.count(q)).sum::<usize>()).sum();
+                let nuc: usize = ucparts.iter().map(|u| (0..1usize << pbits).map(|q| u.count(q)).sum::<usize>()).sum();
                 let t1 = std::time::Instant::now();
                 let resolved = resolve_long_clicks(&ctx, &ucparts, nt, wc);
                 let rms = t1.elapsed().as_secs_f64() * 1000.0;
