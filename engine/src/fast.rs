@@ -1600,27 +1600,47 @@ fn run_rest(
                 if a.len() < 2 {
                     continue;
                 }
+                // Slots hold the event_id itself (0: empty), so that a probe past another ID
+                // reads nothing else; `tab32` has the record's index in the same slot (read only
+                // where the ID is). A packed event_id is never 0 (not empty: its first byte is
+                // in 1..=127); one that were would be kept apart in `zero`, exactly.
                 let cap = (a.len() * 2).next_power_of_two();
-                tab32.clear();
-                tab32.resize(cap, 0);
+                table.clear();
+                table.resize(cap, 0);
+                if tab32.len() < cap {
+                    tab32.resize(cap, 0);
+                }
                 let mask = cap - 1;
+                let mut zero = u32::MAX;
                 for (j, rec) in a.iter().enumerate() {
+                    let fight = |o: &mut u32| {
+                        let other = unsafe { a.get_unchecked(*o as usize) };
+                        let loser = if rec.ing < other.ing {
+                            *o = j as u32;
+                            other.prec
+                        } else {
+                            rec.prec
+                        };
+                        unsafe { kill(pbase, ubase, loser) };
+                    };
+                    if rec.eid == 0 {
+                        if zero == u32::MAX {
+                            zero = j as u32;
+                        } else {
+                            fight(&mut zero);
+                        }
+                        continue;
+                    }
                     let mut i = id_hash(rec.eid) as usize & mask;
                     loop {
-                        let t = unsafe { *tab32.get_unchecked(i) };
-                        if t == 0 {
-                            unsafe { *tab32.get_unchecked_mut(i) = j as u32 + 1 };
+                        let k = unsafe { *table.get_unchecked(i) };
+                        if k == rec.eid {
+                            fight(unsafe { tab32.get_unchecked_mut(i) });
                             break;
                         }
-                        let other = unsafe { a.get_unchecked(t as usize - 1) };
-                        if other.eid == rec.eid {
-                            let loser = if rec.ing < other.ing {
-                                unsafe { *tab32.get_unchecked_mut(i) = j as u32 + 1 };
-                                other.prec
-                            } else {
-                                rec.prec
-                            };
-                            unsafe { kill(pbase, ubase, loser) };
+                        if k == 0 {
+                            unsafe { *table.get_unchecked_mut(i) = rec.eid };
+                            unsafe { *tab32.get_unchecked_mut(i) = j as u32 };
                             break;
                         }
                         i = (i + 1) & mask;
