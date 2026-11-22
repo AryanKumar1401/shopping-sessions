@@ -1015,15 +1015,16 @@ unsafe fn slow_click(ctx: &Ctx, p: *const u8, end: *const u8, lim: *const u8, fi
 }
 
 /// All click lines of `base[..len]` (whole lines; the last may lack its `\n` only when it
-/// ends at `lim`, the end of the readable bytes).
+/// ends at `lim`, the end of the readable bytes). Returns how many lines took the general path.
 #[inline(always)]
-pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8, fix: usize, dates: &mut HopDates, cache: &mut DateCache, cw: &mut Writers<CRec>) {
+pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8, fix: usize, dates: &mut HopDates, cache: &mut DateCache, cw: &mut Writers<CRec>) -> u64 {
     unsafe {
         let mut hot = ClickHot { cbase: ctx.cbase, span: (ctx.we - ctx.cbase) as u64, fix, miss: base };
         let end = base.add(len);
         let room = lim as usize - base as usize;
         let fast_end = if room >= GUARD { base.add((room - GUARD + 1).min(len)) } else { base };
         let mut p = base;
+        let mut slow = 0u64;
         let (mut retry_p, mut retry_n) = (std::ptr::null::<u8>(), 0u32);
         loop {
             let mut code = BAIL;
@@ -1049,7 +1050,9 @@ pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8,
             if p >= end {
                 break;
             }
+            slow += 1;
             p = slow_click(ctx, p, end, lim, fix, cache, cw);
         }
+        slow
     }
 }
