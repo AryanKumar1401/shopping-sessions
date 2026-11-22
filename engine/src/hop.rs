@@ -19,7 +19,7 @@
 //! readable bytes) takes `split_row` + `event_general`, the plain statement of the rules.
 
 use crate::fast::*;
-use crate::scan::split_row;
+use crate::scan::Field;
 use crate::ts::*;
 use crate::util::*;
 
@@ -713,16 +713,42 @@ unsafe fn purchase_finish(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw:
 }
 
 /// The line at `p` (ending before `end`) by the general rules; returns the next line's start.
+/// One pass that finds the newline and splits as `split_row` does: a field has no quote, or
+/// exactly two, as its first and last byte.
 #[cold]
 #[inline(never)]
 unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) -> *const u8 {
     unsafe {
-        let b = std::slice::from_raw_parts(p, end as usize - p as usize);
-        let n = b.iter().position(|&c| c == b'\n').unwrap_or(b.len());
-        if let Some(f) = split_row::<7>(p, n) {
+        let mut f: [Field; 7] = [(p, 0); 7];
+        let (mut k, mut well, mut st, mut nq, mut i) = (0usize, true, p, 0usize, p);
+        loop {
+            let c = if i == end { b'\n' } else { *i };
+            if c == b',' || c == b'\n' {
+                let len = i as usize - st as usize;
+                if k < 7 {
+                    if nq == 0 {
+                        f[k] = (st, len);
+                    } else if nq == 2 && len >= 2 && *st == b'"' && *i.sub(1) == b'"' {
+                        f[k] = (st.add(1), len - 2);
+                    } else {
+                        well = false;
+                    }
+                }
+                k += 1;
+                if c == b'\n' {
+                    break;
+                }
+                st = i.add(1);
+                nq = 0;
+            } else if c == b'"' {
+                nq += 1;
+            }
+            i = i.add(1);
+        }
+        if well && k == 7 {
             event_general(ev.ctx, &f, ev.lim, cache, pw, dw, escape);
         }
-        p.add(n + 1)
+        i.add(1)
     }
 }
 
