@@ -34,6 +34,8 @@ static TERM_WANT: [u16; 2] = [0x002C, 0x2C22];
 static TERM_MASK: [u16; 2] = [0x00FF, 0xFFFF];
 /// Nonzero for an ID length that is not 1..=9.
 static LEN_BAD: [u8; 17] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1];
+/// The same for 0..=9 (an empty user_id is handled here: the event is not a good one).
+static LEN_BAD0: [u8; 17] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1];
 
 /// Nonzero unless the bytes at `t` are `,` (q = 0) or `",` (q = 1).
 #[inline(always)]
@@ -381,11 +383,12 @@ mod k {
 /// Memo of the dates of the years 20YY: key = the eight bytes `YY-MM-DD`, value = epoch
 /// seconds of that midnight less `TOD_BIAS`. Slot: the low bits of the two day digits.
 pub struct HopDates {
-    e: [(u64, i64); 64],
+    k: [u64; 64],
+    v: [i64; 64],
 }
 impl HopDates {
     pub fn new() -> Self {
-        HopDates { e: [(0, 0); 64] }
+        HopDates { k: [0; 64], v: [0; 64] }
     }
 }
 
@@ -399,27 +402,35 @@ unsafe fn date_miss(a: *const u8, dates: &mut HopDates, slot: usize) -> i64 {
         if v == NONE || *a != b'2' || *a.add(1) != b'0' {
             return NONE;
         }
-        dates.e[slot] = (rd64(a.add(2)), v - TOD_BIAS);
+        dates.k[slot] = rd64(a.add(2));
+        dates.v[slot] = v - TOD_BIAS;
         v - TOD_BIAS
     }
 }
 
-/// `20YY-MM-DDTHH:MM:SS` at `a`, already compared with its template (so every digit is one,
-/// and `20`, `-`, `T`, `:` are in place) -> epoch seconds, or NONE for an impossible date or
-/// hour.
-#[inline(always)]
-unsafe fn civil(a: *const u8, dates: &mut HopDates) -> i64 {
-    unsafe {
+/// `20YY-MM-DDTHH:MM:SS` at `$a`, already compared with its template (so every digit is one,
+/// and `20`, `-`, `T`, `:` are in place) -> epoch seconds; leaves the row function with null
+/// for an impossible date or hour.
+macro_rules! civil {
+    ($a:expr, $dates:expr) => {{
+        let a = $a;
         let key = rd64(a.add(2));
         let slot = k::date_slot(key);
-        let e = *dates.e.get_unchecked(slot);
-        let day = if e.0 == key { e.1 } else { date_miss(a, dates, slot) };
+        let day = if *$dates.k.get_unchecked(slot) == key {
+            *$dates.v.get_unchecked(slot)
+        } else {
+            let v = date_miss(a, $dates, slot);
+            if v == NONE {
+                return std::ptr::null();
+            }
+            v
+        };
         let t = k::tod(a.add(11));
-        if (day == NONE) | (t >= TOD_BIAS + 86_400) {
-            return NONE;
+        if t >= TOD_BIAS + 86_400 {
+            return std::ptr::null();
         }
         day + t
-    }
+    }};
 }
 
 // ---------------------------------------------------------------- the row
@@ -449,7 +460,8 @@ unsafe fn purchase_pc(ev: &EvRow, s5: *const u8, mcb: u32, nl: usize, open: u32)
 /// What the row loop keeps in registers or on its stack instead of reading through `Ctx`.
 struct Hot {
     ws: i64,
-    we: i64,
+    /// `we - ws`
+    span: u64,
     cbase: i64,
     ibase_s: i64,
     pshift: u32,
@@ -465,17 +477,20 @@ struct Hot {
     max_d: u64,
 }
 
-/// `Writers::push_ptr` for the aligned write-combining form of 16-byte records.
+/// `Writers::push_ptr` for the aligned write-combining form of 16-byte records
+/// (`heads`, `buf` from `Writers::raw`).
 #[inline(always)]
-unsafe fn push16<T: Copy>(w: &mut Writers<T>, heads: *mut (*mut T, *mut T), buf: *mut T, s: usize, v: T) -> *mut T {
+unsafe fn push16<T: Copy>(w: &mut Writers<T>, heads: *mut (*mut T, *mut T), buf: *mut T, s: usize, v: T) -> usize {
     unsafe {
-        let h = heads.add(s);
-        let p = (*h).0;
-        let n = (p as usize >> 4) & 3;
-        buf.add(s * 4 + n).write(v);
-        (*h).0 = p.add(1);
-        if n == 3 {
-            w.flush_line(s, p);
+        let so = s << 4;
+        let hp = ((&raw mut (*heads).0) as *mut u8).add(so) as *mut usize;
+        let p = *hp;
+        // which of the line's four records
+        let n = p & 0x30;
+        ((buf as *mut u8).add(so * 4 + n) as *mut T).write(v);
+        *hp = p + 16;
+        if n == 0x30 {
+            w.flush_line(s, p as *mut T);
         }
         p
     }
@@ -499,8 +514,8 @@ unsafe fn hop_row<const RAW: bool>(ev: &EvRow, hot: &mut Hot, p: *const u8, date
         let (v1, l1) = k::id_scan(a1);
         let t1 = a1.add(l1);
         bad |= term(t1, q1);
-        // both 1..=9 bytes (an empty or a long ID is not the usual shape)
-        bad |= (*LEN_BAD.get_unchecked(l0) | *LEN_BAD.get_unchecked(l1)) as u64;
+        // at most 9 bytes, and the event_id not empty
+        bad |= (*LEN_BAD.get_unchecked(l0) | *LEN_BAD0.get_unchecked(l1)) as u64;
         // ts: F1 / F2 have a '-' after the year, a 13-digit F3 a digit
         let s2 = t1.add(q1 + 1);
         let q2 = (*s2 == b'"') as usize;
@@ -512,10 +527,7 @@ unsafe fn hop_row<const RAW: bool>(ev: &EvRow, hot: &mut Hot, p: *const u8, date
             if k::ts_misfit(s2, (F1 + f2) * 2 + q2) {
                 return std::ptr::null();
             }
-            let t = civil(a2, dates);
-            if t == NONE {
-                return std::ptr::null();
-            }
+            let t = civil!(a2, dates);
             if f2 == 0 {
                 ts = t * 1000;
                 s3 = a2.add(21 + q2);
@@ -546,10 +558,7 @@ unsafe fn hop_row<const RAW: bool>(ev: &EvRow, hot: &mut Hot, p: *const u8, date
         if k::ts_misfit(s3, F1 * 2 + q3) {
             return std::ptr::null();
         }
-        let ing_s = civil(a3, dates);
-        if ing_s == NONE {
-            return std::ptr::null();
-        }
+        let ing_s = civil!(a3, dates);
         // event_type
         let s4 = a3.add(21 + q3);
         let q4 = (*s4 == b'"') as usize;
@@ -564,7 +573,7 @@ unsafe fn hop_row<const RAW: bool>(ev: &EvRow, hot: &mut Hot, p: *const u8, date
         let nl = mn.trailing_zeros() as usize;
         let below = mn ^ mn.wrapping_sub(1);
         let mcb = mc & below;
-        let d = (mc | mn) & below;
+        let d = mcb | (mn & mn.wrapping_neg());
         let mqb = mq & below;
         let open = mqb & ((d << 1) | 1);
         let close = mqb & (d >> 1);
@@ -577,7 +586,8 @@ unsafe fn hop_row<const RAW: bool>(ev: &EvRow, hot: &mut Hot, p: *const u8, date
             return std::ptr::null();
         }
         let ing = ing_s * 1000;
-        let mut ok = (ts >= hot.ws) & (ts < hot.we) & (ing.wrapping_sub(ts) <= DAY);
+        // (`ts` is not negative and the window is ordered: one compare for both ends)
+        let mut ok = ((ts.wrapping_sub(hot.ws) as u64) < hot.span) && ing.wrapping_sub(ts) <= DAY && l1 != 0;
         let mut pc = 0u32;
         if kt < 2 && ok {
             pc = purchase_pc(ev, s5, mcb, nl, open);
@@ -591,8 +601,8 @@ unsafe fn hop_row<const RAW: bool>(ev: &EvRow, hot: &mut Hot, p: *const u8, date
         if ok {
             let ps = ((id_hash(uid) >> 1) >> hot.pshift) as usize;
             let rec = PRec { k: uid, ts: (ts - hot.cbase) as u32, pc };
-            let prec = if RAW { push16(pw, hot.ph, hot.pb, ps, rec) } else { pw.push_ptr(ps, rec) };
-            idx = (prec as usize).wrapping_sub(hot.pbase) / std::mem::size_of::<PRec>();
+            let prec = if RAW { push16(pw, hot.ph, hot.pb, ps, rec) } else { pw.push_ptr(ps, rec) as usize };
+            idx = prec.wrapping_sub(hot.pbase) / std::mem::size_of::<PRec>();
             hot.max_idx = hot.max_idx.max(idx);
         }
         let rec = DRec { eid, ing: dd as u32, prec: idx as u32 };
@@ -625,20 +635,23 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
         let ctx = ev.ctx;
         let (ph, pb) = pw.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
         let (dh, db) = dw.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
-        let mut hot = Hot { ws: ctx.ws, we: ctx.we, cbase: ctx.cbase, ibase_s: ev.ibase_s, pshift: 63 - ctx.pbits, dshift: 63 - ctx.dbits, pbase: ctx.pregion.base, ph, pb, dh, db, max_idx: 0, max_d: 0 };
+        let mut hot = Hot { ws: ctx.ws, span: (ctx.we - ctx.ws) as u64, cbase: ctx.cbase, ibase_s: ev.ibase_s, pshift: 63 - ctx.pbits, dshift: 63 - ctx.dbits, pbase: ctx.pregion.base, ph, pb, dh, db, max_idx: 0, max_d: 0 };
         let end = base.add(len);
         // lines that start before `fast_end` have `GUARD` readable bytes
         let room = ev.lim as usize - base as usize;
         let fast_end = if room >= GUARD { base.add((room - GUARD + 1).min(len)) } else { base };
         let mut p = base;
         let mut slow = 0u64;
-        while p < end {
-            if p < fast_end {
+        loop {
+            while p < fast_end {
                 let nx = hop_row::<RAW>(ev, &mut hot, p, dates, pw, dw);
-                if !nx.is_null() {
-                    p = nx;
-                    continue;
+                if nx.is_null() {
+                    break;
                 }
+                p = nx;
+            }
+            if p >= end {
+                break;
             }
             slow += 1;
             p = slow_row(ev, p, end, cache, pw, dw, escape);
