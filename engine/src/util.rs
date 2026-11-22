@@ -357,7 +357,7 @@ impl<T: Copy> Writers<T> {
     /// of 32-byte records), else 0.
     const LINE: usize = {
         let size = std::mem::size_of::<T>();
-        if size >= 8 && size <= 32 && size.is_power_of_two() && std::mem::align_of::<T>() <= 16 { if size == 32 { 4 } else { 64 / size } } else { 0 }
+        if size >= 8 && size <= 32 && size.is_power_of_two() && std::mem::align_of::<T>() <= 16 { 128 / size } else { 0 }
     };
 
     pub fn new(parts: usize, block_len: usize) -> Self {

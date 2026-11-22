@@ -630,13 +630,13 @@ unsafe fn push16<T: Copy>(heads: *mut (*mut T, *mut T), buf: *mut T, s: usize, v
         let so = s << 4;
         let h = (heads as *mut u8).add(so) as *mut (*mut T, *mut T);
         let p = (*h).0 as usize;
-        // which of the line's four records
-        let n = p & 0x30;
-        let line = (buf as *mut u8).add(so * 4);
+        // which of the buffer's eight records
+        let n = p & 0x70;
+        let line = (buf as *mut u8).add(so * 8);
         (line.add(n) as *mut T).write(v);
         (*h).0 = (p + 16) as *mut T;
-        if n == 0x30 {
-            wc_copy((p - 0x30) as *mut u8, line, 64);
+        if n == 0x70 {
+            wc_copy((p - 0x70) as *mut u8, line, 128);
             if (*h).1 as usize == p + 16 {
                 *full = REFILL;
             }
