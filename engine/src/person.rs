@@ -496,28 +496,53 @@ impl Scratch {
     /// A slot is 4 bytes: 8 bits of the hash and `index + 1` (0 = empty); the key itself is
     /// compared in `keys`. The whole table of a partition then is a few dozen KB and stays in
     /// the core's cache while the records stream past it.
+    ///
+    /// Probed in aligned buckets of four slots, starting at the bucket `h` selects; a key goes
+    /// to the first empty slot of the first bucket that has one (`free_slot`), and nothing is
+    /// ever removed, so a bucket with an empty slot ends the search. All four slots are tested
+    /// without branching: whether a key sits in its home slot or the next one is a coin toss.
     #[inline(always)]
     fn get_or_insert(&mut self, k: Id) -> u32 {
         let h = id_hash(k);
         // bits 32..40 of the hash: not the partition's (top) nor the slot's (low) bits
-        let tag = (h >> 8) as u32 & self.tagmask;
-        let mut i = h as usize & self.mask;
+        let tm = self.tagmask;
+        let tag = (h >> 8) as u32 & tm;
+        let mut b = h as usize & self.mask & !3;
         unsafe {
             loop {
-                let s = *self.slots.get_unchecked(i);
-                if s == 0 {
-                    break;
+                let p = self.slots.as_ptr().add(b);
+                let s = (p as *const [u32; 4]).read_unaligned();
+                // candidates: used slots with the tag (every used slot when `tm` is 0)
+                let (mut m, mut e) = (0u32, 0u32);
+                for j in 0..4 {
+                    m |= (((s[j] != 0) & ((s[j] ^ tag) & tm == 0)) as u32) << j;
+                    e |= ((s[j] == 0) as u32) << j;
                 }
-                if (s ^ tag) & self.tagmask == 0 {
-                    let idx = (s & !self.tagmask) - 1;
+                while m != 0 {
+                    let idx = (*p.add(m.trailing_zeros() as usize) & !tm) - 1;
                     if *self.keys.get_unchecked(idx as usize) == k {
                         return idx;
                     }
+                    m &= m - 1;
                 }
-                i = (i + 1) & self.mask;
+                if e != 0 {
+                    return self.insert_at(b + e.trailing_zeros() as usize, k);
+                }
+                b = (b + 4) & self.mask;
             }
         }
-        self.insert_at(i, k)
+    }
+    /// The slot a new key of hash `h` goes to (see `get_or_insert`).
+    fn free_slot(&self, h: u64) -> usize {
+        let mut b = h as usize & self.mask & !3;
+        loop {
+            for j in 0..4 {
+                if self.slots[b + j] == 0 {
+                    return b + j;
+                }
+            }
+            b = (b + 4) & self.mask;
+        }
     }
     #[inline(never)]
     fn insert_at(&mut self, mut i: usize, k: Id) -> u32 {
@@ -526,10 +551,7 @@ impl Scratch {
             // more keys than fit beside the tag: go on without tags
             self.tagmask = 0;
             self.rehash(self.slots.len());
-            i = id_hash(k) as usize & self.mask;
-            while self.slots[i] != 0 {
-                i = (i + 1) & self.mask;
-            }
+            i = self.free_slot(id_hash(k));
         }
         self.slots[i] = ((id_hash(k) >> 8) as u32 & self.tagmask) | (idx + 1);
         self.keys.push(k);
@@ -546,12 +568,9 @@ impl Scratch {
         self.slots.clear();
         self.slots.resize(cap, 0);
         self.mask = cap - 1;
-        for (idx, &k) in self.keys.iter().enumerate() {
-            let h = id_hash(k);
-            let mut i = h as usize & self.mask;
-            while self.slots[i] != 0 {
-                i = (i + 1) & self.mask;
-            }
+        for idx in 0..self.keys.len() {
+            let h = id_hash(self.keys[idx]);
+            let i = self.free_slot(h);
             self.slots[i] = ((h >> 8) as u32 & self.tagmask) | (idx as u32 + 1);
             self.kslot[idx] = i as u32;
         }
