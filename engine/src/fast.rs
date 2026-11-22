@@ -327,6 +327,83 @@ fn intern_ahead(keys: &[(*const u8, u32, u64)], ids: &mut Vec<Id>) {
     }
 }
 
+/// The index in `list` of the key `k` (hash `h`), appended if new. `table`: slots of 1 + an
+/// index into `list`, or 0, a power of two in size (64 to start); doubled when half full, every
+/// key placed again by `hash` (the hash the callers give). Keys compare exactly (`DKey`).
+#[inline(always)]
+fn distinct<K: DKey>(table: &mut Vec<u32>, list: &mut Vec<K>, k: K, h: u64, hash: impl Fn(&K) -> u64) -> u32 {
+    let mask = table.len() - 1;
+    let mut i = (h >> 20) as usize & mask;
+    loop {
+        let t = unsafe { *table.get_unchecked(i) };
+        if t == 0 {
+            break;
+        }
+        if unsafe { list.get_unchecked(t as usize - 1) }.same(&k) {
+            return t - 1;
+        }
+        i = (i + 1) & mask;
+    }
+    list.push(k);
+    unsafe { *table.get_unchecked_mut(i) = list.len() as u32 };
+    if list.len() * 2 > table.len() {
+        let cap = table.len() * 2;
+        table.clear();
+        table.resize(cap, 0);
+        for (n, e) in list.iter().enumerate() {
+            let mut i = (hash(e) >> 20) as usize & (cap - 1);
+            while table[i] != 0 {
+                i = (i + 1) & (cap - 1);
+            }
+            table[i] = n as u32 + 1;
+        }
+    }
+    list.len() as u32 - 1
+}
+
+/// Exact equality of two keys of `distinct`.
+trait DKey {
+    fn same(&self, o: &Self) -> bool;
+}
+/// (hi, lo, first byte): the hexadecimal kind.
+impl DKey for (u64, u64, u32) {
+    #[inline(always)]
+    fn same(&self, o: &Self) -> bool {
+        (self.0 == o.0) & (self.1 == o.1) & (self.2 == o.2)
+    }
+}
+/// (bytes, length, hash): equal when the hashes, the lengths and the bytes are.
+impl DKey for (*const u8, u32, u64) {
+    #[inline(always)]
+    fn same(&self, o: &Self) -> bool {
+        self.2 == o.2 && self.1 == o.1 && unsafe { std::slice::from_raw_parts(self.0, self.1 as usize) == std::slice::from_raw_parts(o.0, o.1 as usize) }
+    }
+}
+
+// Thread-summed time of the sections of dedup and `resolve_long`, printed with SE_TIMING.
+const P_DCOPY: usize = 0;
+const P_DPROBE: usize = 1;
+const P_LHEX: usize = 2;
+const P_LGEN: usize = 3;
+const P_R1: usize = 4;
+const P_RI: usize = 5;
+const P_R2: usize = 6;
+static PROF: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+const PROF_NAMES: [&str; 7] = ["D copy", "D probe", "L hex", "L general", "R distinct", "R intern", "R records"];
+#[inline]
+fn prof_add(i: usize, t0: std::time::Instant) -> std::time::Instant {
+    let t = std::time::Instant::now();
+    PROF[i].fetch_add((t - t0).as_nanos() as u64, Relaxed);
+    t
+}
+fn prof_print(tm: &Timer, which: std::ops::Range<usize>) {
+    if tm.on {
+        for i in which {
+            eprintln!("[prof] {:<16} {:>9.1} ms (summed over threads)", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e6);
+        }
+    }
+}
+
 /// Turns the records with long user IDs into the records the parse would have written had it
 /// interned every user_id itself: the surviving `URec`s / `UHRec`s into `PRec`s, the `UCRec`s /
 /// `UCHRec`s into `CRec`s, in the partitions of their interned user IDs. Events and clicks of
@@ -349,48 +426,37 @@ pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<U
         let mut cw: Writers<CRec> = Writers::with_wc(if any_cl { 1 << ctx.pbits } else { 1 }, 128, wc);
         // slots: 1 + the index in `seen` / `hseen` of a distinct ID of the partition, or 0
         let mut table: Vec<u32> = Vec::new();
-        // (bytes, length, hash, Id)
-        let mut seen: Vec<(*const u8, u32, u64, Id)> = Vec::new();
-        // (hi, lo, first byte, Id)
-        let mut hseen: Vec<(u64, u64, u32, Id)> = Vec::new();
+        // (bytes, length, hash)
+        let mut seen: Vec<(*const u8, u32, u64)> = Vec::new();
+        // (hi, lo, first byte)
+        let mut hseen: Vec<(u64, u64, u32)> = Vec::new();
         // for `intern_ahead`: the bytes of each of `hseen`, the strings, their Ids
         let mut hbytes: Vec<[u8; 33]> = Vec::new();
         let mut keys: Vec<(*const u8, u32, u64)> = Vec::new();
         let mut ids: Vec<Id> = Vec::new();
+        // per record of the first step, in order: the index of its ID in `seen` / `hseen`
+        let mut idx: Vec<u32> = Vec::new();
         while let Some(&(_, p)) = order.get(next.fetch_add(1, Relaxed)) {
-            // the hexadecimal kind: keys compared as words
+            // Each kind in three steps: the distinct IDs of the partition's records (a table
+            // sized by them, not by the records, so that it stays in cache), noting each
+            // record's; the distinct IDs interned in order with the interner's table word and
+            // record prefetched a few IDs ahead (most are lookups of IDs the link build
+            // interned, two cache misses each); the records again, with their Ids.
+            // The hexadecimal kind: keys compared as words.
             let n: usize = uhparts.iter().map(|u| u.count(p)).sum::<usize>() + ucparts.iter().map(|u| u.1.count(p)).sum::<usize>();
             if n > 0 {
-                let cap = (n * 2).next_power_of_two();
+                let t0 = std::time::Instant::now();
                 table.clear();
-                table.resize(cap, 0);
+                table.resize(64, 0);
                 hseen.clear();
-                let mask = cap - 1;
-                // Two passes: the distinct IDs first, then the records with their Ids. In
-                // between, the distinct IDs are interned in order with the interner's table
-                // word and record prefetched a few IDs ahead (most are lookups of IDs the link
-                // build interned, two cache misses each).
-                let mut find = |hi: u64, lo: u64, pre: u32| -> Id {
-                    let mut i = (hex_hash(hi, lo, pre) >> 20) as usize & mask;
-                    loop {
-                        let t = unsafe { *table.get_unchecked(i) };
-                        if t == 0 {
-                            hseen.push((hi, lo, pre, 0));
-                            unsafe { *table.get_unchecked_mut(i) = hseen.len() as u32 };
-                            return 0;
-                        }
-                        let e = unsafe { hseen.get_unchecked(t as usize - 1) };
-                        if (e.0 == hi) & (e.1 == lo) & (e.2 == pre) {
-                            return e.3;
-                        }
-                        i = (i + 1) & mask;
-                    }
-                };
+                idx.clear();
+                let hh = |e: &(u64, u64, u32)| hex_hash(e.0, e.1, e.2);
                 for u in uhparts {
                     for sl in u.slices(p) {
                         for r in sl.iter() {
                             if r.ts != DEAD {
-                                find(r.hi, r.lo, r.pre);
+                                let k = (r.hi, r.lo, r.pre);
+                                idx.push(distinct(&mut table, &mut hseen, k, hh(&k), hh));
                             }
                         }
                     }
@@ -398,36 +464,24 @@ pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<U
                 for u in ucparts {
                     for sl in u.1.slices(p) {
                         for r in sl.iter() {
-                            find(r.hi, r.lo, r.cp >> 24);
+                            let k = (r.hi, r.lo, r.cp >> 24);
+                            idx.push(distinct(&mut table, &mut hseen, k, hh(&k), hh));
                         }
                     }
                 }
+                let t1 = prof_add(P_R1, t0);
                 hbytes.clear();
                 hbytes.extend(hseen.iter().map(|e| UHRec { hi: e.0, ts: 0, pc: 0, lo: e.1, pre: e.2, pad: 0 }.id()));
                 keys.clear();
                 keys.extend(hbytes.iter().map(|b| (b.as_ptr(), 33, intern_hash(b))));
                 intern_ahead(&keys, &mut ids);
-                for (e, &id) in hseen.iter_mut().zip(ids.iter()) {
-                    e.3 = id;
-                }
-                // (every ID is in the table now: the same records went through the first pass)
-                let find = |hi: u64, lo: u64, pre: u32| -> Id {
-                    let mut i = (hex_hash(hi, lo, pre) >> 20) as usize & mask;
-                    loop {
-                        let t = unsafe { *table.get_unchecked(i) };
-                        assert!(t != 0);
-                        let e = unsafe { hseen.get_unchecked(t as usize - 1) };
-                        if (e.0 == hi) & (e.1 == lo) & (e.2 == pre) {
-                            return e.3;
-                        }
-                        i = (i + 1) & mask;
-                    }
-                };
+                let t2 = prof_add(P_RI, t1);
+                let mut j = idx.iter();
                 for u in uhparts {
                     for sl in u.slices(p) {
                         for r in sl.iter() {
                             if r.ts != DEAD {
-                                let id = find(r.hi, r.lo, r.pre);
+                                let id = ids[*j.next().unwrap() as usize];
                                 pw.push(part_of(id_hash(id), ctx.pbits), PRec { k: id, ts: r.ts, pc: r.pc });
                             }
                         }
@@ -436,42 +490,28 @@ pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<U
                 for u in ucparts {
                     for sl in u.1.slices(p) {
                         for r in sl.iter() {
-                            let id = find(r.hi, r.lo, r.cp >> 24);
+                            let id = ids[*j.next().unwrap() as usize];
                             cw.push(part_of(id_hash(id), ctx.pbits), CRec { k: id, ts: r.ts, camp: r.cp & 0xFF_FFFF, ptr: r.ptr });
                         }
                     }
                 }
+                prof_add(P_R2, t2);
             }
-            // every other long ID: compared by bytes
+            // Every other long ID: compared by bytes (the same three steps).
             let n: usize = uparts.iter().map(|u| u.count(p)).sum::<usize>() + ucparts.iter().map(|u| u.0.count(p)).sum::<usize>();
             if n > 0 {
-                let cap = (n * 2).next_power_of_two();
+                let t0 = std::time::Instant::now();
                 table.clear();
-                table.resize(cap, 0);
+                table.resize(64, 0);
                 seen.clear();
-                let mask = cap - 1;
-                // (the same three steps as the hexadecimal kind)
-                let mut find = |h: u64, b: &[u8]| {
-                    let mut i = (h >> 20) as usize & mask;
-                    loop {
-                        let t = unsafe { *table.get_unchecked(i) };
-                        if t == 0 {
-                            seen.push((b.as_ptr(), b.len() as u32, h, 0));
-                            unsafe { *table.get_unchecked_mut(i) = seen.len() as u32 };
-                            return;
-                        }
-                        let e = unsafe { seen.get_unchecked(t as usize - 1) };
-                        if e.2 == h && e.1 as usize == b.len() && unsafe { std::slice::from_raw_parts(e.0, e.1 as usize) } == b {
-                            return;
-                        }
-                        i = (i + 1) & mask;
-                    }
-                };
+                idx.clear();
+                let sh = |e: &(*const u8, u32, u64)| e.2;
                 for u in uparts {
                     for sl in u.slices(p) {
                         for r in sl.iter() {
                             if r.ts != DEAD {
-                                find(r.h, unsafe { r.id() });
+                                let b = unsafe { r.id() };
+                                idx.push(distinct(&mut table, &mut seen, (b.as_ptr(), b.len() as u32, r.h), r.h, sh));
                             }
                         }
                     }
@@ -479,33 +519,22 @@ pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<U
                 for u in ucparts {
                     for sl in u.0.slices(p) {
                         for r in sl.iter() {
-                            find(r.h, unsafe { r.id() });
+                            let b = unsafe { r.id() };
+                            idx.push(distinct(&mut table, &mut seen, (b.as_ptr(), b.len() as u32, r.h), r.h, sh));
                         }
                     }
                 }
+                let t1 = prof_add(P_R1, t0);
                 keys.clear();
                 keys.extend(seen.iter().map(|e| (e.0, e.1, intern_hash(unsafe { std::slice::from_raw_parts(e.0, e.1 as usize) }))));
                 intern_ahead(&keys, &mut ids);
-                for (e, &id) in seen.iter_mut().zip(ids.iter()) {
-                    e.3 = id;
-                }
-                let find = |h: u64, b: &[u8]| -> Id {
-                    let mut i = (h >> 20) as usize & mask;
-                    loop {
-                        let t = unsafe { *table.get_unchecked(i) };
-                        assert!(t != 0);
-                        let e = unsafe { seen.get_unchecked(t as usize - 1) };
-                        if e.2 == h && e.1 as usize == b.len() && unsafe { std::slice::from_raw_parts(e.0, e.1 as usize) } == b {
-                            return e.3;
-                        }
-                        i = (i + 1) & mask;
-                    }
-                };
+                let t2 = prof_add(P_RI, t1);
+                let mut j = idx.iter();
                 for u in uparts {
                     for sl in u.slices(p) {
                         for r in sl.iter() {
                             if r.ts != DEAD {
-                                let id = find(r.h, unsafe { r.id() });
+                                let id = ids[*j.next().unwrap() as usize];
                                 pw.push(part_of(id_hash(id), ctx.pbits), PRec { k: id, ts: r.ts, pc: r.pc });
                             }
                         }
@@ -514,11 +543,12 @@ pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<U
                 for u in ucparts {
                     for sl in u.0.slices(p) {
                         for r in sl.iter() {
-                            let id = find(r.h, unsafe { r.id() });
+                            let id = ids[*j.next().unwrap() as usize];
                             cw.push(part_of(id_hash(id), ctx.pbits), CRec { k: id, ts: r.ts, camp: r.camp, ptr: r.ptr });
                         }
                     }
                 }
+                prof_add(P_R2, t2);
             }
         }
         (pw.finish(), cw.finish())
@@ -1539,6 +1569,7 @@ fn run_rest(
             if n < 2 {
                 continue;
             }
+            let t0 = std::time::Instant::now();
             // The partition's records are first copied into sub-buckets by further hash bits,
             // each small enough that it and its table (slots: 1 + index in the bucket) stay
             // in the second-level cache; the copies have all that is needed.
@@ -1563,6 +1594,7 @@ fn run_rest(
                     }
                 }
             }
+            let t1 = prof_add(P_DCOPY, t0);
             for a in subs[..1usize << sb].iter() {
                 if a.len() < 2 {
                     continue;
@@ -1594,6 +1626,7 @@ fn run_rest(
                     }
                 }
             }
+            prof_add(P_DPROBE, t1);
         }
         // The same for the event IDs that are not packed (`LRec`): equal when the hashes,
         // the lengths and the bytes are equal.
@@ -1602,6 +1635,7 @@ fn run_rest(
             if p >= 1usize << ctx.lbits {
                 break;
             }
+            let t0 = std::time::Instant::now();
             // the hexadecimal kind first: equal when the two words and the first byte are
             {
                 let n: usize = lparts_ref.iter().map(|d| d.1.count(p)).sum();
@@ -1643,6 +1677,7 @@ fn run_rest(
                     }
                 }
             }
+            let t0 = prof_add(P_LHEX, t0);
             let n: usize = lparts_ref.iter().map(|d| d.0.count(p)).sum();
             if n < 2 {
                 continue;
@@ -1682,13 +1717,16 @@ fn run_rest(
                     }
                 }
             }
+            prof_add(P_LGEN, t0);
         }
     });
     tm.lap("dedup");
+    prof_print(tm, P_DCOPY..P_R1);
     let (lev, lcl) = resolve_long(&ctx, &uparts, &uhparts, &ucparts, nthreads, wc);
     ev.extend(lev);
     cl.extend(lcl);
     tm.lap("long user IDs");
+    prof_print(tm, P_R1..PROF.len());
     let Some(links) = lh.join().unwrap() else { return false };
     let _ = ctx.links.set(links);
     tm.lap("links (join)");
