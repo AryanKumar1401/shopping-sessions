@@ -27,7 +27,7 @@ use crate::util::*;
 /// Bytes that must be readable from a line's start for the speculative walk: it never reads
 /// further than this, whatever the bytes are (2 x (1 + 16 + 2) for the IDs, 28 + 23 for the
 /// timestamps, 11 for the type, 32 for the tail = 132, and the 32-byte loads behind each).
-pub const GUARD: usize = 192;
+pub const GUARD: usize = 320;
 
 /// What must follow an ID's bytes: `,` (index 0) or `",` (index 1), as a little-endian
 /// 16-bit word and the mask of the bytes that count.
@@ -230,6 +230,21 @@ mod k {
         }
     }
 
+    /// How many of the bytes at `a` come before the first byte outside `0x30..=0x7F`:
+    /// 0..=64, or 65 when there are more (64 bytes are read).
+    #[inline(always)]
+    pub unsafe fn id_len(a: *const u8) -> usize {
+        unsafe {
+            let lo = _mm256_set1_epi8(0x30);
+            let m = _mm256_movemask_epi8(_mm256_cmpgt_epi8(lo, _mm256_loadu_si256(a as *const __m256i))) as u32;
+            if m != 0 {
+                return m.trailing_zeros() as usize;
+            }
+            let m = _mm256_movemask_epi8(_mm256_cmpgt_epi8(lo, _mm256_loadu_si256(a.add(32) as *const __m256i))) as u32;
+            if m != 0 { 32 + m.trailing_zeros() as usize } else { 65 }
+        }
+    }
+
     /// `pack_id16` of two IDs of 0..=9 bytes, all in `0x30..=0x7F` (see `pack2_id16`);
     /// lengths up to 16 are allowed and give a meaningless value.
     #[inline(always)]
@@ -338,6 +353,17 @@ mod k {
                 l += 1;
             }
             (a, l)
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn id_len(a: *const u8) -> usize {
+        unsafe {
+            let mut l = 0;
+            while l < 65 && (0x30..=0x7F).contains(&*a.add(l)) {
+                l += 1;
+            }
+            l
         }
     }
 
@@ -549,6 +575,9 @@ const BAIL: usize = 0;
 const DATE_MISS: usize = 1;
 /// the line is a purchase inside the window, to be finished by `purchase_finish`.
 const PURCHASE: usize = 2;
+/// nothing was done, the line has an ID of 10 bytes or more (or is not of the usual shape):
+/// `long_row`.
+const LONGROW: usize = 3;
 const CODES: isize = 4;
 /// Added to the next line's start: a block the row wrote to is full (`Writers::refill_full`
 /// for `Hot::ps` and `Hot::ds`).
@@ -578,36 +607,20 @@ unsafe fn push16<T: Copy>(heads: *mut (*mut T, *mut T), buf: *mut T, s: usize, v
     }
 }
 
-/// One line at `p` (with `GUARD` readable bytes): handles it and returns the start of the next
-/// line (plus `REFILL`), or one of the codes above. No calls in here: the loop around it
-/// keeps its constants in registers.
-#[inline(always)]
-unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>) -> usize {
-    unsafe {
-        // event_id
-        let q0 = (*p == b'"') as usize;
-        let a0 = p.add(q0);
-        let (v0, l0) = k::id_scan(a0);
-        let t0 = a0.add(l0);
-        let mut bad = term(t0, q0);
-        // user_id
-        let s1 = t0.add(q0 + 1);
-        let q1 = (*s1 == b'"') as usize;
-        let a1 = s1.add(q1);
-        let (v1, l1) = k::id_scan(a1);
-        let t1 = a1.add(l1);
-        bad |= term(t1, q1);
-        // at most 9 bytes, and the event_id not empty (an empty user_id packs to 0)
-        bad |= (*LEN_BAD.get_unchecked(l0) | *LEN_BAD0.get_unchecked(l1)) as u64;
-        let ids = k::pack2(v0, l0, v1, l1);
+/// The fields of an event line after the two IDs, from `$s2` (the first byte of `ts`):
+/// evaluates to (ts in ms, ingest_ts in s, the type's template index, the tail's start, its
+/// comma mask, its opening quotes, the newline's offset, a word that is nonzero when the tail
+/// is not of the usual shape), or leaves the row function with `BAIL` or `DATE_MISS`.
+macro_rules! row_rest {
+    ($s2:expr, $dates:expr, $hot:expr) => {{
         // ts: F1 / F2 have a '-' after the year, a 13-digit F3 a digit
-        let s2 = t1.add(q1 + 1);
+        let s2: *const u8 = $s2;
         let q2 = (*s2 == b'"') as usize;
         let a2 = s2.add(q2);
         let (ts, s3);
         if *a2.add(4) == b'-' {
             if !k::ts_misfit(s2, F1 * 2 + q2) {
-                ts = civil!(a2, dates, hot) * 1000;
+                ts = civil!(a2, $dates, $hot) * 1000;
                 s3 = a2.add(21 + q2);
             } else {
                 // "+HH:MM" / "-HH:MM" (the template lets a comma pass for the sign)
@@ -615,7 +628,7 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
                 if k::ts_misfit(s2, F2 * 2 + q2) | (z == b',') {
                     return BAIL;
                 }
-                let t = civil!(a2, dates, hot);
+                let t = civil!(a2, $dates, $hot);
                 let o = rd64(a2.add(19));
                 let v = ((o >> 8) ^ 0x30_303A_3030) & 0xFF_FFFF_FFFF;
                 let x = v.wrapping_mul(2561);
@@ -641,7 +654,7 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
         if k::ts_misfit(s3, F1 * 2 + q3) {
             return BAIL;
         }
-        let ing_s = civil!(a3, dates, hot);
+        let ing_s = civil!(a3, $dates, $hot);
         // event_type
         let s4 = a3.add(21 + q3);
         let q4 = (*s4 == b'"') as usize;
@@ -664,6 +677,37 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
         // no newline; no comma or several (`d` is then just the newline, or holds a comma
         // above the lowest one); quotes; an empty product (`,` first, or `""` first)
         let tb = (nl as u32 >> 5) | (mcb.wrapping_sub(1) & d) | (opened ^ (close << 1)) | (open & close) | (mqb ^ (open | close)) | ((mcb | ((mcb >> 2) & open)) & 1);
+        (ts, ing_s, kt, s5, mcb, open, nl, tb)
+    }};
+}
+
+/// One line at `p` (with `GUARD` readable bytes): handles it and returns the start of the next
+/// line (plus `REFILL`), or one of the codes above. No calls in here: the loop around it
+/// keeps its constants in registers.
+#[inline(always)]
+unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>) -> usize {
+    unsafe {
+        // event_id
+        let q0 = (*p == b'"') as usize;
+        let a0 = p.add(q0);
+        let (v0, l0) = k::id_scan(a0);
+        let t0 = a0.add(l0);
+        let mut bad = term(t0, q0);
+        // user_id
+        let s1 = t0.add(q0 + 1);
+        let q1 = (*s1 == b'"') as usize;
+        let a1 = s1.add(q1);
+        let (v1, l1) = k::id_scan(a1);
+        // an ID of 10 bytes or more: `long_row`
+        if (l0 > 9) | (l1 > 9) {
+            return LONGROW;
+        }
+        let t1 = a1.add(l1);
+        bad |= term(t1, q1);
+        // the event_id not empty (an empty user_id packs to 0)
+        bad |= (*LEN_BAD.get_unchecked(l0) | *LEN_BAD0.get_unchecked(l1)) as u64;
+        let ids = k::pack2(v0, l0, v1, l1);
+        let (ts, ing_s, kt, s5, mcb, open, nl, tb) = row_rest!(t1.add(q1 + 1), dates, hot);
         bad |= tb as u64;
         if bad != 0 {
             return BAIL;
@@ -714,6 +758,49 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
     }
 }
 
+/// `hop_row` for a line whose event_id or user_id is long: the same walk with ID fields of up
+/// to 64 bytes (all in `0x30..=0x7F`), out of line. A user_id of 10 bytes or more is
+/// interned, as `pack_id` does; an event_id of 10 bytes or more gets an `LRec`
+/// (`push_dedup`). Returns the next line's start, `BAIL` or `DATE_MISS`.
+#[inline(never)]
+unsafe fn long_row(ev: &EvRow, hot: &mut Hot, p: *const u8, dates: &HopDates, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, escape: &mut bool) -> usize {
+    unsafe {
+        let q0 = (*p == b'"') as usize;
+        let a0 = p.add(q0);
+        let l0 = k::id_len(a0);
+        if l0.wrapping_sub(1) > 63 {
+            return BAIL;
+        }
+        let t0 = a0.add(l0);
+        let mut bad = term(t0, q0);
+        let s1 = t0.add(q0 + 1);
+        let q1 = (*s1 == b'"') as usize;
+        let a1 = s1.add(q1);
+        let l1 = k::id_len(a1);
+        if l1 > 64 {
+            return BAIL;
+        }
+        let t1 = a1.add(l1);
+        bad |= term(t1, q1);
+        let (ts, ing_s, kt, s5, mcb, open, nl, tb) = row_rest!(t1.add(q1 + 1), dates, hot);
+        if bad | tb as u64 != 0 {
+            return BAIL;
+        }
+        let dd = (ing_s - hot.ibase_s) as u64;
+        hot.max_d |= dd;
+        let mut prec = NOPREC;
+        if ((ts.wrapping_sub(hot.ws) as u64) < hot.span) && (ing_s * 1000).wrapping_sub(ts) <= DAY && l1 != 0 {
+            let pc = if kt < 2 { purchase_pc(ev, s5, mcb, nl, open) } else { 0 };
+            if kt >= 2 || pc != 0 {
+                let uid = if l1 <= 9 { pack_id16(a1, l1) } else { intern_long(std::slice::from_raw_parts(a1, l1)) };
+                prec = push_prec(ev.ctx, pw, escape, uid, (ts - hot.cbase) as u32, pc);
+            }
+        }
+        push_dedup(ev.ctx, dw, lw, a0, l0, ev.lim, ev.fix, dd as u32, prec);
+        s5 as usize + nl + 1
+    }
+}
+
 /// The rest of a row that left `hop_row` with `PURCHASE`; returns the next line's start.
 #[cold]
 #[inline(never)]
@@ -737,7 +824,7 @@ unsafe fn purchase_finish(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw:
 /// One pass that finds the newline and splits as `split_row` does: a field has no quote, or
 /// exactly two, as its first and last byte.
 #[inline(never)]
-unsafe fn slow_row_bytes(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) -> *const u8 {
+unsafe fn slow_row_bytes(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, escape: &mut bool) -> *const u8 {
     unsafe {
         let mut f: [Field; 7] = [(p, 0); 7];
         let (mut k, mut well, mut st, mut nq, mut i) = (0usize, true, p, 0usize, p);
@@ -766,7 +853,7 @@ unsafe fn slow_row_bytes(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut D
             i = i.add(1);
         }
         if well && k == 7 {
-            event_general(ev.ctx, &f, ev.lim, cache, pw, dw, escape);
+            event_general(ev.ctx, &f, ev.lim, ev.fix, cache, pw, dw, lw, escape);
         }
         i.add(1)
     }
@@ -776,13 +863,13 @@ unsafe fn slow_row_bytes(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut D
 /// comes within 32 bytes of the end of the readable bytes is handed to `slow_row_bytes`.
 #[cold]
 #[inline(never)]
-unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) -> *const u8 {
+unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, escape: &mut bool) -> *const u8 {
     unsafe {
         let mut f: [Field; 7] = [(p, 0); 7];
         let (mut k, mut well, mut st, mut nq, mut b) = (0usize, true, p, 0u32, p);
         loop {
             if (ev.lim as usize - b as usize) < 32 {
-                return slow_row_bytes(ev, p, end, cache, pw, dw, escape);
+                return slow_row_bytes(ev, p, end, cache, pw, dw, lw, escape);
             }
             let (mc, mn, mq) = k::tail_masks(b);
             let mut dm = mc | mn;
@@ -805,7 +892,7 @@ unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCac
                 k += 1;
                 if (mn >> i) & 1 != 0 {
                     if well && k == 7 {
-                        event_general(ev.ctx, &f, ev.lim, cache, pw, dw, escape);
+                        event_general(ev.ctx, &f, ev.lim, ev.fix, cache, pw, dw, lw, escape);
                     }
                     return e.add(1);
                 }
@@ -821,7 +908,7 @@ unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCac
 }
 
 #[inline(always)]
-unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) -> u64 {
+unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, escape: &mut bool) -> u64 {
     unsafe {
         let ctx = ev.ctx;
         let (ph, pb) = pw.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
@@ -872,6 +959,14 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
                 p = purchase_finish(ev, &mut hot, pw, dw);
                 continue;
             }
+            if code == LONGROW {
+                let r = long_row(ev, &mut hot, p, dates, pw, dw, lw, escape);
+                if (r as isize) >= CODES {
+                    p = r as *const u8;
+                    continue;
+                }
+                code = r;
+            }
             if code == DATE_MISS {
                 // A line misses at most twice (its two dates) before it passes; one whose
                 // dates share a memo slot would evict each other for ever, so it gets the
@@ -889,7 +984,7 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
                 break;
             }
             slow += 1;
-            p = slow_row(ev, p, end, cache, pw, dw, escape);
+            p = slow_row(ev, p, end, cache, pw, dw, lw, escape);
         }
         // (a `PRec` index of NOPREC or more: as in `emit_event`)
         *escape |= (hot.max_idx >= NOPREC as usize) | (hot.max_d > u32::MAX as u64);
@@ -900,12 +995,12 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
 /// All event lines of `base[..len]` (whole lines; the last may lack its `\n` only when it
 /// ends at `ev.lim`). Returns how many lines took the general path.
 #[inline(always)]
-pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) -> u64 {
+pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, escape: &mut bool) -> u64 {
     unsafe {
         if pw.raw().is_some() && dw.raw().is_some() && std::mem::size_of::<PRec>() == 16 && std::mem::size_of::<DRec>() == 16 {
-            hop_loop::<true>(ev, base, len, dates, cache, pw, dw, escape)
+            hop_loop::<true>(ev, base, len, dates, cache, pw, dw, lw, escape)
         } else {
-            hop_loop::<false>(ev, base, len, dates, cache, pw, dw, escape)
+            hop_loop::<false>(ev, base, len, dates, cache, pw, dw, lw, escape)
         }
     }
 }
