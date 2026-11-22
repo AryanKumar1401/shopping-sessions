@@ -106,6 +106,8 @@ pub fn map_file(path: &std::path::Path) -> std::io::Result<&'static [u8]> {
         }
         use std::os::fd::IntoRawFd;
         FDS.lock().unwrap().push((p as usize, f.into_raw_fd()));
+        #[cfg(target_os = "linux")]
+        MAPS.lock().unwrap().push((p as usize, (len + 4095) & !4095));
         Ok(std::slice::from_raw_parts(p as *const u8, len))
     }
 }
@@ -123,6 +125,10 @@ pub fn populate_read(_p: *const u8, _len: usize) {
         }
     }
 }
+
+/// The file mappings (address, length rounded up to pages), for `release_all`.
+#[cfg(target_os = "linux")]
+static MAPS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Big anonymous slabs handed out by `os_alloc`, for `release_all`.
 #[cfg(target_os = "linux")]
@@ -148,7 +154,18 @@ pub fn drop_range(_p: *const u8, _len: usize) {
 pub fn release_all(_nthreads: usize) {
     #[cfg(target_os = "linux")]
     {
-        let slabs = std::mem::take(&mut *SLABS.lock().unwrap());
+        let mut slabs = std::mem::take(&mut *SLABS.lock().unwrap());
+        // The file mappings too (SE_UNMAP=0: leave them to exit), in pieces for the threads.
+        if env_on("SE_UNMAP") {
+            for &(p, len) in MAPS.lock().unwrap().iter() {
+                let mut o = 0;
+                while o < len {
+                    let n = (len - o).min(4 * SLAB);
+                    slabs.push((p + o, n));
+                    o += n;
+                }
+            }
+        }
         let next = std::sync::atomic::AtomicUsize::new(0);
         par(vec![(); _nthreads.max(1)], |_, _| {
             loop {

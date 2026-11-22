@@ -88,7 +88,8 @@ pub struct Ctx {
     pub pbits: u32,
     /// Debug knob (SE_STAGE): 1 = scan only, 2 = scan + evaluate, 0 = everything.
     pub stage: u32,
-    /// Drop each chunk's file pages from the mapping once it is parsed (SE_DROP=0 turns it off).
+    /// Drop each chunk's file pages from the mapping once it is parsed (SE_DROP=1; off by default:
+    /// `release_all` unmaps the files from all threads at the end, which is cheaper).
     pub drop_pages: bool,
     /// Zero of `DRec::ing`: `ws` - 2^31 s, in ms.
     pub ibase: i64,
@@ -816,7 +817,7 @@ fn run_rest(
         return false;
     }
     let pregion = Region::new(pregion_bytes);
-    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_on("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion, hop: hop_default(level) };
+    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_flag("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion, hop: hop_default(level) };
 
     if tm.on {
         eprintln!(

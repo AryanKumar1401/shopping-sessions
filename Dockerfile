@@ -18,4 +18,7 @@ FROM scratch
 COPY --from=build /shopping-engine /shopping-engine
 USER 1000:1000
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
+# glibc malloc: huge pages for its heaps, grown 32 MiB at a time (see engine/src/main.rs; the
+# engine re-executes itself with this if the variable is missing).
+ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.top_pad=33554432
 CMD ["/shopping-engine"]

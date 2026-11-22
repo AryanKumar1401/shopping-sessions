@@ -12,7 +12,31 @@ mod util;
 
 use std::path::PathBuf;
 
+/// glibc malloc settings for this workload (the Vec-backed tables and output buffers of the
+/// dedup and people phases): heaps madvised for transparent huge pages and grown 32 MiB at a
+/// time instead of 128 KiB. Measured on the benchmark VM: 4K page faults 31K -> 11K at 20M
+/// events, wall -3%. glibc only takes these from the environment at start-up, so the image
+/// sets the variable (Dockerfile); started without it, the engine starts itself again with it.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn malloc_tunables() {
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os("GLIBC_TUNABLES").is_some() || std::env::var_os("SE_REEXEC").is_some() {
+        return;
+    }
+    let mut args = std::env::args_os();
+    let Some(arg0) = args.next() else { return };
+    // Returns only if the exec failed: then carry on with the defaults.
+    let _ = std::process::Command::new("/proc/self/exe")
+        .arg0(arg0)
+        .args(args)
+        .env("GLIBC_TUNABLES", "glibc.malloc.hugetlb=1:glibc.malloc.top_pad=33554432")
+        .env("SE_REEXEC", "1")
+        .exec();
+}
+
 fn main() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    malloc_tunables();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let timing = args.iter().any(|a| a == "--timing") || util::env_flag("SE_TIMING");
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
