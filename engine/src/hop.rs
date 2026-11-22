@@ -229,6 +229,21 @@ mod k {
         }
     }
 
+    /// The full write-combining line of `push16`: the 64 bytes at `dst` (aligned) get the first
+    /// 48 of `line` and then `last` (16 bytes), with non-temporal stores. `last` comes from its
+    /// registers: it was just stored into `line` in parts, which a load could not forward.
+    #[inline(always)]
+    pub unsafe fn wc_line16<T: Copy>(dst: *mut u8, line: *const u8, last: T) {
+        unsafe {
+            const { assert!(std::mem::size_of::<T>() == 16) };
+            let a = _mm256_load_si256(line as *const __m256i);
+            let b = _mm_load_si128(line.add(32) as *const __m128i);
+            let c: __m128i = std::mem::transmute_copy(&last);
+            _mm256_stream_si256(dst as *mut __m256i, a);
+            _mm256_stream_si256(dst.add(32) as *mut __m256i, _mm256_set_m128i(c, b));
+        }
+    }
+
     /// `fast::hex_key` with 33 readable bytes at `a`.
     #[inline(always)]
     pub unsafe fn hex33(a: *const u8, len: usize) -> Option<(u64, u64)> {
@@ -369,6 +384,12 @@ mod k {
     #[inline(always)]
     pub unsafe fn hex33(a: *const u8, len: usize) -> Option<(u64, u64)> {
         unsafe { crate::fast::hex_key(a, len) }
+    }
+
+    /// (`last` is already in place in `line`.)
+    #[inline(always)]
+    pub unsafe fn wc_line16<T: Copy>(dst: *mut u8, line: *const u8, _last: T) {
+        unsafe { crate::util::wc_copy(dst, line, 64) }
     }
 
     #[inline(always)]
@@ -617,7 +638,7 @@ unsafe fn push16<T: Copy>(heads: *mut (*mut T, *mut T), buf: *mut T, s: usize, v
         (line.add(n) as *mut T).write(v);
         (*h).0 = (p + 16) as *mut T;
         if n == 0x30 {
-            wc_copy((p - 0x30) as *mut u8, line, 64);
+            k::wc_line16((p - 0x30) as *mut u8, line, v);
             if (*h).1 as usize == p + 16 {
                 *full = REFILL;
             }
