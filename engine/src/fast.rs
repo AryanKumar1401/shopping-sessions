@@ -195,6 +195,125 @@ fn resolve_long_users(ctx: &Ctx, uparts: &[Parts<URec>], nthreads: usize, wc: bo
     })
 }
 
+/// A valid click whose user_id does not pack into a word: what its `CRec` will hold, with the
+/// user_id as for a `URec` (hash, and the bytes up to `UCINLINE`; a longer one by its address
+/// in the file's mapping, in the first 8 of `bytes`). Written to partitions by hash;
+/// `resolve_long_clicks` turns them into `CRec`s after the parse, interning each distinct ID
+/// once per partition instead of once per line.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct UCRec {
+    pub h: u64,
+    /// `CRec::ptr`
+    pub ptr: usize,
+    pub ts: u32,
+    pub camp: u32,
+    pub len: u32,
+    pub bytes: [u8; UCINLINE],
+}
+pub const UCINLINE: usize = 36;
+impl UCRec {
+    /// The user_id's bytes.
+    #[inline(always)]
+    pub unsafe fn id(&self) -> &[u8] {
+        unsafe {
+            if self.len as usize <= UCINLINE {
+                self.bytes.get_unchecked(..self.len as usize)
+            } else {
+                std::slice::from_raw_parts((self.bytes.as_ptr() as *const usize).read_unaligned() as *const u8, self.len as usize)
+            }
+        }
+    }
+}
+/// Records per block of the `UCRec` partitions.
+const UCBLOCK: usize = 64;
+
+/// Writes one valid click whose user_id (the `len` bytes at `p`, not empty) is not packable;
+/// `ptr`: its `CRec::ptr`, `fix`: what to add to `p` for its address in the file's mapping.
+#[inline(always)]
+pub(crate) unsafe fn push_uclick(ctx: &Ctx, ucw: &mut Writers<UCRec>, p: *const u8, len: usize, fix: usize, ts: u32, camp: u32, ptr: usize) {
+    unsafe {
+        let h = bytes_hash(p, len);
+        let mut rec = UCRec { h, ptr, ts, camp, len: len as u32, bytes: [0; UCINLINE] };
+        if len <= UCINLINE {
+            std::ptr::copy_nonoverlapping(p, rec.bytes.as_mut_ptr(), len);
+        } else {
+            (rec.bytes.as_mut_ptr() as *mut usize).write_unaligned((p as usize).wrapping_add(fix));
+        }
+        ucw.push(part_of(h, ctx.pbits), rec);
+    }
+}
+
+/// Writes one valid click (user_id: the `len` bytes at `p`, not empty): its `CRec`, or its
+/// `UCRec` when the user_id is not packable.
+#[inline(always)]
+pub(crate) unsafe fn push_click(ctx: &Ctx, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>, p: *const u8, len: usize, lim: *const u8, fix: usize, ts: u32, camp: u32, ptr: usize) {
+    unsafe {
+        if packable(p, len) {
+            let uid = pack_id(p, len, lim);
+            cw.push(part_of(id_hash(uid), ctx.pbits), CRec { k: uid, ts, camp, ptr });
+        } else {
+            push_uclick(ctx, ucw, p, len, fix, ts, camp, ptr);
+        }
+    }
+}
+
+/// The `UCRec`s as `CRec`s (in the partitions of their interned user IDs): the same records
+/// the parse would have written had it interned every user_id itself.
+pub(crate) fn resolve_long_clicks(ctx: &Ctx, ucparts: &[Parts<UCRec>], nthreads: usize, wc: bool) -> Vec<Parts<CRec>> {
+    let np = 1usize << ctx.pbits;
+    if (0..np).all(|p| ucparts.iter().all(|u| u.count(p) == 0)) {
+        return Vec::new();
+    }
+    let next = AtomicUsize::new(0);
+    par((0..nthreads.max(1)).collect::<Vec<usize>>(), |_, _| {
+        let mut cw: Writers<CRec> = Writers::with_wc(np, 128, wc);
+        // slots: 1 + the index in `seen` of a distinct ID of the partition (its first
+        // record and its Id), or 0
+        let mut table: Vec<u32> = Vec::new();
+        let mut seen: Vec<(*const UCRec, Id)> = Vec::new();
+        loop {
+            let p = next.fetch_add(1, Relaxed);
+            if p >= np {
+                break;
+            }
+            let n: usize = ucparts.iter().map(|u| u.count(p)).sum();
+            if n == 0 {
+                continue;
+            }
+            let cap = (n * 2).next_power_of_two();
+            table.clear();
+            table.resize(cap, 0);
+            seen.clear();
+            let mask = cap - 1;
+            for u in ucparts {
+                for sl in u.slices(p) {
+                    for r in sl.iter() {
+                        let mut i = (r.h >> 20) as usize & mask;
+                        let id = loop {
+                            let t = unsafe { *table.get_unchecked(i) };
+                            if t == 0 {
+                                let id = intern_long(unsafe { r.id() });
+                                seen.push((r as *const UCRec, id));
+                                unsafe { *table.get_unchecked_mut(i) = seen.len() as u32 };
+                                break id;
+                            }
+                            let (e, id) = unsafe { *seen.get_unchecked(t as usize - 1) };
+                            let e = unsafe { &*e };
+                            if e.h == r.h && e.len == r.len && unsafe { e.id() == r.id() } {
+                                break id;
+                            }
+                            i = (i + 1) & mask;
+                        };
+                        cw.push(part_of(id_hash(id), ctx.pbits), CRec { k: id, ts: r.ts, camp: r.camp, ptr: r.ptr });
+                    }
+                }
+            }
+        }
+        cw.finish()
+    })
+}
+
 /// Whether `pack_id` packs these bytes into a word (else it interns them).
 #[inline(always)]
 pub unsafe fn packable(p: *const u8, len: usize) -> bool {
@@ -795,6 +914,7 @@ struct PState {
     lw: Writers<LRec>,
     pw: Writers<PRec>,
     cw: Writers<CRec>,
+    ucw: Writers<UCRec>,
 }
 
 /// `ingest_ts` as a `DRec::ing`; sets `escape` when it does not fit.
@@ -916,7 +1036,7 @@ unsafe fn event_row(ev: &EvRow, r: &Row, cache: &mut DateCache, pw: &mut Writers
 
 /// One well-formed click line (`row`: its first byte), by the general rules, into the writer.
 #[inline(always)]
-pub unsafe fn click_general(ctx: &Ctx, f: &[Field; 4], row: *const u8, lim: *const u8, fix: usize, cache: &mut DateCache, cw: &mut Writers<CRec>) {
+pub unsafe fn click_general(ctx: &Ctx, f: &[Field; 4], row: *const u8, lim: *const u8, fix: usize, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>) {
     unsafe {
         if f[0].1 == 0 || f[1].1 == 0 || f[2].1 == 0 {
             return;
@@ -929,15 +1049,14 @@ pub unsafe fn click_general(ctx: &Ctx, f: &[Field; 4], row: *const u8, lim: *con
         if camp == u32::MAX {
             return;
         }
-        let uid = pack_id(f[1].0, f[1].1, lim);
-        cw.push(part_of(id_hash(uid), ctx.pbits), CRec { k: uid, ts: (ts - ctx.cbase) as u32, camp, ptr: (row as usize).wrapping_add(fix) });
+        push_click(ctx, cw, ucw, f[1].0, f[1].1, lim, fix, (ts - ctx.cbase) as u32, camp, (row as usize).wrapping_add(fix));
     }
 }
 
 #[inline(always)]
 unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
     unsafe {
-        let PState { escape, slow, rbuf, rcap, buf, cache, dates, uw, dw, lw, pw, cw } = st;
+        let PState { escape, slow, rbuf, rcap, buf, cache, dates, uw, dw, lw, pw, cw, ucw } = st;
         // `base[..len]`: the job's lines; `lim`: end of the readable bytes; `fix`: what to add
         // to a row pointer to get its address in the file's mapping (which outlives the job).
         let (base, len, lim, fix) = match read_job(job, *rbuf, *rcap) {
@@ -967,9 +1086,9 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
             }
         } else {
             if ctx.chop {
-                *slow += crate::hop::hop_clicks(ctx, base, len, lim, fix, dates, cache, cw);
+                *slow += crate::hop::hop_clicks(ctx, base, len, lim, fix, dates, cache, cw, ucw);
             } else {
-                scan::<M, 4>(buf, base, len, #[inline(always)] |f, row| click_general(ctx, f, row, lim, fix, cache, cw));
+                scan::<M, 4>(buf, base, len, #[inline(always)] |f, row| click_general(ctx, f, row, lim, fix, cache, cw, ucw));
             }
         }
         if drop_after {
@@ -1073,6 +1192,7 @@ fn run_rest(
             pw: Writers::in_region(1 << pbits, PBLOCK, wc, pregion),
             uw: Writers::in_region(1 << pbits, UBLOCK, wc, uregion),
             cw: Writers::with_wc(1 << pbits, 128, wc),
+            ucw: Writers::with_wc(1 << pbits, UCBLOCK, wc),
         })
         .collect();
     let res = par(states, |_, mut st| {
@@ -1083,7 +1203,7 @@ fn run_rest(
             }
             unsafe { main_d(level, &ctx, &mut st, &jobs[j]) };
         }
-        (st.escape, st.dw.finish(), st.pw.finish(), st.cw.finish(), st.lw.finish(), st.uw.finish())
+        (st.escape, st.dw.finish(), st.pw.finish(), st.cw.finish(), st.lw.finish(), st.uw.finish(), st.ucw.finish())
     });
     if res.iter().any(|r| r.0) {
         // Some line did not fit the compact dedup record: the general path redoes everything.
@@ -1094,7 +1214,9 @@ fn run_rest(
     let mut cl = Vec::new();
     let mut lparts = Vec::new();
     let mut uparts = Vec::new();
-    for (_, d, p, c, l, u) in res {
+    let mut ucparts = Vec::new();
+    for (_, d, p, c, l, u, uc) in res {
+        ucparts.push(uc);
         uparts.push(u);
         lparts.push(l);
         dparts.push(d);
@@ -1209,6 +1331,7 @@ fn run_rest(
         }
     });
     ev.extend(resolve_long_users(&ctx, &uparts, nthreads, wc));
+    cl.extend(resolve_long_clicks(&ctx, &ucparts, nthreads, wc));
     tm.lap("dedup");
     let Some(links) = lh.join().unwrap() else { return false };
     let _ = ctx.links.set(links);
@@ -1268,7 +1391,7 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                 let nt = nt.min(jobs.len().max(1));
                 let next = AtomicUsize::new(0);
                 let states: Vec<PState> = (0..nt)
-                    .map(|_| PState { escape: false, slow: 0, rbuf: std::ptr::null_mut(), rcap: 0, buf: ScanBuf::new(), cache: DateCache::new(), dates: crate::hop::HopDates::new(),  dw: Writers::with_wc(1 << dbits, 1024, wc), lw: Writers::with_wc(1 << dbits, 128, wc), pw: Writers::in_region(1 << pbits, PBLOCK, wc, ctx.pregion), uw: Writers::in_region(1 << pbits, UBLOCK, wc, ctx.uregion), cw: Writers::with_wc(1 << pbits, 128, wc) })
+                    .map(|_| PState { escape: false, slow: 0, rbuf: std::ptr::null_mut(), rcap: 0, buf: ScanBuf::new(), cache: DateCache::new(), dates: crate::hop::HopDates::new(),  dw: Writers::with_wc(1 << dbits, 1024, wc), lw: Writers::with_wc(1 << dbits, 128, wc), pw: Writers::in_region(1 << pbits, PBLOCK, wc, ctx.pregion), uw: Writers::in_region(1 << pbits, UBLOCK, wc, ctx.uregion), cw: Writers::with_wc(1 << pbits, 128, wc), ucw: Writers::with_wc(1 << pbits, UCBLOCK, wc) })
                     .collect();
                 let t0 = std::time::Instant::now();
                 let res = par(states, |_, mut st| {
@@ -1280,9 +1403,16 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                         unsafe { main_d(level, &ctx, &mut st, &jobs[j]) };
                     }
                     let _u = st.uw.finish();
-                    (st.escape, st.slow, st.dw.finish(), st.pw.finish(), st.cw.finish(), st.lw.finish())
+                    (st.escape, st.slow, st.dw.finish(), st.pw.finish(), st.cw.finish(), st.lw.finish(), st.ucw.finish())
                 });
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                // clicks with a long user_id: resolved after the parse (timed apart)
+                let mut res = res;
+                let ucparts: Vec<Parts<UCRec>> = res.iter_mut().map(|r| std::mem::replace(&mut r.6, Writers::<UCRec>::new(1, 4).finish())).collect();
+                let nuc: usize = ucparts.iter().map(|u| (0..1usize << pbits).map(|q| u.count(q)).sum::<usize>()).sum();
+                let t1 = std::time::Instant::now();
+                let resolved = resolve_long_clicks(&ctx, &ucparts, nt, wc);
+                let rms = t1.elapsed().as_secs_f64() * 1000.0;
                 let (mut h, mut nd, mut ng, mut slow, mut esc) = (0u64, 0u64, 0u64, 0u64, false);
                 let pbase = ctx.pregion.base as *const PRec;
                 let ubase = ctx.uregion.base as *const URec;
@@ -1299,7 +1429,7 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                     }
                 };
                 let mut nlong = 0u64;
-                for (_, _, _, _, _, l) in &res {
+                for (_, _, _, _, _, l, _) in &res {
                     for part in 0..(1usize << dbits) {
                         for sl in l.slices(part) {
                             for r in sl.iter() {
@@ -1316,19 +1446,30 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                         }
                     }
                 }
-                for (_, _, _, _, c, _) in &res {
+                for c in res.iter().map(|r| &r.4).chain(resolved.iter()) {
                     for part in 0..(1usize << pbits) {
                         for sl in c.slices(part) {
                             for r in sl.iter() {
                                 nd += 1;
                                 ng += 1;
-                                let x = mum(r.k ^ K0, K1) ^ (((r.ts as u64) << 32) | r.camp as u64);
-                                h = h.wrapping_add(mum(mum(x ^ r.ptr as u64, K1) ^ K1 ^ part as u64, K0));
+                                // the same in every process and build: a long user by its bytes
+                                // (not its interner index, nor the partition that follows from
+                                // it), the line by its file and offset
+                                let (key, part) = if is_long(r.k) {
+                                    let mut name = Vec::new();
+                                    id_bytes(r.k, &mut name);
+                                    (unsafe { bytes_hash(name.as_ptr(), name.len()) } | LONG, 0)
+                                } else {
+                                    (r.k, part)
+                                };
+                                let line = inp.clicks.iter().enumerate().find(|(_, f)| r.ptr.wrapping_sub(f.as_ptr() as usize) < f.len()).map_or(u64::MAX, |(i, f)| ((i as u64) << 40) | (r.ptr - f.as_ptr() as usize) as u64);
+                                let x = mum(key ^ K0, K1) ^ (((r.ts as u64) << 32) | r.camp as u64);
+                                h = h.wrapping_add(mum(mum(x ^ line, K1) ^ K1 ^ part as u64, K0));
                             }
                         }
                     }
                 }
-                for (e, s, d, _, _, _) in &res {
+                for (e, s, d, _, _, _, _) in &res {
                     esc |= *e;
                     slow += *s;
                     for part in 0..(1usize << dbits) {
@@ -1346,7 +1487,7 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                         }
                     }
                 }
-                println!("kernel={kernel} threads={nt} ms={ms:.1} drecs={nd} good={ng} slow={slow} escape={esc} hash={h:016x} long={nlong}");
+                println!("kernel={kernel} threads={nt} ms={ms:.1} drecs={nd} good={ng} slow={slow} escape={esc} hash={h:016x} long={nlong} uclicks={nuc} resolve_ms={rms:.1}");
                 match first {
                     None => first = Some((h, nd, ng)),
                     Some(f) => same &= f == (h, nd, ng),
@@ -1575,6 +1716,7 @@ mod hop_tests {
             pw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.pregion),
             uw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.uregion),
             cw: Writers::with_wc(1 << ctx.pbits, 8, true),
+            ucw: Writers::with_wc(1 << ctx.pbits, 8, true),
         };
         let mut jobs = Vec::new();
         make_jobs(&[data], 0, chunk, false, &mut jobs);
@@ -1792,6 +1934,7 @@ mod hop_tests {
             pw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.pregion),
             uw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.uregion),
             cw: Writers::with_wc(1 << ctx.pbits, 8, true),
+            ucw: Writers::with_wc(1 << ctx.pbits, 8, true),
         };
         let mut jobs = Vec::new();
         make_jobs(&[data], 1, chunk, false, &mut jobs);
@@ -1799,9 +1942,10 @@ mod hop_tests {
             unsafe { main_d(level, ctx, &mut st, j) };
         }
         let c = st.cw.finish();
+        let resolved = resolve_long_clicks(ctx, &[st.ucw.finish()], 2, true);
         let mut out = Vec::new();
         for part in 0..(1usize << ctx.pbits) {
-            for sl in c.slices(part) {
+            for sl in c.slices(part).chain(resolved.iter().flat_map(|x| x.slices(part))) {
                 for r in sl.iter() {
                     assert!(part == part_of(id_hash(r.k), ctx.pbits));
                     out.push((r.k, r.ts, r.camp, r.ptr - data.as_ptr() as usize));
