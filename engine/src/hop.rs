@@ -25,17 +25,16 @@ use crate::ts::*;
 use crate::util::*;
 
 /// Bytes that must be readable from a line's start for the speculative walk: it never reads
-/// further than this, whatever the bytes are (2 x (1 + 16 + 2) for the IDs, 28 + 23 for the
-/// timestamps, 11 for the type, 32 for the tail = 132, and the 32-byte loads behind each).
+/// further than this, whatever the bytes are (2 x (1 + 64 + 2) for the IDs, 28 + 23 for the
+/// timestamps, 11 for the type, 32 for the tail = 228, and the 32-byte loads behind each; the
+/// scans of the long IDs read at most 80 bytes from an ID's start, which starts before 85).
 pub const GUARD: usize = 320;
 
 /// What must follow an ID's bytes: `,` (index 0) or `",` (index 1), as a little-endian
 /// 16-bit word and the mask of the bytes that count.
 static TERM_WANT: [u16; 2] = [0x002C, 0x2C22];
 static TERM_MASK: [u16; 2] = [0x00FF, 0xFFFF];
-/// Nonzero for an ID length that is not 1..=9.
-static LEN_BAD: [u8; 17] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1];
-/// The same for 0..=9 (an empty user_id is handled here: the event is not a good one).
+/// Nonzero for an ID length that is not 0..=9 (an empty campaign_id is handled here).
 static LEN_BAD0: [u8; 17] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1];
 
 /// Nonzero unless the bytes at `t` are `,` (q = 0) or `",` (q = 1).
@@ -230,21 +229,6 @@ mod k {
         }
     }
 
-    /// How many of the bytes at `a` come before the first byte outside `0x30..=0x7F`:
-    /// 0..=64, or 65 when there are more (64 bytes are read).
-    #[inline(always)]
-    pub unsafe fn id_len(a: *const u8) -> usize {
-        unsafe {
-            let lo = _mm256_set1_epi8(0x30);
-            let m = _mm256_movemask_epi8(_mm256_cmpgt_epi8(lo, _mm256_loadu_si256(a as *const __m256i))) as u32;
-            if m != 0 {
-                return m.trailing_zeros() as usize;
-            }
-            let m = _mm256_movemask_epi8(_mm256_cmpgt_epi8(lo, _mm256_loadu_si256(a.add(32) as *const __m256i))) as u32;
-            if m != 0 { 32 + m.trailing_zeros() as usize } else { 65 }
-        }
-    }
-
     /// `fast::hex_key` with 33 readable bytes at `a`.
     #[inline(always)]
     pub unsafe fn hex33(a: *const u8, len: usize) -> Option<(u64, u64)> {
@@ -385,17 +369,6 @@ mod k {
     #[inline(always)]
     pub unsafe fn hex33(a: *const u8, len: usize) -> Option<(u64, u64)> {
         unsafe { crate::fast::hex_key(a, len) }
-    }
-
-    #[inline(always)]
-    pub unsafe fn id_len(a: *const u8) -> usize {
-        unsafe {
-            let mut l = 0;
-            while l < 65 && (0x30..=0x7F).contains(&*a.add(l)) {
-                l += 1;
-            }
-            l
-        }
     }
 
     #[inline(always)]
@@ -765,26 +738,31 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
         let q1 = (*s1 == b'"') as usize;
         let a1 = s1.add(q1);
         let (v1, l1) = k::id_scan(a1);
-        let long = (l0 > 9) | (l1 > 9);
+        // (an empty event_id takes the long branch, which leaves with BAIL; an empty user_id
+        // packs to 0)
+        let long = (l0.wrapping_sub(1) > 8) | (l1 > 9);
         let (s2, mut bad) = if !long {
             let t1 = a1.add(l1);
-            // the event_id not empty (an empty user_id packs to 0)
-            (t1.add(q1 + 1), term(t0, q0) | term(t1, q1) | (*LEN_BAD.get_unchecked(l0) | *LEN_BAD0.get_unchecked(l1)) as u64)
+            (t1.add(q1 + 1), term(t0, q0) | term(t1, q1))
         } else {
-            // An ID of 10 bytes or more: both fields again, up to 64 bytes each; the line is
-            // walked here and finished by `long_emit`.
-            let l0 = k::id_len(a0);
-            if l0.wrapping_sub(1) > 63 {
+            // An ID of 10 bytes or more, up to 64: a scan that stopped short of 16 bytes has its
+            // length; one that filled them goes on from there (and the user_id is found again
+            // when it was the event_id). The line is walked here and finished below or by
+            // `long_emit`.
+            let (mut l0, mut a1, mut q1, mut l1) = (l0, a1, q1, l1);
+            if l0 == 16 {
+                l0 += id_more(a0.add(16));
+                let s1 = a0.add(l0 + q0 + 1);
+                q1 = (*s1 == b'"') as usize;
+                a1 = s1.add(q1);
+                l1 = id_scan80(a1).1;
+            } else if l1 == 16 {
+                l1 += id_more(a1.add(16));
+            }
+            if (l0.wrapping_sub(1) > 63) | (l1 > 64) {
                 return BAIL;
             }
             let t0 = a0.add(l0);
-            let s1 = t0.add(q0 + 1);
-            let q1 = (*s1 == b'"') as usize;
-            let a1 = s1.add(q1);
-            let l1 = k::id_len(a1);
-            if l1 > 64 {
-                return BAIL;
-            }
             let t1 = a1.add(l1);
             hot.lr.ids = (a0, l0, a1, l1);
             (t1.add(q1 + 1), term(t0, q0) | term(t1, q1))
