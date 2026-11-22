@@ -245,6 +245,32 @@ mod k {
         }
     }
 
+    /// `fast::hex_key` with 33 readable bytes at `a`.
+    #[inline(always)]
+    pub unsafe fn hex33(a: *const u8, len: usize) -> Option<(u64, u64)> {
+        unsafe {
+            if len != 33 {
+                return None;
+            }
+            let v = _mm256_loadu_si256(a.add(1) as *const __m256i);
+            // a digit: byte - '0' <= 9; a letter: byte - 'a' <= 5 (unsigned)
+            let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+            let l = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+            let isd = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+            let isl = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+            if _mm256_movemask_epi8(_mm256_or_si256(isd, isl)) != -1 {
+                return None;
+            }
+            let nib = _mm256_blendv_epi8(_mm256_add_epi8(l, _mm256_set1_epi8(10)), d, isd);
+            // pairs of nibbles to bytes, eight bytes per 128-bit lane
+            let by = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+            let pk = _mm256_packus_epi16(by, by);
+            let hi = (_mm_cvtsi128_si64(_mm256_castsi256_si128(pk)) as u64).swap_bytes();
+            let lo = (_mm_cvtsi128_si64(_mm256_extracti128_si256(pk, 1)) as u64).swap_bytes();
+            Some((hi, lo))
+        }
+    }
+
     /// `pack_id16` of two IDs of 0..=9 bytes, all in `0x30..=0x7F` (see `pack2_id16`);
     /// lengths up to 16 are allowed and give a meaningless value.
     #[inline(always)]
@@ -354,6 +380,11 @@ mod k {
             }
             (a, l)
         }
+    }
+
+    #[inline(always)]
+    pub unsafe fn hex33(a: *const u8, len: usize) -> Option<(u64, u64)> {
+        unsafe { crate::fast::hex_key(a, len) }
     }
 
     #[inline(always)]
@@ -787,7 +818,7 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
 /// bytes or more gets a `URec`, an event_id of 10 bytes or more an `LRec`: for these bytes
 /// `packable` is the length alone.
 #[inline(never)]
-unsafe fn long_emit<const RAW: bool>(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> *const u8 {
+unsafe fn long_emit<const RAW: bool>(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut UW, escape: &mut bool) -> *const u8 {
     unsafe {
         let (a0, l0, a1, l1) = hot.lr.ids;
         let (ts, ing_s, kt, s5, mcb, open, nl) = hot.lr.rest;
@@ -799,7 +830,10 @@ unsafe fn long_emit<const RAW: bool>(ev: &EvRow, hot: &mut Hot, pw: &mut Writers
             if kt >= 2 || pc != 0 {
                 let pts = (ts - hot.cbase) as u32;
                 prec = if l1 > 9 {
-                    push_urec(ev.ctx, uw, escape, a1, l1, ev.fix, pts, pc, true)
+                    match k::hex33(a1, l1) {
+                        Some((hi, lo)) => push_uhrec(ev.ctx, uw, escape, *a1, hi, lo, pts, pc),
+                        None => push_urec(ev.ctx, uw, escape, a1, l1, ev.fix, pts, pc, true),
+                    }
                 } else if RAW {
                     let uid = pack_id16(a1, l1);
                     let ps = ((id_hash(uid) >> 1) >> hot.pshift) as usize;
@@ -860,7 +894,7 @@ unsafe fn purchase_finish(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw:
 /// One pass that finds the newline and splits as `split_row` does: a field has no quote, or
 /// exactly two, as its first and last byte.
 #[inline(never)]
-unsafe fn slow_row_bytes(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> *const u8 {
+unsafe fn slow_row_bytes(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut UW, escape: &mut bool) -> *const u8 {
     unsafe {
         let mut f: [Field; 7] = [(p, 0); 7];
         let (mut k, mut well, mut st, mut nq, mut i) = (0usize, true, p, 0usize, p);
@@ -899,7 +933,7 @@ unsafe fn slow_row_bytes(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut D
 /// comes within 32 bytes of the end of the readable bytes is handed to `slow_row_bytes`.
 #[cold]
 #[inline(never)]
-unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> *const u8 {
+unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut UW, escape: &mut bool) -> *const u8 {
     unsafe {
         let mut f: [Field; 7] = [(p, 0); 7];
         let (mut k, mut well, mut st, mut nq, mut b) = (0usize, true, p, 0u32, p);
@@ -944,7 +978,7 @@ unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCac
 }
 
 #[inline(always)]
-unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> u64 {
+unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut UW, escape: &mut bool) -> u64 {
     unsafe {
         let ctx = ev.ctx;
         let (ph, pb) = pw.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
@@ -1028,7 +1062,7 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
 /// All event lines of `base[..len]` (whole lines; the last may lack its `\n` only when it
 /// ends at `ev.lim`). Returns how many lines took the general path.
 #[inline(always)]
-pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> u64 {
+pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut UW, escape: &mut bool) -> u64 {
     unsafe {
         if pw.raw().is_some() && dw.raw().is_some() && std::mem::size_of::<PRec>() == 16 && std::mem::size_of::<DRec>() == 16 {
             hop_loop::<true>(ev, base, len, dates, cache, pw, dw, lw, uw, escape)
@@ -1104,7 +1138,7 @@ unsafe fn id_scan80(a: *const u8) -> (k::V16, usize) {
 }
 
 #[inline(always)]
-unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDates, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>) -> usize {
+unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDates, cw: &mut Writers<CRec>, ucw: &mut UCW) -> usize {
     unsafe {
         // click_id
         let q0 = (*p == b'"') as usize;
@@ -1189,7 +1223,7 @@ unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDate
 /// The click line at `p` (ending before `end`) by the general rules; returns the next line's start.
 #[cold]
 #[inline(never)]
-unsafe fn slow_click(ctx: &Ctx, p: *const u8, end: *const u8, lim: *const u8, fix: usize, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>) -> *const u8 {
+unsafe fn slow_click(ctx: &Ctx, p: *const u8, end: *const u8, lim: *const u8, fix: usize, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut UCW) -> *const u8 {
     unsafe {
         let mut e = p;
         while e < end && *e != b'\n' {
@@ -1205,7 +1239,7 @@ unsafe fn slow_click(ctx: &Ctx, p: *const u8, end: *const u8, lim: *const u8, fi
 /// All click lines of `base[..len]` (whole lines; the last may lack its `\n` only when it
 /// ends at `lim`, the end of the readable bytes). Returns how many lines took the general path.
 #[inline(always)]
-pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8, fix: usize, dates: &mut HopDates, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>) -> u64 {
+pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8, fix: usize, dates: &mut HopDates, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut UCW) -> u64 {
     unsafe {
         let mut hot = ClickHot { cbase: ctx.cbase, span: (ctx.we - ctx.cbase) as u64, fix, miss: base };
         let end = base.add(len);

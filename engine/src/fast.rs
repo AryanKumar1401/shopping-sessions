@@ -88,28 +88,103 @@ impl URec {
         }
     }
 }
-/// In a dedup record's `prec`: the index is of a `URec`. (`PRec` and `URec` indexes stay
-/// below it: `run_rest` and the `escape` checks.)
+/// A `URec` for the generated long shape, one byte and 32 lowercase hexadecimal digits
+/// (`hex_key`): the 128 bits as two words and the first byte. Half the size, compared as
+/// words. Every path decides between the two kinds with `hex_key`, so a user_id is always in
+/// the same kind. `ts` is where `URec::ts` is (`kill`).
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct UHRec {
+    pub hi: u64,
+    pub ts: u32,
+    pub pc: u32,
+    pub lo: u64,
+    pub pre: u32,
+    pub pad: u32,
+}
+impl UHRec {
+    #[inline(always)]
+    pub fn hash(&self) -> u64 {
+        hex_hash(self.hi, self.lo, self.pre)
+    }
+    /// The user_id's 33 bytes.
+    pub fn id(&self) -> [u8; 33] {
+        let mut b = [0u8; 33];
+        b[0] = self.pre as u8;
+        for i in 0..16 {
+            b[1 + i] = b"0123456789abcdef"[((self.hi >> (60 - 4 * i)) & 15) as usize];
+            b[17 + i] = b"0123456789abcdef"[((self.lo >> (60 - 4 * i)) & 15) as usize];
+        }
+        b
+    }
+}
+
+/// The 32 hexadecimal digits of an ID of the generated long shape as two words (first digit
+/// most significant), or None when the `len` bytes at `p` are not 33 bytes of which the last
+/// 32 are in `0-9a-f`. (hop.rs has the same in vector code.)
+#[inline]
+pub unsafe fn hex_key(p: *const u8, len: usize) -> Option<(u64, u64)> {
+    unsafe {
+        if len != 33 {
+            return None;
+        }
+        let mut w = [0u64; 2];
+        for i in 0..32 {
+            let c = *p.add(1 + i);
+            let v = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                _ => return None,
+            };
+            w[i / 16] = (w[i / 16] << 4) | v as u64;
+        }
+        Some((w[0], w[1]))
+    }
+}
+
+/// The two kinds of records for long user IDs.
+pub struct UW {
+    pub g: Writers<URec>,
+    pub h: Writers<UHRec>,
+}
+
+/// In a dedup record's `prec`: the index is of a `URec` or (with `HFLAG`) a `UHRec`, in
+/// units of 32 bytes from `Ctx::uregion`. (`PRec` indexes stay below `UFLAG`, these below
+/// `HFLAG`: `run_rest` and the `escape` checks.)
 pub const UFLAG: u32 = 1 << 31;
+pub const HFLAG: u32 = 1 << 30;
 /// Records per block of the `URec` partitions.
 const UBLOCK: usize = 64;
 
 /// Writes one good event's `PRec` or `URec` (user_id: the `len` bytes at `p`, not empty) and
 /// returns what names it in the dedup record.
 #[inline(always)]
-pub(crate) unsafe fn push_good(ctx: &Ctx, pw: &mut Writers<PRec>, uw: &mut Writers<URec>, escape: &mut bool, p: *const u8, len: usize, lim: *const u8, fix: usize, ts: u32, pc: u32) -> u32 {
+pub(crate) unsafe fn push_good(ctx: &Ctx, pw: &mut Writers<PRec>, uw: &mut UW, escape: &mut bool, p: *const u8, len: usize, lim: *const u8, fix: usize, ts: u32, pc: u32) -> u32 {
     unsafe {
         if packable(p, len) {
             return push_prec(ctx, pw, escape, pack_id(p, len, lim), ts, pc);
+        }
+        if let Some((hi, lo)) = hex_key(p, len) {
+            return push_uhrec(ctx, uw, escape, *p, hi, lo, ts, pc);
         }
         push_urec(ctx, uw, escape, p, len, fix, ts, pc, false)
     }
 }
 
-/// `push_good` for a user_id that is known not to be packable (`readable`: and to have
-/// `UINLINE` readable bytes at `p`).
+/// `push_good` for a user_id of the hexadecimal shape (`hex_key`; `pre`: its first byte).
 #[inline(always)]
-pub(crate) unsafe fn push_urec(ctx: &Ctx, uw: &mut Writers<URec>, escape: &mut bool, p: *const u8, len: usize, fix: usize, ts: u32, pc: u32, readable: bool) -> u32 {
+pub(crate) unsafe fn push_uhrec(ctx: &Ctx, uw: &mut UW, escape: &mut bool, pre: u8, hi: u64, lo: u64, ts: u32, pc: u32) -> u32 {
+    let rec = UHRec { hi, ts, pc, lo, pre: pre as u32, pad: 0 };
+    let r = uw.h.push_ptr(part_of(rec.hash(), ctx.lbits), rec);
+    let idx = (r as usize).wrapping_sub(ctx.uregion.base) / 32;
+    *escape |= idx >= HFLAG as usize;
+    idx as u32 | UFLAG | HFLAG
+}
+
+/// `push_good` for a user_id that is known not to be packable and not of the hexadecimal
+/// shape (`readable`: and to have `UINLINE` readable bytes at `p`).
+#[inline(always)]
+pub(crate) unsafe fn push_urec(ctx: &Ctx, uw: &mut UW, escape: &mut bool, p: *const u8, len: usize, fix: usize, ts: u32, pc: u32, readable: bool) -> u32 {
     unsafe {
         let h = bytes_hash(p, len);
         let mut rec = URec { h, ts, pc, len: len as u32, pad: 0, bytes: [0; UINLINE] };
@@ -119,82 +194,25 @@ pub(crate) unsafe fn push_urec(ctx: &Ctx, uw: &mut Writers<URec>, escape: &mut b
         } else {
             (rec.bytes.as_mut_ptr() as *mut usize).write_unaligned((p as usize).wrapping_add(fix));
         }
-        let r = uw.push_ptr(part_of(h, ctx.lbits), rec);
-        let idx = (r as usize).wrapping_sub(ctx.uregion.base) / std::mem::size_of::<URec>();
-        *escape |= idx >= UFLAG as usize;
+        let r = uw.g.push_ptr(part_of(h, ctx.lbits), rec);
+        let idx = (r as usize).wrapping_sub(ctx.uregion.base) / 32;
+        *escape |= idx >= HFLAG as usize;
         idx as u32 | UFLAG
     }
 }
 
-/// Cancels the `PRec` or `URec` that a dedup record names.
+/// Cancels the `PRec`, `URec` or `UHRec` that a dedup record names.
 #[inline(always)]
-unsafe fn kill(pbase: *mut PRec, ubase: *mut URec, prec: u32) {
+unsafe fn kill(pbase: *mut PRec, ubase: *mut u8, prec: u32) {
     unsafe {
         if prec == NOPREC {
         } else if prec & UFLAG != 0 {
-            (*ubase.add((prec & !UFLAG) as usize)).ts = DEAD;
+            // (`ts` is at byte 8 of both kinds)
+            (ubase.add((prec & (HFLAG - 1)) as usize * 32 + 8) as *mut u32).write(DEAD);
         } else {
             (*pbase.add(prec as usize)).ts = DEAD;
         }
     }
-}
-
-/// The surviving `URec`s as `PRec`s (in the partitions of their interned user IDs).
-fn resolve_long_users(ctx: &Ctx, uparts: &[Parts<URec>], nthreads: usize, wc: bool) -> Vec<Parts<PRec>> {
-    let np = 1usize << ctx.lbits;
-    if (0..np).all(|p| uparts.iter().all(|u| u.count(p) == 0)) {
-        return Vec::new();
-    }
-    let next = AtomicUsize::new(0);
-    par((0..nthreads.max(1)).collect::<Vec<usize>>(), |_, _| {
-        let mut pw: Writers<PRec> = Writers::with_wc(1 << ctx.pbits, PBLOCK, wc);
-        // slots: 1 + the index in `seen` of a distinct ID of the partition (its first
-        // record and its Id), or 0
-        let mut table: Vec<u32> = Vec::new();
-        let mut seen: Vec<(*const URec, Id)> = Vec::new();
-        loop {
-            let p = next.fetch_add(1, Relaxed);
-            if p >= np {
-                break;
-            }
-            let n: usize = uparts.iter().map(|u| u.count(p)).sum();
-            if n == 0 {
-                continue;
-            }
-            let cap = (n * 2).next_power_of_two();
-            table.clear();
-            table.resize(cap, 0);
-            seen.clear();
-            let mask = cap - 1;
-            for u in uparts {
-                for sl in u.slices(p) {
-                    for r in sl.iter() {
-                        if r.ts == DEAD {
-                            continue;
-                        }
-                        let mut i = (r.h >> 20) as usize & mask;
-                        let id = loop {
-                            let t = unsafe { *table.get_unchecked(i) };
-                            if t == 0 {
-                                let id = intern_long(unsafe { r.id() });
-                                seen.push((r as *const URec, id));
-                                unsafe { *table.get_unchecked_mut(i) = seen.len() as u32 };
-                                break id;
-                            }
-                            let (e, id) = unsafe { *seen.get_unchecked(t as usize - 1) };
-                            let e = unsafe { &*e };
-                            if e.h == r.h && e.len == r.len && unsafe { e.id() == r.id() } {
-                                break id;
-                            }
-                            i = (i + 1) & mask;
-                        };
-                        pw.push(part_of(id_hash(id), ctx.pbits), PRec { k: id, ts: r.ts, pc: r.pc });
-                    }
-                }
-            }
-        }
-        pw.finish()
-    })
 }
 
 /// A valid click whose user_id does not pack into a word: what its `CRec` will hold, with the
@@ -233,8 +251,13 @@ const UCBLOCK: usize = 64;
 /// Writes one valid click whose user_id (the `len` bytes at `p`, not empty) is not packable;
 /// `ptr`: its `CRec::ptr`, `fix`: what to add to `p` for its address in the file's mapping.
 #[inline(always)]
-pub(crate) unsafe fn push_uclick(ctx: &Ctx, ucw: &mut Writers<UCRec>, p: *const u8, len: usize, fix: usize, ts: u32, camp: u32, ptr: usize) {
+pub(crate) unsafe fn push_uclick(ctx: &Ctx, ucw: &mut UCW, p: *const u8, len: usize, fix: usize, ts: u32, camp: u32, ptr: usize) {
     unsafe {
+        if let Some((hi, lo)) = hex_key(p, len) {
+            let pre = *p as u32;
+            ucw.h.push(part_of(hex_hash(hi, lo, pre), ctx.lbits), UCHRec { hi, lo, ptr, ts, cp: camp | (pre << 24) });
+            return;
+        }
         let h = bytes_hash(p, len);
         let mut rec = UCRec { h, ptr, ts, camp, len: len as u32, bytes: [0; UCINLINE] };
         if len <= UCINLINE {
@@ -242,14 +265,14 @@ pub(crate) unsafe fn push_uclick(ctx: &Ctx, ucw: &mut Writers<UCRec>, p: *const 
         } else {
             (rec.bytes.as_mut_ptr() as *mut usize).write_unaligned((p as usize).wrapping_add(fix));
         }
-        ucw.push(part_of(h, ctx.lbits), rec);
+        ucw.g.push(part_of(h, ctx.lbits), rec);
     }
 }
 
 /// Writes one valid click (user_id: the `len` bytes at `p`, not empty): its `CRec`, or its
 /// `UCRec` when the user_id is not packable.
 #[inline(always)]
-pub(crate) unsafe fn push_click(ctx: &Ctx, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>, p: *const u8, len: usize, lim: *const u8, fix: usize, ts: u32, camp: u32, ptr: usize) {
+pub(crate) unsafe fn push_click(ctx: &Ctx, cw: &mut Writers<CRec>, ucw: &mut UCW, p: *const u8, len: usize, lim: *const u8, fix: usize, ts: u32, camp: u32, ptr: usize) {
     unsafe {
         if packable(p, len) {
             let uid = pack_id(p, len, lim);
@@ -260,60 +283,168 @@ pub(crate) unsafe fn push_click(ctx: &Ctx, cw: &mut Writers<CRec>, ucw: &mut Wri
     }
 }
 
-/// The `UCRec`s as `CRec`s (in the partitions of their interned user IDs): the same records
-/// the parse would have written had it interned every user_id itself.
-pub(crate) fn resolve_long_clicks(ctx: &Ctx, ucparts: &[Parts<UCRec>], nthreads: usize, wc: bool) -> Vec<Parts<CRec>> {
+/// A `UCRec` for the hexadecimal shape (see `UHRec`): `cp` = campaign | first byte << 24
+/// (a campaign index is below 2^22, see `run`).
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct UCHRec {
+    pub hi: u64,
+    pub lo: u64,
+    pub ptr: usize,
+    pub ts: u32,
+    pub cp: u32,
+}
+/// The two kinds of records for clicks with a long user_id.
+pub struct UCW {
+    pub g: Writers<UCRec>,
+    pub h: Writers<UCHRec>,
+}
+impl UCW {
+    pub fn new(parts: usize, block: usize, wc: bool) -> Self {
+        UCW { g: Writers::with_wc(parts, block, wc), h: Writers::with_wc(parts, 2 * block, wc) }
+    }
+    pub fn finish(self) -> (Parts<UCRec>, Parts<UCHRec>) {
+        (self.g.finish(), self.h.finish())
+    }
+}
+#[inline(always)]
+fn hex_hash(hi: u64, lo: u64, pre: u32) -> u64 {
+    mum(hi ^ K0, lo ^ K1) ^ pre as u64
+}
+
+/// Turns the records with long user IDs into the records the parse would have written had it
+/// interned every user_id itself: the surviving `URec`s / `UHRec`s into `PRec`s, the `UCRec`s /
+/// `UCHRec`s into `CRec`s, in the partitions of their interned user IDs. Events and clicks of
+/// one hash partition share a table of its distinct IDs (one per kind), so an ID is interned
+/// once per partition, whatever lines it is on.
+pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<UHRec>], ucparts: &[(Parts<UCRec>, Parts<UCHRec>)], nthreads: usize, wc: bool) -> (Vec<Parts<PRec>>, Vec<Parts<CRec>>) {
     let np = 1usize << ctx.lbits;
-    if (0..np).all(|p| ucparts.iter().all(|u| u.count(p) == 0)) {
-        return Vec::new();
+    let any_ev = (0..np).any(|p| uparts.iter().any(|u| u.count(p) != 0) || uhparts.iter().any(|u| u.count(p) != 0));
+    let any_cl = (0..np).any(|p| ucparts.iter().any(|u| u.0.count(p) != 0 || u.1.count(p) != 0));
+    if !any_ev && !any_cl {
+        return (Vec::new(), Vec::new());
     }
     let next = AtomicUsize::new(0);
-    par((0..nthreads.max(1)).collect::<Vec<usize>>(), |_, _| {
-        let mut cw: Writers<CRec> = Writers::with_wc(1 << ctx.pbits, 128, wc);
-        // slots: 1 + the index in `seen` of a distinct ID of the partition (its first
-        // record and its Id), or 0
+    let res = par((0..nthreads.max(1)).collect::<Vec<usize>>(), |_, _| {
+        let mut pw: Writers<PRec> = Writers::with_wc(if any_ev { 1 << ctx.pbits } else { 1 }, PBLOCK, wc);
+        let mut cw: Writers<CRec> = Writers::with_wc(if any_cl { 1 << ctx.pbits } else { 1 }, 128, wc);
+        // slots: 1 + the index in `seen` / `hseen` of a distinct ID of the partition, or 0
         let mut table: Vec<u32> = Vec::new();
-        let mut seen: Vec<(*const UCRec, Id)> = Vec::new();
+        // (bytes, length, hash, Id)
+        let mut seen: Vec<(*const u8, u32, u64, Id)> = Vec::new();
+        // (hi, lo, first byte, Id)
+        let mut hseen: Vec<(u64, u64, u32, Id)> = Vec::new();
         loop {
             let p = next.fetch_add(1, Relaxed);
             if p >= np {
                 break;
             }
-            let n: usize = ucparts.iter().map(|u| u.count(p)).sum();
-            if n == 0 {
-                continue;
+            // the hexadecimal kind: keys compared as words
+            let n: usize = uhparts.iter().map(|u| u.count(p)).sum::<usize>() + ucparts.iter().map(|u| u.1.count(p)).sum::<usize>();
+            if n > 0 {
+                let cap = (n * 2).next_power_of_two();
+                table.clear();
+                table.resize(cap, 0);
+                hseen.clear();
+                let mask = cap - 1;
+                let mut find = |hi: u64, lo: u64, pre: u32| -> Id {
+                    let mut i = (hex_hash(hi, lo, pre) >> 20) as usize & mask;
+                    loop {
+                        let t = unsafe { *table.get_unchecked(i) };
+                        if t == 0 {
+                            let id = intern_long(&UHRec { hi, ts: 0, pc: 0, lo, pre, pad: 0 }.id());
+                            hseen.push((hi, lo, pre, id));
+                            unsafe { *table.get_unchecked_mut(i) = hseen.len() as u32 };
+                            return id;
+                        }
+                        let e = unsafe { hseen.get_unchecked(t as usize - 1) };
+                        if (e.0 == hi) & (e.1 == lo) & (e.2 == pre) {
+                            return e.3;
+                        }
+                        i = (i + 1) & mask;
+                    }
+                };
+                for u in uhparts {
+                    for sl in u.slices(p) {
+                        for r in sl.iter() {
+                            if r.ts != DEAD {
+                                let id = find(r.hi, r.lo, r.pre);
+                                pw.push(part_of(id_hash(id), ctx.pbits), PRec { k: id, ts: r.ts, pc: r.pc });
+                            }
+                        }
+                    }
+                }
+                for u in ucparts {
+                    for sl in u.1.slices(p) {
+                        for r in sl.iter() {
+                            let id = find(r.hi, r.lo, r.cp >> 24);
+                            cw.push(part_of(id_hash(id), ctx.pbits), CRec { k: id, ts: r.ts, camp: r.cp & 0xFF_FFFF, ptr: r.ptr });
+                        }
+                    }
+                }
             }
-            let cap = (n * 2).next_power_of_two();
-            table.clear();
-            table.resize(cap, 0);
-            seen.clear();
-            let mask = cap - 1;
-            for u in ucparts {
-                for sl in u.slices(p) {
-                    for r in sl.iter() {
-                        let mut i = (r.h >> 20) as usize & mask;
-                        let id = loop {
-                            let t = unsafe { *table.get_unchecked(i) };
-                            if t == 0 {
-                                let id = intern_long(unsafe { r.id() });
-                                seen.push((r as *const UCRec, id));
-                                unsafe { *table.get_unchecked_mut(i) = seen.len() as u32 };
-                                break id;
+            // every other long ID: compared by bytes
+            let n: usize = uparts.iter().map(|u| u.count(p)).sum::<usize>() + ucparts.iter().map(|u| u.0.count(p)).sum::<usize>();
+            if n > 0 {
+                let cap = (n * 2).next_power_of_two();
+                table.clear();
+                table.resize(cap, 0);
+                seen.clear();
+                let mask = cap - 1;
+                let mut find = |h: u64, b: &[u8]| -> Id {
+                    let mut i = (h >> 20) as usize & mask;
+                    loop {
+                        let t = unsafe { *table.get_unchecked(i) };
+                        if t == 0 {
+                            let id = intern_long(b);
+                            seen.push((b.as_ptr(), b.len() as u32, h, id));
+                            unsafe { *table.get_unchecked_mut(i) = seen.len() as u32 };
+                            return id;
+                        }
+                        let e = unsafe { seen.get_unchecked(t as usize - 1) };
+                        if e.2 == h && e.1 as usize == b.len() && unsafe { std::slice::from_raw_parts(e.0, e.1 as usize) } == b {
+                            return e.3;
+                        }
+                        i = (i + 1) & mask;
+                    }
+                };
+                for u in uparts {
+                    for sl in u.slices(p) {
+                        for r in sl.iter() {
+                            if r.ts != DEAD {
+                                let id = find(r.h, unsafe { r.id() });
+                                pw.push(part_of(id_hash(id), ctx.pbits), PRec { k: id, ts: r.ts, pc: r.pc });
                             }
-                            let (e, id) = unsafe { *seen.get_unchecked(t as usize - 1) };
-                            let e = unsafe { &*e };
-                            if e.h == r.h && e.len == r.len && unsafe { e.id() == r.id() } {
-                                break id;
-                            }
-                            i = (i + 1) & mask;
-                        };
-                        cw.push(part_of(id_hash(id), ctx.pbits), CRec { k: id, ts: r.ts, camp: r.camp, ptr: r.ptr });
+                        }
+                    }
+                }
+                for u in ucparts {
+                    for sl in u.0.slices(p) {
+                        for r in sl.iter() {
+                            let id = find(r.h, unsafe { r.id() });
+                            cw.push(part_of(id_hash(id), ctx.pbits), CRec { k: id, ts: r.ts, camp: r.camp, ptr: r.ptr });
+                        }
                     }
                 }
             }
         }
-        cw.finish()
-    })
+        (pw.finish(), cw.finish())
+    });
+    let (mut ev, mut cl) = (Vec::new(), Vec::new());
+    for (e, c) in res {
+        if any_ev {
+            ev.push(e);
+        }
+        if any_cl {
+            cl.push(c);
+        }
+    }
+    (ev, cl)
+}
+
+/// `resolve_long` for clicks alone.
+pub(crate) fn resolve_long_clicks(ctx: &Ctx, ucparts: &[(Parts<UCRec>, Parts<UCHRec>)], nthreads: usize, wc: bool) -> Vec<Parts<CRec>> {
+    resolve_long(ctx, &[], &[], ucparts, nthreads, wc).1
 }
 
 /// Whether `pack_id` packs these bytes into a word (else it interns them).
@@ -917,12 +1048,12 @@ struct PState {
     buf: ScanBuf,
     cache: DateCache,
     dates: crate::hop::HopDates,
-    uw: Writers<URec>,
+    uw: UW,
     dw: Writers<DRec>,
     lw: Writers<LRec>,
     pw: Writers<PRec>,
     cw: Writers<CRec>,
-    ucw: Writers<UCRec>,
+    ucw: UCW,
 }
 
 /// `ingest_ts` as a `DRec::ing`; sets `escape` when it does not fit.
@@ -947,7 +1078,7 @@ pub(crate) fn push_prec(ctx: &Ctx, pw: &mut Writers<PRec>, escape: &mut bool, ui
 /// One well-formed event line, by the general rules (`eval_event`), into the writers.
 #[cold]
 #[inline(never)]
-pub(crate) unsafe fn event_general(ctx: &Ctx, f: &[Field; 7], lim: *const u8, fix: usize, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) {
+pub(crate) unsafe fn event_general(ctx: &Ctx, f: &[Field; 7], lim: *const u8, fix: usize, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut UW, escape: &mut bool) {
     unsafe {
         let stage = ctx.stage;
         let r = eval_event(ctx, f, lim, cache);
@@ -982,7 +1113,7 @@ pub(crate) struct EvRow<'a> {
 
 /// One well-formed event line.
 #[inline(always)]
-unsafe fn event_row(ev: &EvRow, r: &Row, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) {
+unsafe fn event_row(ev: &EvRow, r: &Row, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut UW, escape: &mut bool) {
     unsafe {
         let l0 = r.len(0);
         if l0 == 0 {
@@ -1044,7 +1175,7 @@ unsafe fn event_row(ev: &EvRow, r: &Row, cache: &mut DateCache, pw: &mut Writers
 
 /// One well-formed click line (`row`: its first byte), by the general rules, into the writer.
 #[inline(always)]
-pub unsafe fn click_general(ctx: &Ctx, f: &[Field; 4], row: *const u8, lim: *const u8, fix: usize, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>) {
+pub unsafe fn click_general(ctx: &Ctx, f: &[Field; 4], row: *const u8, lim: *const u8, fix: usize, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut UCW) {
     unsafe {
         if f[0].1 == 0 || f[1].1 == 0 || f[2].1 == 0 {
             return;
@@ -1162,8 +1293,8 @@ fn run_rest(
     let nt_max = nthreads.max(1);
     let pregion_bytes = ev_bytes + nt_max * ((PBLOCK * std::mem::size_of::<PRec>() + 64) << pbits) + (nt_max + 1) * (16 << 20);
     // (the same for the `URec`s: a line with one has at least 32 bytes)
-    let uregion_bytes = ev_bytes + nt_max * ((UBLOCK * std::mem::size_of::<URec>() + 64) << lbits) + (nt_max + 1) * (16 << 20);
-    if pregion_bytes / std::mem::size_of::<PRec>() >= UFLAG as usize || uregion_bytes / std::mem::size_of::<URec>() >= UFLAG as usize {
+    let uregion_bytes = ev_bytes + 2 * nt_max * ((UBLOCK * std::mem::size_of::<URec>() + 64) << lbits) + (nt_max + 1) * (16 << 20);
+    if pregion_bytes / std::mem::size_of::<PRec>() >= UFLAG as usize || uregion_bytes / 32 >= HFLAG as usize {
         return false;
     }
     let pregion = Region::new(pregion_bytes);
@@ -1205,9 +1336,9 @@ fn run_rest(
             dw: Writers::with_wc(1 << dbits, 1024, wc),
             lw: Writers::with_wc(1 << lbits, 128, wc),
             pw: Writers::in_region(1 << pbits, PBLOCK, wc, pregion),
-            uw: Writers::in_region(1 << lbits, UBLOCK, wc, uregion),
+            uw: UW { g: Writers::in_region(1 << lbits, UBLOCK, wc, uregion), h: Writers::in_region(1 << lbits, 2 * UBLOCK, wc, uregion) },
             cw: Writers::with_wc(1 << pbits, 128, wc),
-            ucw: Writers::with_wc(1 << lbits, UCBLOCK, wc),
+            ucw: UCW::new(1 << lbits, UCBLOCK, wc),
         })
         .collect();
     let res = par(states, |_, mut st| {
@@ -1218,7 +1349,7 @@ fn run_rest(
             }
             unsafe { main_d(level, &ctx, &mut st, &jobs[j]) };
         }
-        (st.escape, st.dw.finish(), st.pw.finish(), st.cw.finish(), st.lw.finish(), st.uw.finish(), st.ucw.finish())
+        (st.escape, st.dw.finish(), st.pw.finish(), st.cw.finish(), st.lw.finish(), (st.uw.g.finish(), st.uw.h.finish()), st.ucw.finish())
     });
     if res.iter().any(|r| r.0) {
         // Some line did not fit the compact dedup record: the general path redoes everything.
@@ -1229,10 +1360,12 @@ fn run_rest(
     let mut cl = Vec::new();
     let mut lparts = Vec::new();
     let mut uparts = Vec::new();
+    let mut uhparts = Vec::new();
     let mut ucparts = Vec::new();
     for (_, d, p, c, l, u, uc) in res {
         ucparts.push(uc);
-        uparts.push(u);
+        uparts.push(u.0);
+        uhparts.push(u.1);
         lparts.push(l);
         dparts.push(d);
         ev.push(p);
@@ -1251,7 +1384,7 @@ fn run_rest(
     let (pbase_addr, ubase_addr) = (ctx.pregion.base, ctx.uregion.base);
     par((0..nthreads).collect::<Vec<usize>>(), |_, _| {
         let mut table: Vec<u64> = Vec::new();
-        let (pbase, ubase) = (pbase_addr as *mut PRec, ubase_addr as *mut URec);
+        let (pbase, ubase) = (pbase_addr as *mut PRec, ubase_addr as *mut u8);
         loop {
             let p = next.fetch_add(1, Relaxed);
             if p >= np {
@@ -1346,8 +1479,9 @@ fn run_rest(
         }
     });
     tm.lap("dedup");
-    ev.extend(resolve_long_users(&ctx, &uparts, nthreads, wc));
-    cl.extend(resolve_long_clicks(&ctx, &ucparts, nthreads, wc));
+    let (lev, lcl) = resolve_long(&ctx, &uparts, &uhparts, &ucparts, nthreads, wc);
+    ev.extend(lev);
+    cl.extend(lcl);
     tm.lap("long user IDs");
     let Some(links) = lh.join().unwrap() else { return false };
     let _ = ctx.links.set(links);
@@ -1408,7 +1542,7 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                 let nt = nt.min(jobs.len().max(1));
                 let next = AtomicUsize::new(0);
                 let states: Vec<PState> = (0..nt)
-                    .map(|_| PState { escape: false, slow: 0, rbuf: std::ptr::null_mut(), rcap: 0, buf: ScanBuf::new(), cache: DateCache::new(), dates: crate::hop::HopDates::new(),  dw: Writers::with_wc(1 << dbits, 1024, wc), lw: Writers::with_wc(1 << lbits, 128, wc), pw: Writers::in_region(1 << pbits, PBLOCK, wc, ctx.pregion), uw: Writers::in_region(1 << lbits, UBLOCK, wc, ctx.uregion), cw: Writers::with_wc(1 << pbits, 128, wc), ucw: Writers::with_wc(1 << lbits, UCBLOCK, wc) })
+                    .map(|_| PState { escape: false, slow: 0, rbuf: std::ptr::null_mut(), rcap: 0, buf: ScanBuf::new(), cache: DateCache::new(), dates: crate::hop::HopDates::new(),  dw: Writers::with_wc(1 << dbits, 1024, wc), lw: Writers::with_wc(1 << lbits, 128, wc), pw: Writers::in_region(1 << pbits, PBLOCK, wc, ctx.pregion), uw: UW { g: Writers::in_region(1 << lbits, UBLOCK, wc, ctx.uregion), h: Writers::in_region(1 << lbits, 2 * UBLOCK, wc, ctx.uregion) }, cw: Writers::with_wc(1 << pbits, 128, wc), ucw: UCW::new(1 << lbits, UCBLOCK, wc) })
                     .collect();
                 let t0 = std::time::Instant::now();
                 let res = par(states, |_, mut st| {
@@ -1419,14 +1553,14 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                         }
                         unsafe { main_d(level, &ctx, &mut st, &jobs[j]) };
                     }
-                    let _u = st.uw.finish();
+                    let _u = (st.uw.g.finish(), st.uw.h.finish());
                     (st.escape, st.slow, st.dw.finish(), st.pw.finish(), st.cw.finish(), st.lw.finish(), st.ucw.finish())
                 });
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
                 // clicks with a long user_id: resolved after the parse (timed apart)
                 let mut res = res;
-                let ucparts: Vec<Parts<UCRec>> = res.iter_mut().map(|r| std::mem::replace(&mut r.6, Writers::<UCRec>::new(1, 4).finish())).collect();
-                let nuc: usize = ucparts.iter().map(|u| (0..1usize << pbits).map(|q| u.count(q)).sum::<usize>()).sum();
+                let ucparts: Vec<(Parts<UCRec>, Parts<UCHRec>)> = res.iter_mut().map(|r| std::mem::replace(&mut r.6, UCW::new(1, 4, false).finish())).collect();
+                let nuc: usize = ucparts.iter().map(|u| (0..1usize << lbits).map(|q| u.0.count(q) + u.1.count(q)).sum::<usize>()).sum();
                 let t1 = std::time::Instant::now();
                 let resolved = resolve_long_clicks(&ctx, &ucparts, nt, wc);
                 let rms = t1.elapsed().as_secs_f64() * 1000.0;
@@ -1436,8 +1570,11 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                 // what a dedup record's `prec` names: (user key, ts, pc)
                 let view = |prec: u32| -> (u64, u32, u32) {
                     unsafe {
-                        if prec & UFLAG != 0 {
-                            let u = &*ubase.add((prec & !UFLAG) as usize);
+                        if prec & HFLAG != 0 {
+                            let u = &*((ubase as *const u8).add((prec & (HFLAG - 1)) as usize * 32) as *const UHRec);
+                            (bytes_hash(u.id().as_ptr(), 33) | LONG, u.ts, u.pc)
+                        } else if prec & UFLAG != 0 {
+                            let u = &*((ubase as *const u8).add((prec & (HFLAG - 1)) as usize * 32) as *const URec);
                             (u.h | LONG, u.ts, u.pc)
                         } else {
                             let p = &*pbase.add(prec as usize);
@@ -1731,24 +1868,30 @@ mod hop_tests {
             dw: Writers::with_wc(1 << ctx.dbits, 8, true),
             lw: Writers::with_wc(1 << ctx.lbits, 8, true),
             pw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.pregion),
-            uw: Writers::in_region(1 << ctx.lbits, 8, true, ctx.uregion),
+            uw: UW { g: Writers::in_region(1 << ctx.lbits, 8, true, ctx.uregion), h: Writers::in_region(1 << ctx.lbits, 8, true, ctx.uregion) },
             cw: Writers::with_wc(1 << ctx.pbits, 8, true),
-            ucw: Writers::with_wc(1 << ctx.lbits, 8, true),
+            ucw: UCW::new(1 << ctx.lbits, 8, true),
         };
         let mut jobs = Vec::new();
         make_jobs(&[data], 0, chunk, false, &mut jobs);
         for j in &jobs {
             unsafe { main_d(level, ctx, &mut st, j) };
         }
-        let (d, _p, l, _u) = (st.dw.finish(), st.pw.finish(), st.lw.finish(), st.uw.finish());
+        let (d, _p, l, _u) = (st.dw.finish(), st.pw.finish(), st.lw.finish(), (st.uw.g.finish(), st.uw.h.finish()));
         let pbase = ctx.pregion.base as *const PRec;
         let ubase = ctx.uregion.base as *const URec;
         let view = |prec: u32| -> Option<(Id, u32, u32)> {
             unsafe {
                 if prec == NOPREC {
                     None
+                } else if prec & HFLAG != 0 {
+                    let u = &*((ubase as *const u8).add((prec & (HFLAG - 1)) as usize * 32) as *const UHRec);
+                    let b = u.id();
+                    assert!(hex_key(b.as_ptr(), 33) == Some((u.hi, u.lo)));
+                    Some((bytes_hash(b.as_ptr(), 33) | LONG, u.ts, u.pc))
                 } else if prec & UFLAG != 0 {
-                    let u = &*ubase.add((prec & !UFLAG) as usize);
+                    let u = &*((ubase as *const u8).add((prec & (HFLAG - 1)) as usize * 32) as *const URec);
+                    assert!(hex_key(u.id().as_ptr(), u.id().len()).is_none());
                     let b = u.id();
                     if b.len() > UINLINE {
                         // (a long one is named by its place in the file)
@@ -1950,9 +2093,9 @@ mod hop_tests {
             dw: Writers::with_wc(1 << ctx.dbits, 8, true),
             lw: Writers::with_wc(1 << ctx.lbits, 8, true),
             pw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.pregion),
-            uw: Writers::in_region(1 << ctx.lbits, 8, true, ctx.uregion),
+            uw: UW { g: Writers::in_region(1 << ctx.lbits, 8, true, ctx.uregion), h: Writers::in_region(1 << ctx.lbits, 8, true, ctx.uregion) },
             cw: Writers::with_wc(1 << ctx.pbits, 8, true),
-            ucw: Writers::with_wc(1 << ctx.lbits, 8, true),
+            ucw: UCW::new(1 << ctx.lbits, 8, true),
         };
         let mut jobs = Vec::new();
         make_jobs(&[data], 1, chunk, false, &mut jobs);
