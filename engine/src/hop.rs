@@ -276,8 +276,8 @@ mod k {
     #[inline(always)]
     pub unsafe fn pack2(v0: V16, l0: usize, v1: V16, l1: usize) -> Ids {
         unsafe {
-            let m0 = _mm_load_si128(LEN_MASK.get_unchecked(l0).as_ptr() as *const __m128i);
-            let m1 = _mm_load_si128(LEN_MASK.get_unchecked(l1).as_ptr() as *const __m128i);
+            let m0 = _mm_loadu_si128(LEN_MASK.get_unchecked(l0).as_ptr() as *const __m128i);
+            let m1 = _mm_loadu_si128(LEN_MASK.get_unchecked(l1).as_ptr() as *const __m128i);
             let d = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_and_si128(v0, m0)), _mm_and_si128(v1, m1), 1);
             let w = _mm256_maddubs_epi16(_mm256_set1_epi16(0x0180), d);
             let dd = _mm256_madd_epi16(w, _mm256_set1_epi32(0x0001_4000));
@@ -299,8 +299,8 @@ mod k {
     pub unsafe fn ts_misfit(s: *const u8, k: usize) -> bool {
         unsafe {
             let v = _mm256_loadu_si256(s as *const __m256i);
-            let x = _mm256_sub_epi8(v, _mm256_load_si256(TS_PAT.lo.get_unchecked(k).as_ptr() as *const __m256i));
-            let over = _mm256_subs_epu8(x, _mm256_load_si256(TS_PAT.rng.get_unchecked(k).as_ptr() as *const __m256i));
+            let x = _mm256_sub_epi8(v, _mm256_loadu_si256(TS_PAT.lo.get_unchecked(k).as_ptr() as *const __m256i));
+            let over = _mm256_subs_epu8(x, _mm256_loadu_si256(TS_PAT.rng.get_unchecked(k).as_ptr() as *const __m256i));
             _mm256_testz_si256(over, over) == 0
         }
     }
@@ -310,8 +310,8 @@ mod k {
     pub unsafe fn type_misfit(s: *const u8, k: usize) -> bool {
         unsafe {
             let v = _mm_loadu_si128(s as *const __m128i);
-            let x = _mm_xor_si128(v, _mm_load_si128(TYPE_PAT.pat.get_unchecked(k).as_ptr() as *const __m128i));
-            _mm_testz_si128(x, _mm_load_si128(TYPE_PAT.mask.get_unchecked(k).as_ptr() as *const __m128i)) == 0
+            let x = _mm_xor_si128(v, _mm_loadu_si128(TYPE_PAT.pat.get_unchecked(k).as_ptr() as *const __m128i));
+            _mm_testz_si128(x, _mm_loadu_si128(TYPE_PAT.mask.get_unchecked(k).as_ptr() as *const __m128i)) == 0
         }
     }
 

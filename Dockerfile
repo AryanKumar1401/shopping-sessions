@@ -1,7 +1,7 @@
 # Shopping Sessions: Rust engine, static binary in an empty image.
 # The scorer builds natively on linux/amd64 (Intel Cascade Lake or newer).
 # The arch switch only exists so the same file builds natively on arm64 for local benchmarking.
-FROM rust:1-bookworm AS build
+FROM rust:1.100-bookworm AS build
 WORKDIR /src
 COPY engine/Cargo.toml engine/Cargo.lock ./
 COPY engine/src ./src
