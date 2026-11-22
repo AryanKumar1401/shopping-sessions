@@ -779,7 +779,7 @@ dispatch!(main_d, main_g, (ctx: &Ctx, st: &mut PState, job: &Job));
 
 /// Dedup variant (SE_DEDUP): 0 = one table of record pointers per partition, 1 = the same with
 /// the slot of a later record prefetched, 2 = `dedup_grouped`.
-const DEDUP_MODE: usize = 0;
+const DEDUP_MODE: usize = 1;
 /// Experiment defaults: link-build threads; 1 = build the links before the parse (measurement).
 const LINK_THREADS: usize = 2;
 const LINKS_FIRST: usize = 0;
