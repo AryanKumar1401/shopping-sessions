@@ -336,6 +336,8 @@ pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<U
         let mut seen: Vec<(*const u8, u32, u64, Id)> = Vec::new();
         // (hi, lo, first byte, Id)
         let mut hseen: Vec<(u64, u64, u32, Id)> = Vec::new();
+        // the bytes and interner hash of each of `hseen`
+        let mut ids: Vec<([u8; 33], u64)> = Vec::new();
         while let Some(&(_, p)) = order.get(next.fetch_add(1, Relaxed)) {
             // the hexadecimal kind: keys compared as words
             let n: usize = uhparts.iter().map(|u| u.count(p)).sum::<usize>() + ucparts.iter().map(|u| u.1.count(p)).sum::<usize>();
@@ -345,16 +347,62 @@ pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<U
                 table.resize(cap, 0);
                 hseen.clear();
                 let mask = cap - 1;
+                // Two passes: the distinct IDs first, then the records with their Ids. In
+                // between, the distinct IDs are interned in order with the interner's table
+                // word and record prefetched a few IDs ahead (most are lookups of IDs the link
+                // build interned, two cache misses each).
                 let mut find = |hi: u64, lo: u64, pre: u32| -> Id {
                     let mut i = (hex_hash(hi, lo, pre) >> 20) as usize & mask;
                     loop {
                         let t = unsafe { *table.get_unchecked(i) };
                         if t == 0 {
-                            let id = intern_long(&UHRec { hi, ts: 0, pc: 0, lo, pre, pad: 0 }.id());
-                            hseen.push((hi, lo, pre, id));
+                            hseen.push((hi, lo, pre, 0));
                             unsafe { *table.get_unchecked_mut(i) = hseen.len() as u32 };
-                            return id;
+                            return 0;
                         }
+                        let e = unsafe { hseen.get_unchecked(t as usize - 1) };
+                        if (e.0 == hi) & (e.1 == lo) & (e.2 == pre) {
+                            return e.3;
+                        }
+                        i = (i + 1) & mask;
+                    }
+                };
+                for u in uhparts {
+                    for sl in u.slices(p) {
+                        for r in sl.iter() {
+                            if r.ts != DEAD {
+                                find(r.hi, r.lo, r.pre);
+                            }
+                        }
+                    }
+                }
+                for u in ucparts {
+                    for sl in u.1.slices(p) {
+                        for r in sl.iter() {
+                            find(r.hi, r.lo, r.cp >> 24);
+                        }
+                    }
+                }
+                ids.clear();
+                ids.extend(hseen.iter().map(|e| {
+                    let b = UHRec { hi: e.0, ts: 0, pc: 0, lo: e.1, pre: e.2, pad: 0 }.id();
+                    (b, intern_hash(&b))
+                }));
+                for k in 0..ids.len() {
+                    if let Some(x) = ids.get(k + 8) {
+                        intern_prefetch(x.1, false);
+                    }
+                    if let Some(x) = ids.get(k + 4) {
+                        intern_prefetch(x.1, true);
+                    }
+                    hseen[k].3 = intern_long_h(&ids[k].0, ids[k].1);
+                }
+                // (every ID is in the table now: the same records went through the first pass)
+                let find = |hi: u64, lo: u64, pre: u32| -> Id {
+                    let mut i = (hex_hash(hi, lo, pre) >> 20) as usize & mask;
+                    loop {
+                        let t = unsafe { *table.get_unchecked(i) };
+                        assert!(t != 0);
                         let e = unsafe { hseen.get_unchecked(t as usize - 1) };
                         if (e.0 == hi) & (e.1 == lo) & (e.2 == pre) {
                             return e.3;
