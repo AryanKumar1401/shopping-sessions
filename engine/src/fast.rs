@@ -399,7 +399,8 @@ fn prof_add(i: usize, t0: std::time::Instant) -> std::time::Instant {
 fn prof_print(tm: &Timer, which: std::ops::Range<usize>) {
     if tm.on {
         for i in which {
-            eprintln!("[prof] {:<16} {:>9.1} ms (summed over threads)", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e6);
+            // (diagnostic build: in the `[timing]` form, so that bench.py shows them as phases)
+            eprintln!("[timing] ~{:<27} wall {:>9.3} ms   user {:>9.3} ms   sys {:>8.3} ms   (t=0.000 ms)", PROF_NAMES[i], 0.0, PROF[i].load(Relaxed) as f64 / 1e6, 0.0);
         }
     }
 }
