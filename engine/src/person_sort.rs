@@ -1,25 +1,32 @@
-// SE_PEOPLE=sort: "sort once, then scan columns" (included into person.rs).
+// The flat sweep of the people stage (included into person.rs).
 //
-// Pass A: the events of a partition are sorted by (ID, 30-minute bucket) with two counting
-// passes; one linear scan turns each ID's timestamps into bucket aggregates [min, max, count].
-// An unlinked ID's aggregates are chained into sessions right away; a linked ID's aggregates
-// leave as one run for the partition of the person's name. Clicks and purchases of linked IDs
-// leave as flat (name, ts, payload) records.
-// Pass B: the aggregates of a partition are sorted by (person, bucket), merged and chained.
-// Both passes then hold the partition's sessions as one array ordered by (person, start), its
-// clicks as one array sorted by (person, ts) and its purchases likewise, and `sweep_flat`
-// credits, counts assists and writes the rows of all its people in linear scans.
+// The front end is the one described in person.rs (group by ID, 30-minute buckets, runs for
+// linked IDs). But instead of sweeping person by person, a partition's sessions are laid out
+// as one array ordered by (person, start), its clicks as one array sorted by (person, ts) and
+// its purchases likewise, and `sweep_flat` credits, counts assists and writes the rows of all
+// its people in a few linear scans: no per-person loop nest, no per-campaign `on` table.
+//
+// (A fully sorted front end - events radix-sorted by (ID, bucket), flat routing of linked
+// records - was measured and is slower than grouping + buckets; see commit f3edf6c.)
 
-/// SE_PEOPLE: `sort` = 2 (sorted front end and flat sweep), `flat` = 1 (the grouping front end
-/// feeding the flat sweep), anything else = 0.
+/// SE_PEOPLE=person restores the per-person sweep (`person`); the default is the flat sweep.
 fn people_mode() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("SE_PEOPLE").as_deref() {
-        Ok("sort") => 2,
-        Ok("flat") => 1,
-        Ok("flatb") => 3,
-        _ => 0,
+        Ok("person") => 0,
+        _ => 1,
     })
+}
+
+fn env_usize(k: &str) -> Option<usize> {
+    std::env::var(k).ok().and_then(|v| v.parse().ok())
+}
+
+/// Debug knob SE_WIDE_AT: partitions with more sessions than this count into the 64-bit
+/// counters directly (default 60000; at most that).
+fn wide_at() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("SE_WIDE_AT").map_or(60_000, |v| v.min(60_000)))
 }
 
 const FLAT_PROF: [&str; 32] = [
@@ -28,27 +35,6 @@ const FLAT_PROF: [&str; 32] = [
     "S rows", "S purchases", "S credit", "S window", "S assists", "S emit", "", "",
     "", "", "", "", "", "", "", "(write calls)",
 ];
-const SORT_PROF: [&str; 32] = [
-    "A scan events", "A scan clicks", "A link lookups", "A sort events", "A route clicks", "A purchases", "A aggs+sessions", "A sort clicks",
-    "B read runs", "B read clicks", "B sort aggs", "B sessions", "B purchases", "B sort clicks", "", "",
-    "S rows", "S purchases", "S credit", "S window", "S assists", "S emit", "", "",
-    "", "", "", "", "", "", "", "(write calls)",
-];
-
-/// Events of one ID (or person) in one 30-minute bucket.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct Agg {
-    min: u32,
-    max: u32,
-    cnt: u32,
-}
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct AggR {
-    rank: u32,
-    a: Agg,
-}
 /// A session of the person `rank` of the partition.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -67,32 +53,7 @@ struct FClk {
     /// which click (for `ptr_of`: the click line is only needed to break a tie)
     j: u32,
 }
-/// What pass A sends on for a click (`ptr != 0`, `x` = campaign) or a purchase (`ptr == 0`,
-/// `x` = category * PRICE_MUL + price) of a linked ID.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct FRec {
-    name: Id,
-    ptr: usize,
-    ts: u32,
-    x: u32,
-}
-const AGG_HDR: usize = 16;
-#[inline(always)]
-fn agg_run_bytes(n: usize) -> usize {
-    AGG_HDR + ((n * 12 + 7) & !7)
-}
-
 struct Flat {
-    nb: usize,
-    k0: Vec<u64>,
-    k1: Vec<u64>,
-    hist: Vec<u32>,
-    aggbuf: Vec<Agg>,
-    ar: Vec<AggR>,
-    ar2: Vec<AggR>,
-    aggs: Vec<Agg>,
-    dest: Vec<u32>,
     /// sessions by (rank, start)
     ss: Vec<FS>,
     sk: Vec<u64>,
@@ -105,29 +66,17 @@ struct Flat {
     r_cat: Vec<u32>,
     s_rev: Vec<u64>,
     fc: Vec<FClk>,
-    fct: Vec<FClk>,
-    ch: Vec<u32>,
     cptr: Vec<usize>,
     sa: Vec<u32>,
     sw: Vec<u32>,
-    purch: Vec<(u64, u32)>,
     fpu: Vec<(u64, u32)>,
     prof: [u64; 32],
     t0: std::time::Instant,
 }
 
 impl Flat {
-    fn new(span: u32) -> Self {
+    fn new() -> Self {
         Flat {
-            nb: (span / BW) as usize + 1,
-            k0: Vec::new(),
-            k1: Vec::new(),
-            hist: Vec::new(),
-            aggbuf: Vec::new(),
-            ar: Vec::new(),
-            ar2: Vec::new(),
-            aggs: Vec::new(),
-            dest: Vec::new(),
             ss: Vec::new(),
             sk: Vec::new(),
             row_of: Vec::new(),
@@ -138,12 +87,9 @@ impl Flat {
             r_cat: Vec::new(),
             s_rev: Vec::new(),
             fc: Vec::new(),
-            fct: Vec::new(),
-            ch: Vec::new(),
             cptr: Vec::new(),
             sa: Vec::new(),
             sw: Vec::new(),
-            purch: Vec::new(),
             fpu: Vec::new(),
             prof: [0; 32],
             t0: std::time::Instant::now(),
@@ -154,126 +100,6 @@ impl Flat {
         let n = std::time::Instant::now();
         self.prof[i] += (n - self.t0).as_nanos() as u64;
         self.t0 = n;
-    }
-}
-
-/// Counts to starting offsets.
-#[inline(always)]
-fn prefix(h: &mut [u32]) {
-    let mut s = 0u32;
-    for x in h {
-        let c = *x;
-        *x = s;
-        s += c;
-    }
-}
-
-/// One counting-sort pass: `src[j]` goes to `dst[cur[digit(src[j])]++]`.
-#[inline(always)]
-unsafe fn scatter<T: Copy>(src: &[T], dst: *mut T, cur: &mut [u32], digit: impl Fn(&T) -> usize) {
-    unsafe {
-        for x in src {
-            let c = cur.get_unchecked_mut(digit(x));
-            *dst.add(*c as usize) = *x;
-            *c += 1;
-        }
-    }
-}
-
-/// Bucket aggregates of timestamps that are ordered by bucket. Returns how many.
-#[inline(always)]
-unsafe fn agg_run(t: &[u32], out: *mut Agg) -> usize {
-    unsafe {
-        let mut k = 0usize;
-        let mut pb = u32::MAX;
-        let (mut mn, mut mx, mut cnt) = (0u32, 0u32, 0u32);
-        for &x in t {
-            let b = x / BW;
-            let new = b != pb;
-            pb = b;
-            k += new as usize;
-            mn = if new { x } else { mn.min(x) };
-            mx = if new { x } else { mx.max(x) };
-            cnt = if new { 1 } else { cnt + 1 };
-            *out.add(k - 1) = Agg { min: mn, max: mx, cnt };
-        }
-        k
-    }
-}
-
-/// Merges neighbours of the same bucket (aggregates ordered by bucket), in place.
-#[inline(always)]
-fn merge_buckets(a: &mut [Agg]) -> usize {
-    let mut k = 0usize;
-    let mut pb = u32::MAX;
-    let (mut mn, mut mx, mut cnt) = (0u32, 0u32, 0u32);
-    for j in 0..a.len() {
-        let e = a[j];
-        let b = e.min / BW;
-        let new = b != pb;
-        pb = b;
-        k += new as usize;
-        mn = if new { e.min } else { mn.min(e.min) };
-        mx = if new { e.max } else { mx.max(e.max) };
-        cnt = if new { e.cnt } else { cnt + e.cnt };
-        a[k - 1] = Agg { min: mn, max: mx, cnt };
-    }
-    k
-}
-
-/// Sessions of one person from their aggregates (one per bucket, ascending, not empty), written
-/// at `out[k..]`. Returns the new session count.
-#[inline(always)]
-unsafe fn sess_from_aggs(a: &[Agg], rank: u32, out: *mut FS, mut k: usize) -> usize {
-    unsafe {
-        let e = *a.get_unchecked(0);
-        let (mut start, mut end, mut n) = (e.min, e.max, e.cnt);
-        *out.add(k) = FS { start, end, n, rank };
-        k += 1;
-        for e in &a[1..] {
-            let new = e.min - end > GAP;
-            k += new as usize;
-            start = if new { e.min } else { start };
-            n = if new { e.cnt } else { n + e.cnt };
-            end = e.max;
-            *out.add(k - 1) = FS { start, end, n, rank };
-        }
-        k
-    }
-}
-
-/// Sorts the clicks by key (rank, ts); `nk` = number of ranks.
-fn sort_fc(fc: &mut Vec<FClk>, tmp: &mut Vec<FClk>, h: &mut Vec<u32>, nk: usize) {
-    let n = fc.len();
-    if n < 48 || n >= u32::MAX as usize {
-        fc.sort_unstable_by_key(|c| c.key);
-        return;
-    }
-    const D: usize = 2048;
-    h.clear();
-    h.resize(3 * D + nk, 0);
-    unsafe {
-        for x in fc.iter() {
-            let k = x.key;
-            *h.get_unchecked_mut(k as usize & (D - 1)) += 1;
-            *h.get_unchecked_mut(D + ((k >> 11) as usize & (D - 1))) += 1;
-            *h.get_unchecked_mut(2 * D + ((k >> 22) as usize & (D - 1))) += 1;
-            *h.get_unchecked_mut(3 * D + (k >> 33) as usize) += 1;
-        }
-        let (h0, r) = h.split_at_mut(D);
-        let (h1, r) = r.split_at_mut(D);
-        let (h2, h3) = r.split_at_mut(D);
-        prefix(h0);
-        prefix(h1);
-        prefix(h2);
-        prefix(h3);
-        tmp.clear();
-        tmp.reserve(n);
-        tmp.set_len(n);
-        scatter(fc, tmp.as_mut_ptr(), h0, |x| x.key as usize & (D - 1));
-        scatter(tmp, fc.as_mut_ptr(), h1, |x| (x.key >> 11) as usize & (D - 1));
-        scatter(fc, tmp.as_mut_ptr(), h2, |x| (x.key >> 22) as usize & (D - 1));
-        scatter(tmp, fc.as_mut_ptr(), h3, |x| (x.key >> 33) as usize);
     }
 }
 
@@ -316,7 +142,7 @@ fn sweep_flat(ctx: &Ctx, o: &mut Out, f: &mut Flat, names: &[Id], ptr_of: &dyn F
     let (nd, organic, day_off) = (o.nd, o.organic as u32, o.day_off);
     // No 16-bit counter gets more than one per session; a partition with more sessions than
     // that counts into the wide counters directly.
-    let wide = ns > 60_000;
+    let wide = ns > wide_at();
     if o.hot_n as usize + ns > u16::MAX as usize {
         o.fold_hot();
     }
@@ -644,333 +470,7 @@ fn best_cat(o: &mut Out) -> u32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// The line of click `j` of partition `q` (in the order of its records).
-#[cold]
-#[inline(never)]
-fn nth_click(cl: &[Parts<CRec>], q: usize, j: u32) -> usize {
-    let mut j = j as usize;
-    for p in cl {
-        for sl in p.slices(q) {
-            if j < sl.len() {
-                return sl[j].ptr;
-            }
-            j -= sl.len();
-        }
-    }
-    unreachable!()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn pass_a_sort(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: &mut Scratch, f: &mut Flat, o: &mut Out, runs: &mut RunOut, cruns: &mut RunOut) {
-    let n: usize = ev.iter().map(|p| p.count(q)).sum();
-    let nc: usize = cl.iter().map(|p| p.count(q)).sum();
-    if n + nc == 0 {
-        return;
-    }
-    f.t0 = std::time::Instant::now();
-    sc.reset();
-    f.purch.clear();
-    f.k0.clear();
-    f.k0.reserve(n);
-    f.hist.clear();
-    f.hist.resize(f.nb, 0);
-    let mut m = 0usize;
-    {
-        let k0 = f.k0.as_mut_ptr();
-        for p in ev {
-            for sl in p.slices(q) {
-                for r in sl.iter() {
-                    if r.ts == DEAD {
-                        continue;
-                    }
-                    let idx = sc.get_or_insert(r.k);
-                    unsafe {
-                        *sc.cnt.get_unchecked_mut(idx as usize) += 1;
-                        *k0.add(m) = ((idx as u64) << 32) | r.ts as u64;
-                        *f.hist.get_unchecked_mut((r.ts / BW) as usize) += 1;
-                    }
-                    m += 1;
-                    if r.pc != 0 {
-                        f.purch.push((((idx as u64) << 33) | r.ts as u64, r.pc));
-                    }
-                }
-            }
-        }
-        unsafe { f.k0.set_len(m) };
-    }
-    let n = m;
-    if env_recycle() {
-        for p in ev {
-            for sl in p.slices(q) {
-                let base = sl.as_ptr() as usize;
-                if base % 8 == 0 {
-                    for k in 0..sl.len() * std::mem::size_of::<PRec>() / RUN_BLOCK {
-                        runs.free.push(base + k * RUN_BLOCK);
-                    }
-                }
-            }
-        }
-    }
-    f.lap(0);
-    sc.cidx.clear();
-    sc.cidx.reserve(nc);
-    {
-        let ci = sc.cidx.as_mut_ptr();
-        let mut m = 0usize;
-        for p in cl {
-            for sl in p.slices(q) {
-                for r in sl.iter() {
-                    let idx = sc.get_or_insert(r.k);
-                    unsafe { *ci.add(m) = idx };
-                    m += 1;
-                }
-            }
-        }
-        unsafe { sc.cidx.set_len(m) };
-    }
-    let nk = sc.keys.len();
-    f.lap(1);
-    // one link lookup per distinct ID
-    sc.names.clear();
-    f.dest.clear();
-    f.dest.resize(nk, 0);
-    let links = ctx.links.get().unwrap();
-    if links.any {
-        const AHEAD: usize = 8;
-        for i in 0..nk.min(AHEAD) {
-            links.prefetch(id_hash(sc.keys[i]));
-        }
-        for i in 0..nk {
-            if i + AHEAD < nk {
-                links.prefetch(id_hash(sc.keys[i + AHEAD]));
-            }
-            let k = sc.keys[i];
-            let name = links.lookup(k, id_hash(k));
-            sc.names.push(name);
-            if name != 0 {
-                f.dest[i] = part_of(id_hash(name), ctx.pbits) as u32;
-            }
-        }
-    } else {
-        sc.names.resize(nk, 0);
-    }
-    f.lap(2);
-    // events by (ID, bucket): one pass by bucket, one by ID
-    prefix(&mut f.hist);
-    f.k1.clear();
-    f.k1.reserve(n);
-    sc.off.clear();
-    sc.cur.clear();
-    let mut sum = 0u32;
-    for &c in &sc.cnt {
-        sc.off.push(sum);
-        sc.cur.push(sum);
-        sum += c;
-    }
-    sc.off.push(sum);
-    sc.ts.clear();
-    sc.ts.reserve(n + OVER);
-    unsafe {
-        scatter(&f.k0, f.k1.as_mut_ptr(), &mut f.hist, |&k| (k as u32 / BW) as usize);
-        f.k1.set_len(n);
-        let ts = sc.ts.as_mut_ptr();
-        for &k in &f.k1 {
-            let c = sc.cur.get_unchecked_mut((k >> 32) as usize);
-            *ts.add(*c as usize) = k as u32;
-            *c += 1;
-        }
-        sc.ts.set_len(n);
-    }
-    f.lap(3);
-    // aggregates per ID; sessions of the unlinked, runs of the linked
-    f.aggbuf.clear();
-    f.aggbuf.reserve(n + 4);
-    f.ss.clear();
-    f.ss.reserve(n + 1);
-    let mut nss = 0usize;
-    unsafe {
-        let ab = f.aggbuf.as_mut_ptr();
-        let ss = f.ss.as_mut_ptr();
-        for i in 0..nk {
-            let (a, b) = (*sc.off.get_unchecked(i) as usize, *sc.off.get_unchecked(i + 1) as usize);
-            if a == b {
-                continue;
-            }
-            let na = agg_run(sc.ts.get_unchecked(a..b), ab);
-            let name = *sc.names.get_unchecked(i);
-            if name == 0 {
-                nss = sess_from_aggs(std::slice::from_raw_parts(ab, na), i as u32, ss, nss);
-            } else {
-                let p = runs.alloc(*f.dest.get_unchecked(i) as usize, agg_run_bytes(na));
-                (p as *mut u64).write(name);
-                (p.add(8) as *mut u64).write(na as u64);
-                copy_over(ab as *const u8, p.add(AGG_HDR), na * 12);
-            }
-        }
-        f.ss.set_len(nss);
-    }
-    f.lap(6);
-    // clicks: the unlinked stay, the linked go to their person's partition
-    f.fc.clear();
-    f.fc.reserve(nc);
-    {
-        let mut j = 0usize;
-        for p in cl {
-            for sl in p.slices(q) {
-                for r in sl.iter() {
-                    let i = unsafe { *sc.cidx.get_unchecked(j) } as usize;
-                    j += 1;
-                    let name = unsafe { *sc.names.get_unchecked(i) };
-                    if name == 0 {
-                        f.fc.push(FClk { key: ((i as u64) << 33) | r.ts as u64, camp: r.camp, j: j as u32 - 1 });
-                    } else {
-                        let p = cruns.alloc(f.dest[i] as usize, 24) as *mut FRec;
-                        unsafe { p.write(FRec { name, ptr: r.ptr, ts: r.ts, x: r.camp }) };
-                    }
-                }
-            }
-        }
-    }
-    f.lap(4);
-    f.fpu.clear();
-    if !f.purch.is_empty() {
-        f.purch.sort_unstable();
-        for &(k, pc) in &f.purch {
-            let i = (k >> 33) as usize;
-            let name = sc.names[i];
-            if name == 0 {
-                f.fpu.push((k, pc));
-            } else {
-                let p = cruns.alloc(f.dest[i] as usize, 24) as *mut FRec;
-                unsafe { p.write(FRec { name, ptr: 0, ts: k as u32, x: pc }) };
-            }
-        }
-    }
-    f.lap(5);
-    if nss == 0 {
-        return;
-    }
-    sort_fc(&mut f.fc, &mut f.fct, &mut f.ch, nk);
-    f.lap(7);
-    sweep_flat(ctx, o, f, &sc.keys, &|j| nth_click(cl, q, j));
-}
-
-fn pass_b_sort(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], cblocks: &[Vec<Vec<(usize, usize)>>], sc: &mut Scratch, f: &mut Flat, o: &mut Out) {
-    f.t0 = std::time::Instant::now();
-    sc.reset();
-    f.ar.clear();
-    f.hist.clear();
-    f.hist.resize(f.nb, 0);
-    for th in blocks {
-        for &(st, used) in &th[d] {
-            let (mut p, end) = (st, st + used);
-            while p < end {
-                unsafe {
-                    let name = *(p as *const u64);
-                    let na = *((p + 8) as *const u64) as usize;
-                    let idx = sc.get_or_insert(name);
-                    *sc.cnt.get_unchecked_mut(idx as usize) += na as u32;
-                    let ap = (p + AGG_HDR) as *const Agg;
-                    f.ar.reserve(na);
-                    let l = f.ar.len();
-                    let w = f.ar.as_mut_ptr().add(l);
-                    for j in 0..na {
-                        let a = *ap.add(j);
-                        *f.hist.get_unchecked_mut((a.min / BW) as usize) += 1;
-                        *w.add(j) = AggR { rank: idx, a };
-                    }
-                    f.ar.set_len(l + na);
-                    p += agg_run_bytes(na);
-                }
-            }
-        }
-    }
-    let n = f.ar.len();
-    if n == 0 {
-        return;
-    }
-    f.lap(8);
-    f.fc.clear();
-    f.fpu.clear();
-    f.cptr.clear();
-    let (mut last, mut last_idx) = (0u64, 0u32);
-    for th in cblocks {
-        for &(st, used) in &th[d] {
-            let recs = unsafe { std::slice::from_raw_parts(st as *const FRec, used / 24) };
-            for r in recs {
-                if r.name != last {
-                    last = r.name;
-                    last_idx = sc.get_or_insert(r.name);
-                }
-                let key = ((last_idx as u64) << 33) | r.ts as u64;
-                if r.ptr != 0 {
-                    f.fc.push(FClk { key, camp: r.x, j: f.cptr.len() as u32 });
-                    f.cptr.push(r.ptr);
-                } else {
-                    f.fpu.push((key, r.x));
-                }
-            }
-        }
-    }
-    let nk = sc.keys.len();
-    f.lap(9);
-    // aggregates by (person, bucket)
-    prefix(&mut f.hist);
-    f.ar2.clear();
-    f.ar2.reserve(n);
-    sc.off.clear();
-    sc.cur.clear();
-    let mut sum = 0u32;
-    for &c in &sc.cnt {
-        sc.off.push(sum);
-        sc.cur.push(sum);
-        sum += c;
-    }
-    sc.off.push(sum);
-    f.aggs.clear();
-    f.aggs.reserve(n);
-    unsafe {
-        scatter(&f.ar, f.ar2.as_mut_ptr(), &mut f.hist, |x| (x.a.min / BW) as usize);
-        f.ar2.set_len(n);
-        let ag = f.aggs.as_mut_ptr();
-        for x in &f.ar2 {
-            let c = sc.cur.get_unchecked_mut(x.rank as usize);
-            *ag.add(*c as usize) = x.a;
-            *c += 1;
-        }
-        f.aggs.set_len(n);
-    }
-    f.lap(10);
-    f.ss.clear();
-    f.ss.reserve(n + 1);
-    let mut nss = 0usize;
-    unsafe {
-        let ss = f.ss.as_mut_ptr();
-        for i in 0..nk {
-            let (a, b) = (*sc.off.get_unchecked(i) as usize, *sc.off.get_unchecked(i + 1) as usize);
-            if a == b {
-                continue;
-            }
-            let sl = f.aggs.get_unchecked_mut(a..b);
-            let na = merge_buckets(sl);
-            nss = sess_from_aggs(&sl[..na], i as u32, ss, nss);
-        }
-        f.ss.set_len(nss);
-    }
-    f.lap(11);
-    f.fpu.sort_unstable();
-    f.lap(12);
-    sort_fc(&mut f.fc, &mut f.fct, &mut f.ch, nk);
-    f.lap(13);
-    let cptr = std::mem::take(&mut f.cptr);
-    sweep_flat(ctx, o, f, &sc.keys, &|j| cptr[j as usize]);
-    f.cptr = cptr;
-}
-
-// ---------------------------------------------------------------- SE_PEOPLE=flat
-// The grouping front end of the default mode (group by ID, 30-minute buckets, runs for linked
-// IDs) feeding `sweep_flat`: sessions, clicks and purchases of a partition's people are laid
-// out as flat arrays ordered by (person, time) instead of being swept person by person.
+// ---------------------------------------------------------------- the passes
 
 impl Buckets {
     /// `drain` into flat sessions of `rank`.

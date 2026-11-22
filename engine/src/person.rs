@@ -170,7 +170,7 @@ struct Out {
     /// bytes of a value of the sessions and events columns: 4 (INT32) or 8
     cw: usize,
     file: PqFile,
-    /// SE_PEOPLE=flat|sort: per campaign, the first session (in `mark_top` coordinates) of the
+    /// The flat sweep: per campaign, the first session (in `mark_top` coordinates) of the
     /// click of that campaign handled last by the backward assist scan
     mark: Vec<u32>,
     mark_top: u32,
@@ -1178,37 +1178,33 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
             cw: if narrow { 4 } else { 8 },
             file,
             mark: vec![u32::MAX; ncamp],
-            mark_top: u32::MAX - 1,
+            // (debug knob SE_MARK_TOP: start low, to exercise the refill)
+            mark_top: env_usize("SE_MARK_TOP").map_or(u32::MAX - 1, |v| v as u32),
         };
         o.reserve_group();
         let mut sc = Scratch::new((ctx.we - ctx.cbase) as u32);
         let mut runs = RunOut::new(np);
-        let mut cruns = RunOut::new(np);
-        let mut fl = Flat::new((ctx.we - ctx.cbase) as u32);
+        let mut fl = Flat::new();
         loop {
             let j = next.fetch_add(1, Relaxed);
             if j >= np {
                 break;
             }
             match mode {
-                2 => pass_a_sort(ctx, order[j] as usize, ev, cl, &mut sc, &mut fl, &mut o, &mut runs, &mut cruns),
                 1 => pass_a_flat(ctx, order[j] as usize, ev, cl, &mut sc, &mut fl, &mut o, &mut runs),
                 _ => pass_a(ctx, order[j] as usize, ev, cl, &mut sc, &mut o, &mut runs),
             }
         }
-        (o, sc, fl, runs.finish(), cruns.finish())
+        (o, sc, fl, runs.finish())
     });
     tm.lap("people A (by user id)");
     let mut states = Vec::new();
     let mut blocks = Vec::new();
-    let mut cblocks = Vec::new();
-    for (o, sc, fl, b, cb) in res {
+    for (o, sc, fl, b) in res {
         states.push((o, sc, fl));
         blocks.push(b);
-        cblocks.push(cb);
     }
     let blocks = &blocks;
-    let cblocks = &cblocks;
     let order = largest_first(np, |d| blocks.iter().map(|b| b[d].iter().map(|x| x.1).sum::<usize>()).sum());
     let next = AtomicUsize::new(0);
     let accs = par(states, |_, (mut o, mut sc, mut fl)| {
@@ -1218,8 +1214,7 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
                 break;
             }
             match mode {
-                2 => pass_b_sort(ctx, order[j] as usize, blocks, cblocks, &mut sc, &mut fl, &mut o),
-                1 | 3 => pass_b_flat(ctx, order[j] as usize, blocks, &mut sc, &mut fl, &mut o),
+                1 => pass_b_flat(ctx, order[j] as usize, blocks, &mut sc, &mut fl, &mut o),
                 _ => pass_b(ctx, order[j] as usize, blocks, &mut sc, &mut o),
             }
         }
@@ -1234,8 +1229,7 @@ pub fn run(ctx: &Ctx, ev: &[Parts<PRec>], cl: &[Parts<CRec>], out: &Path, nthrea
         (o.acc, sc.prof)
     });
     if tm.on && mode != 0 {
-        let names = if mode == 2 { &SORT_PROF } else { &FLAT_PROF };
-        for (i, nm) in names.iter().enumerate() {
+        for (i, nm) in FLAT_PROF.iter().enumerate() {
             let t: u64 = accs.iter().map(|a| a.1[i]).sum();
             if !nm.is_empty() {
                 eprintln!("[prof] {:<16} {:>9.1} ms (summed over threads)", nm, t as f64 / 1e6);
