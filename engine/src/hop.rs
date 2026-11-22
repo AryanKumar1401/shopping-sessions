@@ -1057,10 +1057,17 @@ pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, dates: &mut Ho
 
 // ---------------------------------------------------------------- click rows
 
-/// The same walk for click lines, `click_id , user_id , campaign_id , ts \n`: three IDs of the
-/// usual shape (the click_id not empty) and a 13-digit F3, F1 or F2 `ts` that ends the line.
+/// The same walk for click lines, `click_id , user_id , campaign_id , ts \n`: a click_id of 1 to
+/// 79 bytes and a user_id of 0 to 79 bytes, all in `0x30..=0x7F` (the generated IDs are 6 to 9
+/// bytes, or 33 with their hexadecimal suffix), a campaign_id of the usual shape (0 to 9 such
+/// bytes) and a 13-digit F3, F1 or F2 `ts` that ends the line.
 /// Every byte of an accepted line is checked as for events; every other line (and every line
-/// within `GUARD` bytes of the end) takes `slow_click`, the general rules.
+/// within `CLICK_GUARD` bytes of the end) takes `slow_click`, the general rules.
+///
+/// The click_id is never turned into an `Id`: only its end is looked for (the tie-break reads
+/// it again from the line, `person::click_id`). A user_id of up to 9 bytes is packed as
+/// before; a longer one is interned exactly as `pack_id` does, and only for a click that is
+/// kept.
 struct ClickHot {
     cbase: i64,
     /// `we - cbase`
@@ -1069,22 +1076,74 @@ struct ClickHot {
     miss: *const u8,
 }
 
+/// Bytes that must be readable from a click line's start: 1 + 80 + 2 for the click_id, the
+/// same for the user_id, 1 + 16 + 2 for the campaign, 1 + 32 for the timestamp = 218.
+const CLICK_GUARD: usize = 256;
+
+/// How many of the 64 bytes at `a` come before the first one outside `0x30..=0x7F` (64 when
+/// there is none).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn id_more(a: *const u8) -> usize {
+    unsafe {
+        use std::arch::x86_64::*;
+        let lo = _mm256_loadu_si256(a as *const __m256i);
+        let hi = _mm256_loadu_si256(a.add(32) as *const __m256i);
+        let c = _mm256_set1_epi8(0x30);
+        // signed compare: bytes from 0x80 on are negative, so they stop the ID as well
+        let m = _mm256_movemask_epi8(_mm256_cmpgt_epi8(c, lo)) as u32 as u64 | ((_mm256_movemask_epi8(_mm256_cmpgt_epi8(c, hi)) as u32 as u64) << 32);
+        m.trailing_zeros() as usize
+    }
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn id_more(a: *const u8) -> usize {
+    unsafe {
+        let mut l = 0;
+        while l < 64 && (0x30..=0x7F).contains(&*a.add(l)) {
+            l += 1;
+        }
+        l
+    }
+}
+
+/// `k::id_scan` for an ID that may be long: the first 16 bytes at `a`, and how many of the
+/// 80 bytes at `a` come before the first one outside `0x30..=0x7F` (80 when there is none).
+/// One short scan for the usual 6 to 9 bytes; the long form (one ID in eight) pays a branch.
+#[inline(always)]
+unsafe fn id_scan80(a: *const u8) -> (k::V16, usize) {
+    unsafe {
+        let (v, mut l) = k::id_scan(a);
+        if l == 16 {
+            l += id_more(a.add(16));
+        }
+        (v, l)
+    }
+}
+
+/// A user_id of `len` (10..=79) bytes at `a`, as `pack_id` gives it.
+#[inline(never)]
+unsafe fn long_uid(a: *const u8, len: usize) -> Id {
+    unsafe { intern_long(std::slice::from_raw_parts(a, len)) }
+}
+
 #[inline(always)]
 unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDates, cw: &mut Writers<CRec>) -> usize {
     unsafe {
         // click_id
         let q0 = (*p == b'"') as usize;
         let a0 = p.add(q0);
-        let (_, l0) = k::id_scan(a0);
+        let (_, l0) = id_scan80(a0);
         let t0 = a0.add(l0);
-        let mut bad = term(t0, q0);
+        // not empty, and its end is inside the 80 bytes
+        let mut bad = term(t0, q0) | (l0.wrapping_sub(1) >= 79) as u64;
         // user_id
         let s1 = t0.add(q0 + 1);
         let q1 = (*s1 == b'"') as usize;
         let a1 = s1.add(q1);
-        let (v1, l1) = k::id_scan(a1);
+        let (v1, l1) = id_scan80(a1);
         let t1 = a1.add(l1);
-        bad |= term(t1, q1);
+        bad |= term(t1, q1) | (l1 >= 80) as u64;
         // campaign_id
         let s2 = t1.add(q1 + 1);
         let q2 = (*s2 == b'"') as usize;
@@ -1092,8 +1151,9 @@ unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDate
         let (v2, l2) = k::id_scan(a2);
         let t2 = a2.add(l2);
         bad |= term(t2, q2);
-        bad |= (*LEN_BAD.get_unchecked(l0) | *LEN_BAD0.get_unchecked(l1) | *LEN_BAD0.get_unchecked(l2)) as u64;
-        let ids = k::pack2(v1, l1, v2, l2);
+        bad |= *LEN_BAD0.get_unchecked(l2) as u64;
+        // (a user_id of 10 bytes or more: its half of `ids` is not used)
+        let ids = k::pack2(v1, l1.min(16), v2, l2);
         // ts, then the newline
         let s3 = t2.add(q2 + 1);
         let q3 = (*s3 == b'"') as usize;
@@ -1131,11 +1191,12 @@ unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDate
         if bad != 0 {
             return BAIL;
         }
-        let (uid, cid) = (k::id0(ids), k::id1(ids));
+        let cid = k::id1(ids);
         // in the click window, with a user and a known campaign (an empty ID packs to 0)
-        if ((ts.wrapping_sub(hot.cbase) as u64) < hot.span) & (uid != 0) & (cid != 0) {
+        if ((ts.wrapping_sub(hot.cbase) as u64) < hot.span) & (l1 != 0) & (cid != 0) {
             let camp = ctx.campaigns.get(cid);
             if camp != u32::MAX {
+                let uid = if l1 <= 9 { k::id0(ids) } else { long_uid(a1, l1) };
                 cw.push(part_of(id_hash(uid), ctx.pbits), CRec { k: uid, ts: (ts - hot.cbase) as u32, camp, ptr: (p as usize).wrapping_add(hot.fix) });
             }
         }
@@ -1167,7 +1228,7 @@ pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8,
         let mut hot = ClickHot { cbase: ctx.cbase, span: (ctx.we - ctx.cbase) as u64, fix, miss: base };
         let end = base.add(len);
         let room = lim as usize - base as usize;
-        let fast_end = if room >= GUARD { base.add((room - GUARD + 1).min(len)) } else { base };
+        let fast_end = if room >= CLICK_GUARD { base.add((room - CLICK_GUARD + 1).min(len)) } else { base };
         let mut p = base;
         let mut slow = 0u64;
         let (mut retry_p, mut retry_n) = (std::ptr::null::<u8>(), 0u32);

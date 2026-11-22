@@ -134,6 +134,11 @@ class Gen:
                                                         "e" * 33, "event_id"]
         self.cid_pool = ["k1", "k2", "k9", "k10", "kB", "ka", "K1", "k1 ", "é", "z", "k" * 17, "k" * 16 + "a",
                          "k" * 16 + "B", "k" * 33, "😀"] + [f"k{i}" for i in range(11, 11 + r.randint(0, 60))]
+        # long click IDs around the click kernel's limits (33 = the generator's hexadecimal
+        # form; 64, 79, 80 = scan widths), with common prefixes so that ties compare far in
+        hx = "0123456789abcdef" * 2
+        self.cid_pool += ["k" + hx, "k" + hx[:-1] + "e", "k" + hx + "0", "k" + hx[:-1], "k" * 64, "k" * 65,
+                          "k" * 79, "k" * 79 + "a", "k" * 80, "k" * 80 + "b", "k" * 200, "k" * 200 + "a"]
         if self.n_events > 3000:
             self.cid_pool += [f"k{r.randint(0, 10 ** 9):x}" for _ in range(self.n_events // 2)]
 

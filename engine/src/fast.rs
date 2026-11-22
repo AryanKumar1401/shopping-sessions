@@ -1526,6 +1526,31 @@ mod hop_tests {
         }
     }
 
+    /// An ID of one of the lengths around the click kernel's limits (9, 10, 16, 33, 64, 79,
+    /// 80 and more), hexadecimal or not, now and then with a byte that is not an ID byte of
+    /// the fast path. A few values repeat, so that long user IDs meet again.
+    fn long_id(r: &mut Rng, lead: u8, out: &mut Vec<u8>) {
+        let len = [9usize, 10, 11, 15, 16, 17, 31, 32, 33, 33, 33, 34, 47, 48, 49, 63, 64, 65, 78, 79, 80, 81, 100, 200][r.below(24) as usize];
+        let start = out.len();
+        out.push(lead);
+        if r.one_in(3) {
+            // one of a few fixed values of this length
+            let v = r.below(3) as u8;
+            for i in 1..len {
+                out.push(b"0123456789abcdef"[((i as u8).wrapping_mul(7).wrapping_add(v)) as usize & 15]);
+            }
+        } else {
+            let hex = !r.one_in(4);
+            for _ in 1..len {
+                out.push(if hex { b"0123456789abcdef"[r.below(16) as usize] } else { b"0123456789abcdefghijklmnopqrstuvwxyzABCXYZ_~{|}:;<=>?@[]^`\x7F"[r.below(59) as usize] });
+            }
+        }
+        if r.one_in(40) {
+            let pos = start + r.below(len as u64) as usize;
+            out[pos] = *r.pick(&[b" ", b"-", b"\x00", b"\xC3", b"/", b"\x80", b"\xFF", b"."]).first().unwrap();
+        }
+    }
+
     fn click_line(r: &mut Rng, n: usize, out: &mut Vec<u8>) {
         let mut f: Vec<Vec<u8>> = vec![Vec::new(); 4];
         if r.one_in(25) {
@@ -1534,6 +1559,14 @@ mod hop_tests {
             f[0] = format!("k{:07}", n).into_bytes();
         }
         id(r, b'u', &mut f[1]);
+        if r.one_in(5) {
+            f[0].clear();
+            long_id(r, b'k', &mut f[0]);
+        }
+        if r.one_in(5) {
+            f[1].clear();
+            long_id(r, b'u', &mut f[1]);
+        }
         f[2] = if r.one_in(12) { r.pick(&[b"", b"C_1", b"c_99", b" c_1", b"c_1 ", b"c_12345678901", b"c\xC3\xA9", b"c_1\r"]).to_vec() } else { format!("c_{}", r.below(12)).into_bytes() };
         ts(r, false, &mut f[3]);
         let nf = if r.one_in(60) { r.below(7) as usize } else { 4 };
@@ -1651,6 +1684,14 @@ mod hop_tests {
             _ => id(r, b'k', &mut f[0]),
         }
         id(r, b'u', &mut f[1]);
+        if r.one_in(4) {
+            f[0].clear();
+            long_id(r, b'k', &mut f[0]);
+        }
+        if r.one_in(4) {
+            f[1].clear();
+            long_id(r, b'u', &mut f[1]);
+        }
         f[2] = if r.one_in(15) { r.pick(&[b"", b"C_1", b"c_999", b"c_1 ", b" c_1", b"c_12345678", b"c_1234567", b"c_123456789", b"c-1", b"organic", b"c_1\x00", b"c_\xC3\xA9", b"c1"]).to_vec() } else { format!("c_{}", r.below(45)).into_bytes() };
         if r.one_in(12) {
             // the click window's edges (window 2026-10-01 .. 2026-10-15) and impossible values
