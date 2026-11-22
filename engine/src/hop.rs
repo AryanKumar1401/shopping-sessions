@@ -19,6 +19,7 @@
 //! readable bytes) takes `split_row` + `event_general`, the plain statement of the rules.
 
 use crate::fast::*;
+use crate::links::part_of;
 use crate::scan::Field;
 use crate::ts::*;
 use crate::util::*;
@@ -55,12 +56,14 @@ unsafe fn rd64(p: *const u8) -> u64 {
 
 /// Timestamp templates, a field from its first byte (the opening quote if it has one) to the
 /// comma after it: byte `i` must satisfy `b - lo[i] <= rng[i]` (unsigned, wrapping).
-/// Index: form * 2 + quoted, forms F1, F2, F3 (13 digits).
+/// Index: form * 2 + quoted, forms F1, F2, F3 (13 digits); plus `NL` for the same field as a
+/// line's last one (a newline after it instead of the comma).
 #[repr(C, align(32))]
 struct TsPat {
-    lo: [[u8; 32]; 6],
-    rng: [[u8; 32]; 6],
+    lo: [[u8; 32]; 12],
+    rng: [[u8; 32]; 12],
 }
+const NL: usize = 6;
 const F1: usize = 0;
 const F2: usize = 1;
 const F3: usize = 2;
@@ -76,12 +79,13 @@ const fn ts_pat() -> TsPat {
         [x(b'2'), x(b'0'), D, D, x(b'-'), (b'0', b'1'), D, x(b'-'), (b'0', b'3'), D, x(b'T'), (b'0', b'2'), D, x(b':'), (b'0', b'5'), D, x(b':'), (b'0', b'5'), D];
     // F2's sign may be `+`, `,` or `-` here; the caller excludes the comma
     let off: [(u8, u8); 6] = [(b'+', b'-'), (b'0', b'2'), D, x(b':'), (b'0', b'5'), D];
-    let mut t = TsPat { lo: [[0; 32]; 6], rng: [[0xFF; 32]; 6] };
-    let mut form = 0;
-    while form < 3 {
+    let mut t = TsPat { lo: [[0; 32]; 12], rng: [[0xFF; 32]; 12] };
+    let mut tf = 0;
+    while tf < 6 {
+        let (form, last) = (tf % 3, tf / 3);
         let mut q = 0;
         while q < 2 {
-            let k = form * 2 + q;
+            let k = last * NL + form * 2 + q;
             let mut body = [(0u8, 0u8); 32];
             let mut n = 0;
             if q == 1 {
@@ -118,7 +122,7 @@ const fn ts_pat() -> TsPat {
                 body[n] = x(b'"');
                 n += 1;
             }
-            body[n] = x(b',');
+            body[n] = x(if last == 1 { b'\n' } else { b',' });
             n += 1;
             let mut i = 0;
             while i < n {
@@ -128,7 +132,7 @@ const fn ts_pat() -> TsPat {
             }
             q += 1;
         }
-        form += 1;
+        tf += 1;
     }
     t
 }
@@ -838,6 +842,150 @@ pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, dates: &mut Ho
             hop_loop::<true>(ev, base, len, dates, cache, pw, dw, escape)
         } else {
             hop_loop::<false>(ev, base, len, dates, cache, pw, dw, escape)
+        }
+    }
+}
+
+// ---------------------------------------------------------------- click rows
+
+/// The same walk for click lines, `click_id , user_id , campaign_id , ts \n`: three IDs of the
+/// usual shape (the click_id not empty) and a 13-digit F3, F1 or F2 `ts` that ends the line.
+/// Every byte of an accepted line is checked as for events; every other line (and every line
+/// within `GUARD` bytes of the end) takes `slow_click`, the general rules.
+struct ClickHot {
+    cbase: i64,
+    /// `we - cbase`
+    span: u64,
+    fix: usize,
+    miss: *const u8,
+}
+
+#[inline(always)]
+unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDates, cw: &mut Writers<CRec>) -> usize {
+    unsafe {
+        // click_id
+        let q0 = (*p == b'"') as usize;
+        let a0 = p.add(q0);
+        let (_, l0) = k::id_scan(a0);
+        let t0 = a0.add(l0);
+        let mut bad = term(t0, q0);
+        // user_id
+        let s1 = t0.add(q0 + 1);
+        let q1 = (*s1 == b'"') as usize;
+        let a1 = s1.add(q1);
+        let (v1, l1) = k::id_scan(a1);
+        let t1 = a1.add(l1);
+        bad |= term(t1, q1);
+        // campaign_id
+        let s2 = t1.add(q1 + 1);
+        let q2 = (*s2 == b'"') as usize;
+        let a2 = s2.add(q2);
+        let (v2, l2) = k::id_scan(a2);
+        let t2 = a2.add(l2);
+        bad |= term(t2, q2);
+        bad |= (*LEN_BAD.get_unchecked(l0) | *LEN_BAD0.get_unchecked(l1) | *LEN_BAD0.get_unchecked(l2)) as u64;
+        let ids = k::pack2(v1, l1, v2, l2);
+        // ts, then the newline
+        let s3 = t2.add(q2 + 1);
+        let q3 = (*s3 == b'"') as usize;
+        let a3 = s3.add(q3);
+        let (ts, next);
+        if *a3.add(4) == b'-' {
+            if !k::ts_misfit(s3, NL + F1 * 2 + q3) {
+                ts = civil!(a3, dates, hot) * 1000;
+                next = a3.add(21 + q3);
+            } else {
+                let z = *a3.add(19);
+                if k::ts_misfit(s3, NL + F2 * 2 + q3) | (z == b',') {
+                    return BAIL;
+                }
+                let t = civil!(a3, dates, hot);
+                let o = rd64(a3.add(19));
+                let v = ((o >> 8) ^ 0x30_303A_3030) & 0xFF_FFFF_FFFF;
+                let x = v.wrapping_mul(2561);
+                let hh = (x >> 8) & 0xFF;
+                let mm = (x >> 32) & 0xFF;
+                if hh > 23 {
+                    return BAIL;
+                }
+                let off = ((hh * 60 + mm) * 60_000) as i64;
+                ts = if z == b'+' { t * 1000 - off } else { t * 1000 + off };
+                next = a3.add(26 + q3);
+            }
+        } else {
+            if k::ts_misfit(s3, NL + F3 * 2 + q3) {
+                return BAIL;
+            }
+            ts = k::f3_13(a3);
+            next = a3.add(14 + q3);
+        }
+        if bad != 0 {
+            return BAIL;
+        }
+        let (uid, cid) = (k::id0(ids), k::id1(ids));
+        // in the click window, with a user and a known campaign (an empty ID packs to 0)
+        if ((ts.wrapping_sub(hot.cbase) as u64) < hot.span) & (uid != 0) & (cid != 0) {
+            let camp = ctx.campaigns.get(cid);
+            if camp != u32::MAX {
+                cw.push(part_of(id_hash(uid), ctx.pbits), CRec { k: uid, ts: (ts - hot.cbase) as u32, camp, ptr: (p as usize).wrapping_add(hot.fix) });
+            }
+        }
+        next as usize
+    }
+}
+
+/// The click line at `p` (ending before `end`) by the general rules; returns the next line's start.
+#[cold]
+#[inline(never)]
+unsafe fn slow_click(ctx: &Ctx, p: *const u8, end: *const u8, lim: *const u8, fix: usize, cache: &mut DateCache, cw: &mut Writers<CRec>) -> *const u8 {
+    unsafe {
+        let mut e = p;
+        while e < end && *e != b'\n' {
+            e = e.add(1);
+        }
+        if let Some(f) = crate::scan::split_row::<4>(p, e as usize - p as usize) {
+            click_general(ctx, &f, p, lim, fix, cache, cw);
+        }
+        e.add(1)
+    }
+}
+
+/// All click lines of `base[..len]` (whole lines; the last may lack its `\n` only when it
+/// ends at `lim`, the end of the readable bytes).
+#[inline(always)]
+pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8, fix: usize, dates: &mut HopDates, cache: &mut DateCache, cw: &mut Writers<CRec>) {
+    unsafe {
+        let mut hot = ClickHot { cbase: ctx.cbase, span: (ctx.we - ctx.cbase) as u64, fix, miss: base };
+        let end = base.add(len);
+        let room = lim as usize - base as usize;
+        let fast_end = if room >= GUARD { base.add((room - GUARD + 1).min(len)) } else { base };
+        let mut p = base;
+        let (mut retry_p, mut retry_n) = (std::ptr::null::<u8>(), 0u32);
+        loop {
+            let mut code = BAIL;
+            while p < fast_end {
+                let r = click_row(ctx, &mut hot, p, dates, cw);
+                if (r as isize) < CODES {
+                    code = r;
+                    break;
+                }
+                p = r as *const u8;
+            }
+            if code == DATE_MISS {
+                // as in `hop_loop`: at most one miss per line here, then the general path
+                if retry_p != p {
+                    retry_p = p;
+                    retry_n = 0;
+                }
+                retry_n += 1;
+                if retry_n <= 2 && date_miss(hot.miss, dates) != NONE {
+                    continue;
+                }
+            }
+            if p >= end {
+                break;
+            }
+            p = slow_click(ctx, p, end, lim, fix, cache, cw);
         }
     }
 }

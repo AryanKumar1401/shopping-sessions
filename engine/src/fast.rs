@@ -709,6 +709,26 @@ unsafe fn event_row(ev: &EvRow, r: &Row, cache: &mut DateCache, pw: &mut Writers
     }
 }
 
+/// One well-formed click line (`row`: its first byte), by the general rules, into the writer.
+#[inline(always)]
+pub unsafe fn click_general(ctx: &Ctx, f: &[Field; 4], row: *const u8, lim: *const u8, fix: usize, cache: &mut DateCache, cw: &mut Writers<CRec>) {
+    unsafe {
+        if f[0].1 == 0 || f[1].1 == 0 || f[2].1 == 0 {
+            return;
+        }
+        let ts = parse_ts(f[3].0, f[3].1, cache);
+        if ts == NONE || ts < ctx.cbase || ts >= ctx.we {
+            return;
+        }
+        let camp = ctx.campaigns.get(pack_id(f[2].0, f[2].1, lim));
+        if camp == u32::MAX {
+            return;
+        }
+        let uid = pack_id(f[1].0, f[1].1, lim);
+        cw.push(part_of(id_hash(uid), ctx.pbits), CRec { k: uid, ts: (ts - ctx.cbase) as u32, camp, ptr: (row as usize).wrapping_add(fix) });
+    }
+}
+
 #[inline(always)]
 unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
     unsafe {
@@ -741,21 +761,11 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
                 scan_rows::<M, 7>(buf, base, len, #[inline(always)] |r| event_row(&ev, r, cache, pw, dw, escape));
             }
         } else {
-            scan::<M, 4>(buf, base, len, #[inline(always)] |f, row| {
-                if f[0].1 == 0 || f[1].1 == 0 || f[2].1 == 0 {
-                    return;
-                }
-                let ts = parse_ts(f[3].0, f[3].1, cache);
-                if ts == NONE || ts < ctx.cbase || ts >= ctx.we {
-                    return;
-                }
-                let camp = ctx.campaigns.get(pack_id(f[2].0, f[2].1, lim));
-                if camp == u32::MAX {
-                    return;
-                }
-                let uid = pack_id(f[1].0, f[1].1, lim);
-                cw.push(part_of(id_hash(uid), ctx.pbits), CRec { k: uid, ts: (ts - ctx.cbase) as u32, camp, ptr: (row as usize).wrapping_add(fix) });
-            });
+            if ctx.hop {
+                crate::hop::hop_clicks(ctx, base, len, lim, fix, dates, cache, cw);
+            } else {
+                scan::<M, 4>(buf, base, len, #[inline(always)] |f, row| click_general(ctx, f, row, lim, fix, cache, cw));
+            }
         }
         if drop_after {
             drop_range(base, len);
@@ -1304,5 +1314,117 @@ mod hop_tests {
             let got = run_kernel(&mut ctx, data, false, level, 4096);
             assert!(got == want, "scan kernel differs in round {round}");
         }
+    }
+
+    fn click_line(r: &mut Rng, n: usize, out: &mut Vec<u8>) {
+        let mut f: Vec<Vec<u8>> = vec![Vec::new(); 4];
+        if r.one_in(25) {
+            id(r, b'k', &mut f[0]);
+        } else {
+            f[0] = format!("k{:07}", n).into_bytes();
+        }
+        id(r, b'u', &mut f[1]);
+        f[2] = if r.one_in(12) { r.pick(&[b"", b"C_1", b"c_99", b" c_1", b"c_1 ", b"c_12345678901", b"c\xC3\xA9", b"c_1\r"]).to_vec() } else { format!("c_{}", r.below(12)).into_bytes() };
+        ts(r, false, &mut f[3]);
+        let nf = if r.one_in(60) { r.below(7) as usize } else { 4 };
+        let start = out.len();
+        for k in 0..nf {
+            if k > 0 {
+                out.push(b',');
+            }
+            let v: &[u8] = if k < 4 { &f[k] } else { b"x" };
+            let q = r.one_in(5);
+            if q {
+                out.push(b'"');
+            }
+            out.extend_from_slice(v);
+            if q && !r.one_in(150) {
+                out.push(b'"');
+            }
+        }
+        if r.one_in(30) && out.len() > start {
+            let pos = start + r.below((out.len() - start) as u64) as usize;
+            let c = *r.pick(&[b"\"", b",", b"\n", b"\r", b"\x00", b"\xE2", b" ", b"Z", b"0", b":"]).first().unwrap();
+            match r.below(3) {
+                0 => out[pos] = c,
+                1 => out.insert(pos, c),
+                _ => {
+                    out.remove(pos);
+                }
+            }
+        }
+        if r.one_in(100) {
+            out.push(b'\r');
+        }
+        out.push(b'\n');
+        if r.one_in(200) {
+            out.push(b'\n');
+        }
+    }
+
+    fn run_clicks(ctx: &mut Ctx, data: &'static [u8], hop: bool, level: Level, chunk: usize) -> Vec<(Id, u32, u32, usize)> {
+        ctx.hop = hop;
+        let mut st = PState {
+            escape: false,
+            slow: 0,
+            rbuf: std::ptr::null_mut(),
+            rcap: 0,
+            buf: ScanBuf::new(),
+            cache: DateCache::new(),
+            dates: crate::hop::HopDates::new(),
+            dw: Writers::with_wc(1 << ctx.dbits, 8, true),
+            pw: Writers::in_region(1 << ctx.pbits, 8, true, ctx.pregion),
+            cw: Writers::with_wc(1 << ctx.pbits, 8, true),
+        };
+        let mut jobs = Vec::new();
+        make_jobs(&[data], 1, chunk, false, &mut jobs);
+        for j in &jobs {
+            unsafe { main_d(level, ctx, &mut st, j) };
+        }
+        let c = st.cw.finish();
+        let mut out = Vec::new();
+        for part in 0..(1usize << ctx.pbits) {
+            for sl in c.slices(part) {
+                for r in sl.iter() {
+                    out.push((r.k, r.ts, r.camp, r.ptr - data.as_ptr() as usize));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The click row-hopping kernel against the scalar reference scanner on adversarial
+    /// lines: the same click records (user, time, campaign, line), whatever the chunking.
+    #[test]
+    fn hop_clicks_equal_reference() {
+        let mut ctx = test_ctx();
+        ctx.campaigns = IdMap::new(16);
+        for i in 0..8u32 {
+            let name = format!("c_{i}");
+            ctx.campaigns.insert(unsafe { pack_id(name.as_ptr(), name.len(), name.as_ptr().add(name.len())) }, i);
+        }
+        let level = pick_level();
+        let rounds: u64 = std::env::var("HOP_FUZZ_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        let mut r = Rng(0xD1B5_4A32_D192_ED03);
+        let mut kept = 0usize;
+        for round in 0..rounds {
+            let mut v = b"click_id,user_id,campaign_id,ts\n".to_vec();
+            let rows = 1 + r.below(if round % 4 == 0 { 30 } else { 3000 }) as usize;
+            for n in 0..rows {
+                click_line(&mut r, n, &mut v);
+            }
+            if round % 3 == 0 {
+                v.pop();
+            }
+            let data: &'static [u8] = Box::leak(v.into_boxed_slice());
+            let want = run_clicks(&mut ctx, data, false, Level::Scalar, 1 << 30);
+            kept += want.len();
+            for chunk in [1usize << 30, 7, 193, 4096] {
+                let got = run_clicks(&mut ctx, data, true, level, chunk);
+                assert!(got == want, "round {round} chunk {chunk}: {} vs {} click records", got.len(), want.len());
+            }
+        }
+        assert!(kept > 1000, "the generator must produce clicks that are kept ({kept})");
     }
 }
