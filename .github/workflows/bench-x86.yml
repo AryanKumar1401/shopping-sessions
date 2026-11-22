@@ -1,6 +1,7 @@
 # Scratch: real-x86 gate + A/B of a new main commit against the last verified one. Not for main.
 #   gh workflow run bench-x86 --ref bench-x86 -f old=<sha> -f new=<sha>
 name: bench-x86
+run-name: "x86 ${{ inputs.old }} -> ${{ inputs.new }} ${{ inputs.probe }}${{ inputs.quick != '' && 'quick' || '' }}"
 on:
   workflow_dispatch:
     inputs:

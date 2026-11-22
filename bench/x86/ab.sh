@@ -6,10 +6,10 @@
 set -u
 OLD=$1; NEW=$2; MODE=${3:-quick}
 REPO=AryanKumar1401/shopping-sessions
-before=$(gh run list -R $REPO --workflow bench-x86 --limit 1 --json databaseId --jq '.[0].databaseId')
 if [ "$MODE" = full ]; then gh workflow run bench-x86 -R $REPO --ref bench-x86 -f old=$OLD -f new=$NEW >/dev/null; else gh workflow run bench-x86 -R $REPO --ref bench-x86 -f old=$OLD -f new=$NEW -f quick=1 >/dev/null; fi
-# find the run this call started: the newest one whose title carries nothing we can match, so poll until a new id appears
-for i in $(seq 30); do sleep 5; R=$(gh run list -R $REPO --workflow bench-x86 --limit 5 --json databaseId,createdAt --jq 'sort_by(.createdAt) | reverse | .[0].databaseId'); [ "$R" != "$before" ] && break; done
+# the run is named after its inputs, so several A/Bs can be in flight at once
+R=""; for i in $(seq 40); do sleep 5; R=$(gh run list -R $REPO --workflow bench-x86 --limit 20 --json databaseId,displayTitle,createdAt --jq "[.[] | select(.displayTitle | contains(\"-> $NEW\"))] | sort_by(.createdAt) | reverse | .[0].databaseId // empty"); [ -n "$R" ] && break; done
+[ -z "$R" ] && { echo "could not find the run for $NEW"; exit 1; }
 echo "run $R (https://github.com/$REPO/actions/runs/$R)"
 until [ "$(gh run view -R $REPO $R --json status --jq .status)" = completed ]; do sleep 20; done
 echo "conclusion: $(gh run view -R $REPO $R --json conclusion --jq .conclusion)"
