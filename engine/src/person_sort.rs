@@ -22,6 +22,10 @@ fn knob_lahead() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_usize("SE_LAHEAD").unwrap_or(8))
 }
+fn knob_bfm() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("SE_BFM").unwrap_or(0))
+}
 fn knob_bwarm() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_flag("SE_BWARM"))
@@ -41,7 +45,7 @@ fn wide_at() -> usize {
 const FLAT_PROF: [&str; 32] = [
     "A scan events", "A scan clicks", "A link lookups", "A group ts", "A group clicks", "A purchases", "A sessions", "A sort clicks",
     "A write runs", "B group runs", "B people", "", "", "", "", "",
-    "S rows", "S purchases", "S credit", "S window", "S assists", "S emit", "", "",
+    "S rows", "S purchases", "S credit", "S window", "S assists", "S emit", "S merge", "",
     "", "", "", "", "", "", "", "(write calls)",
 ];
 /// A session of the person `rank` of the partition.
@@ -77,6 +81,7 @@ struct Flat {
     fc: Vec<FClk>,
     cptr: Vec<usize>,
     sa: Vec<u32>,
+    ci: Vec<u32>,
     sw: Vec<u32>,
     fpu: Vec<(u64, u32)>,
     prof: [u64; 32],
@@ -98,6 +103,7 @@ impl Flat {
             fc: Vec::new(),
             cptr: Vec::new(),
             sa: Vec::new(),
+            ci: Vec::new(),
             sw: Vec::new(),
             fpu: Vec::new(),
             prof: [0; 32],
@@ -136,6 +142,66 @@ fn tie_camp(fc: &[FClk], top: usize, ptr_of: &dyn Fn(u32) -> usize) -> u32 {
         }
     }
     camp
+}
+
+/// The ranks of two sorted lists in each other, as a stable merge (x first on ties) gives them:
+/// `ox[i]` = #{j: y_j < x_i}, and unless `oy` is null `oy[j]` = #{i: x_i <= y_j}. `kx(nx)` and
+/// `ky(ny)` must be u64::MAX (sentinels); `ox` and `oy` need one slot past the end (a dummy).
+/// The merge runs without a branch in `k` independent pieces (cut at y), interleaved, so that
+/// the pieces' load-compare chains overlap.
+#[inline(always)]
+unsafe fn merge_ranks(k: usize, nx: usize, ny: usize, kx: impl Fn(usize) -> u64, ky: impl Fn(usize) -> u64, ox: *mut u32, oy: *mut u32) {
+    const MK: usize = 8;
+    let k = k.clamp(1, MK);
+    let want_y = !oy.is_null();
+    // piece p runs from state (xs[p], ys[p]) to (xs[p + 1], ys[p + 1]): the state before the merge
+    // takes y_j is (#{x <= y_j}, j)
+    let (mut xs, mut ys) = ([0usize; MK + 1], [0usize; MK + 1]);
+    for p in 1..k {
+        let j = p * ny / k;
+        let v = ky(j);
+        let (mut lo, mut hi) = (xs[p - 1], nx);
+        while lo < hi {
+            let m = (lo + hi) / 2;
+            if kx(m) <= v { lo = m + 1 } else { hi = m }
+        }
+        xs[p] = lo;
+        ys[p] = j;
+    }
+    xs[k] = nx;
+    ys[k] = ny;
+    let (mut ci, mut cj, mut left) = ([0usize; MK], [0usize; MK], [0usize; MK]);
+    let mut m = usize::MAX;
+    for p in 0..k {
+        ci[p] = xs[p];
+        cj[p] = ys[p];
+        left[p] = (xs[p + 1] - xs[p]) + (ys[p + 1] - ys[p]);
+        m = m.min(left[p]);
+    }
+    #[inline(always)]
+    unsafe fn step(i: &mut usize, j: &mut usize, nx: usize, ny: usize, kx: &impl Fn(usize) -> u64, ky: &impl Fn(usize) -> u64, ox: *mut u32, oy: *mut u32, want_y: bool) {
+        unsafe {
+            let c = kx(*i) <= ky(*j);
+            let mask = (c as usize).wrapping_neg();
+            // taking x: ox[i] = j; taking y: oy[j] = i; the other store goes to the dummy
+            *ox.add(nx ^ ((nx ^ *i) & mask)) = *j as u32;
+            if want_y {
+                *oy.add(*j ^ ((*j ^ ny) & mask)) = *i as u32;
+            }
+            *i += c as usize;
+            *j += !c as usize;
+        }
+    }
+    for _ in 0..m {
+        for p in 0..k {
+            unsafe { step(&mut ci[p], &mut cj[p], nx, ny, &kx, &ky, ox, oy, want_y) };
+        }
+    }
+    for p in 0..k {
+        for _ in m..left[p] {
+            unsafe { step(&mut ci[p], &mut cj[p], nx, ny, &kx, &ky, ox, oy, want_y) };
+        }
+    }
 }
 
 /// All the people of a partition: `f.ss` = their sessions by (rank, start), `f.fc` = their
@@ -243,11 +309,30 @@ fn sweep_flat(ctx: &Ctx, o: &mut Out, f: &mut Flat, names: &[Id], ptr_of: &dyn F
         let sa = f.sa.as_mut_ptr();
         let fc = f.fc.as_ptr();
         let mut i = 0usize;
+        let bfm = knob_bfm();
+        if bfm != 0 {
+            // `sa[i]` = sessions with sk < key (the first at or after the click), `ci[s]` =
+            // clicks with key <= sk[s]; `fc[nc]` and `sk[ns]` are sentinels
+            f.ci.clear();
+            f.ci.reserve(ns + 1);
+            (fc as *mut FClk).add(nc).write(FClk { key: u64::MAX, camp: 0, j: 0 });
+            let sk = f.sk.as_ptr();
+            merge_ranks(bfm, nc, ns, |i| (*fc.add(i)).key, |j| *sk.add(j), sa, f.ci.as_mut_ptr());
+            i = nc;
+        }
+        let i_end = i;
+        if bfm != 0 {
+            f.lap(22);
+        }
         for s in 0..ns {
             let k = *f.sk.get_unchecked(s);
+            if bfm != 0 {
+                i = *f.ci.as_ptr().add(s) as usize;
+            } else {
             while i < nc && (*fc.add(i)).key <= k {
                 *sa.add(i) = s as u32;
                 i += 1;
+            }
             }
             // (`fc[-1]` is not read as a click: `i > 0` is part of `ok`)
             let top = *fc.add(i.saturating_sub(1));
@@ -284,6 +369,9 @@ fn sweep_flat(ctx: &Ctx, o: &mut Out, f: &mut Flat, names: &[Id], ptr_of: &dyn F
                 }
             }
         }
+        if bfm != 0 {
+            i = i_end;
+        }
         while i < nc {
             *sa.add(i) = ns as u32;
             i += 1;
@@ -294,16 +382,22 @@ fn sweep_flat(ctx: &Ctx, o: &mut Out, f: &mut Flat, names: &[Id], ptr_of: &dyn F
     if nc > 0 {
         // ---- per click: the first session it is too old for
         f.sw.clear();
-        f.sw.reserve(nc);
+        f.sw.reserve(nc + 1);
         unsafe {
             let sw = f.sw.as_mut_ptr();
             let mut w = 0usize;
+            if knob_bfm() != 0 {
+                // `sw[i]` = sessions with sk < key + WEEK + 1
+                let (fc, sk) = (f.fc.as_ptr(), f.sk.as_ptr());
+                merge_ranks(knob_bfm(), nc, ns, |i| (*fc.add(i)).key.saturating_add(WEEK as u64 + 1), |j| *sk.add(j), f.sw.as_mut_ptr(), std::ptr::null_mut());
+            } else {
             for (i, c) in f.fc.iter().enumerate() {
                 let lim = c.key + WEEK as u64;
                 while *f.sk.get_unchecked(w) <= lim {
                     w += 1;
                 }
                 *sw.add(i) = w as u32;
+            }
             }
             f.sw.set_len(nc);
         }

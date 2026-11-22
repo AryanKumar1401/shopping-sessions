@@ -24,7 +24,6 @@ const GROUP_ROWS: usize = 1 << 16;
 const LF: usize = 2;
 const PR_ONE: u64 = 1 << 48;
 const PR_LIM: u64 = 1 << 47;
-const TAGMASK: u32 = 0xFF00_0000;
 
 pub const UD_SCHEMA: [(&str, Kind); 6] = [
     ("user_id", Kind::Str),
@@ -413,11 +412,10 @@ fn person(ctx: &Ctx, o: &mut Out, name: Id, sess: &[Sess], pu: &[Pu], cl: &[Clk]
 // ---------------------------------------------------------------- grouping scratch
 
 struct Scratch {
-    /// Open addressing `Id -> index` (see `get_or_insert`).
-    slots: Vec<u32>,
+    /// Open addressing `Id -> index` (see `get_or_insert`): the key (0 = empty) and its index.
+    slot_k: Vec<Id>,
+    slot_i: Vec<u32>,
     mask: usize,
-    /// the tag bits of a slot (0 once a partition has too many keys for tags)
-    tagmask: u32,
     keys: Vec<Id>,
     kslot: Vec<u32>,
     /// per key: events (pass A) or runs (pass B)
@@ -451,9 +449,9 @@ struct Scratch {
 impl Scratch {
     fn new(span: u32) -> Self {
         Scratch {
-            slots: vec![0; 4096],
+            slot_k: vec![0; 4096],
+            slot_i: vec![0; 4096],
             mask: 4095,
-            tagmask: TAGMASK,
             keys: Vec::new(),
             kslot: Vec::new(),
             cnt: Vec::new(),
@@ -488,7 +486,7 @@ impl Scratch {
     }
     fn reset(&mut self) {
         for &s in &self.kslot {
-            self.slots[s as usize] = 0;
+            self.slot_k[s as usize] = 0;
         }
         self.keys.clear();
         self.kslot.clear();
@@ -497,26 +495,20 @@ impl Scratch {
     }
     /// The index of `k` (in first-seen order), adding it if it is new.
     ///
-    /// A slot is 4 bytes: 8 bits of the hash and `index + 1` (0 = empty); the key itself is
-    /// compared in `keys`. The whole table of a partition then is a few dozen KB and stays in
-    /// the core's cache while the records stream past it.
+    /// Keys sit in the table itself (no ID is 0, the empty slot), so a hit is one load and
+    /// one compare; the index is read beside it.
     #[inline(always)]
     fn get_or_insert(&mut self, k: Id) -> u32 {
-        let h = id_hash(k);
-        // bits 32..40 of the hash: not the partition's (top) nor the slot's (low) bits
-        let tag = (h >> 8) as u32 & self.tagmask;
-        let mut i = h as usize & self.mask;
+        debug_assert!(k != 0);
+        let mut i = id_hash(k) as usize & self.mask;
         unsafe {
             loop {
-                let s = *self.slots.get_unchecked(i);
+                let s = *self.slot_k.get_unchecked(i);
+                if s == k {
+                    return *self.slot_i.get_unchecked(i);
+                }
                 if s == 0 {
                     break;
-                }
-                if (s ^ tag) & self.tagmask == 0 {
-                    let idx = (s & !self.tagmask) - 1;
-                    if *self.keys.get_unchecked(idx as usize) == k {
-                        return idx;
-                    }
                 }
                 i = (i + 1) & self.mask;
             }
@@ -524,39 +516,32 @@ impl Scratch {
         self.insert_at(i, k)
     }
     #[inline(never)]
-    fn insert_at(&mut self, mut i: usize, k: Id) -> u32 {
+    fn insert_at(&mut self, i: usize, k: Id) -> u32 {
         let idx = self.keys.len() as u32;
-        if idx + 1 > !self.tagmask {
-            // more keys than fit beside the tag: go on without tags
-            self.tagmask = 0;
-            self.rehash(self.slots.len());
-            i = id_hash(k) as usize & self.mask;
-            while self.slots[i] != 0 {
-                i = (i + 1) & self.mask;
-            }
-        }
-        self.slots[i] = ((id_hash(k) >> 8) as u32 & self.tagmask) | (idx + 1);
+        self.slot_k[i] = k;
+        self.slot_i[i] = idx;
         self.keys.push(k);
         self.kslot.push(i as u32);
         self.cnt.push(0);
         self.ccnt.push(0);
-        if self.keys.len() * LF > self.slots.len() {
-            self.rehash(self.slots.len() * 2);
+        if self.keys.len() * LF > self.slot_k.len() {
+            self.rehash(self.slot_k.len() * 2);
         }
         idx
     }
     #[cold]
     fn rehash(&mut self, cap: usize) {
-        self.slots.clear();
-        self.slots.resize(cap, 0);
+        self.slot_k.clear();
+        self.slot_k.resize(cap, 0);
+        self.slot_i.resize(cap, 0);
         self.mask = cap - 1;
         for (idx, &k) in self.keys.iter().enumerate() {
-            let h = id_hash(k);
-            let mut i = h as usize & self.mask;
-            while self.slots[i] != 0 {
+            let mut i = id_hash(k) as usize & self.mask;
+            while self.slot_k[i] != 0 {
                 i = (i + 1) & self.mask;
             }
-            self.slots[i] = ((h >> 8) as u32 & self.tagmask) | (idx as u32 + 1);
+            self.slot_k[i] = k;
+            self.slot_i[i] = idx as u32;
             self.kslot[idx] = i as u32;
         }
     }
