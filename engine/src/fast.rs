@@ -1644,55 +1644,36 @@ fn run_rest(
                     table.clear();
                     table.resize(cap, 0);
                     let mask = cap - 1;
-                    let tp = table.as_ptr() as usize;
-                    let mut probe = |h: u64, rec: &LHRec| {
-                        let tag = ((h >> 32) & 0xFFFF) << 48;
-                        let me = (rec as *const LHRec as u64) | tag;
-                        let mut i = (h >> 8) as usize & mask;
-                        loop {
-                            let s = unsafe { *table.get_unchecked(i) };
-                            if s == 0 {
-                                unsafe { *table.get_unchecked_mut(i) = me };
-                                break;
-                            }
-                            if s & (0xFFFF << 48) == tag {
-                                let other = unsafe { &*((s & ((1 << 48) - 1)) as *const LHRec) };
-                                if (other.hi == rec.hi) & (other.lo == rec.lo) & (other.pre == rec.pre) {
-                                    let loser = if rec.ing < other.ing {
-                                        unsafe { *table.get_unchecked_mut(i) = me };
-                                        other.prec
-                                    } else {
-                                        rec.prec
-                                    };
-                                    unsafe { kill(pbase, ubase, loser) };
-                                    break;
-                                }
-                            }
-                            i = (i + 1) & mask;
-                        }
-                    };
-                    // The table is too big for the second-level cache: each record's slot is
-                    // prefetched, and the record probed `LAG` records later (in the same order).
-                    const LAG: usize = 8;
-                    let mut ring: [(u64, *const LHRec); LAG] = [(0, std::ptr::null()); LAG];
-                    let mut k = 0usize;
                     for d in lparts_ref {
                         for sl in d.1.slices(p) {
-                            for rec in sl.iter() {
+                            for rec in sl.iter_mut() {
                                 let h = hex_hash(rec.hi, rec.lo, rec.pre);
-                                prefetch((tp + ((h >> 8) as usize & mask) * 8) as *const u64);
-                                let e = &mut ring[k % LAG];
-                                if k >= LAG {
-                                    probe(e.0, unsafe { &*e.1 });
+                                let tag = ((h >> 32) & 0xFFFF) << 48;
+                                let me = (rec as *mut LHRec as u64) | tag;
+                                let mut i = (h >> 8) as usize & mask;
+                                loop {
+                                    let s = unsafe { *table.get_unchecked(i) };
+                                    if s == 0 {
+                                        unsafe { *table.get_unchecked_mut(i) = me };
+                                        break;
+                                    }
+                                    if s & (0xFFFF << 48) == tag {
+                                        let other = unsafe { &*((s & ((1 << 48) - 1)) as *const LHRec) };
+                                        if (other.hi == rec.hi) & (other.lo == rec.lo) & (other.pre == rec.pre) {
+                                            let loser = if rec.ing < other.ing {
+                                                table[i] = me;
+                                                other.prec
+                                            } else {
+                                                rec.prec
+                                            };
+                                            unsafe { kill(pbase, ubase, loser) };
+                                            break;
+                                        }
+                                    }
+                                    i = (i + 1) & mask;
                                 }
-                                *e = (h, rec);
-                                k += 1;
                             }
                         }
-                    }
-                    for j in k.saturating_sub(LAG)..k {
-                        let e = ring[j % LAG];
-                        probe(e.0, unsafe { &*e.1 });
                     }
                 }
             }
