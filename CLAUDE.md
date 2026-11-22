@@ -68,9 +68,13 @@ Everything runs on `NCPU` threads over work queues; the process ends with `_exit
    finishes unlinked IDs in place, forwards linked IDs as runs; pass B groups runs by person. Sessions come
    from 30-minute buckets (min/max/count, neighbours chained by the exact gap test), not from sorting.
    Credit and assists in one sweep; dense `[campaign][day]` counters; `parquet.rs` writes PLAIN, uncompressed.
-6. `slow.rs`: exact single-threaded general path. Used whenever a fast-path precondition fails
+6. `slow.rs`: exact general path with no fast-path assumptions. Used whenever a fast-path precondition fails
    (window span >= 2^32 ms, > 429 categories, huge counter grid, `ingest_ts` not on a whole second, >= 2^31
-   events, ...). Force it with `SE_SLOW=1`. **Every fast path must keep an exact fallback.**
+   events, ...). Force it with `SE_SLOW=1`. It runs on `NCPU` threads (scalar line parser -> records
+   partitioned by event-ID hash -> one `HashMap` dedup per partition -> per-person sort and sessions):
+   19 s and 10.2 GB peak RSS at 60M events on the benchmark VM (20M: 6.7 s, 3.6 GB), so a fallback in the
+   final stays far inside the 3-minute cap. `SE_SLOW=2` runs the original single-threaded reference
+   (`run_simple`, 83 s at 20M) that it must agree with. **Every fast path must keep an exact fallback.**
 
 Useful knobs: `SE_TIMING=1` (per-phase wall/user/sys), `SE_THREADS`, `SE_KERNEL=hop|scan` (events), `SE_CKERNEL=hop|scan` (clicks), `SE_SIMD=scalar|swar|sse2|avx512`,
 `SE_CHUNK`, `SE_SLOW=1`, `SE_PBITS`/`SE_DBITS`, `SE_STAGE`, `--kernel-bench` (`KB_KIND=clicks` for the click kernel). Full list in `bench/README.md`.

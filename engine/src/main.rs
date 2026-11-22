@@ -90,7 +90,7 @@ fn main() {
     }
     let done = !util::env_flag("SE_SLOW") && fast::run(&inp, &out, nthreads, &mut tm);
     if !done {
-        slow::run(&inp, &out);
+        slow::run(&inp, &out, nthreads, &mut tm);
         tm.lap("slow path");
     }
     // Give the arenas back from all threads at once; exit would do it on one (SE_RELEASE=0: off).
