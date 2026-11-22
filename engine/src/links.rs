@@ -30,6 +30,9 @@ pub struct LinkTable {
 unsafe impl Send for LinkTable {}
 unsafe impl Sync for LinkTable {}
 
+/// How far ahead the build loops prefetch.
+const AHEAD: usize = 12;
+
 #[inline(always)]
 pub fn part_of(h: u64, bits: u32) -> usize {
     ((h >> 1) >> (63 - bits)) as usize
@@ -142,6 +145,7 @@ impl LinkTable {
         if total >= u32::MAX as u64 {
             return None;
         }
+        let tt = std::time::Instant::now();
         let slots = os_alloc(total as usize * 16) as *mut Slot;
         let t = LinkTable { slots, base, mask, bits, any: true };
         let eptr: Vec<usize> = edges.iter_mut().map(|e| e.as_mut_ptr() as usize).collect();
@@ -157,7 +161,12 @@ impl LinkTable {
                 let m = t.mask[p];
                 for o in occ {
                     for sl in o.slices(p) {
-                        for oc in sl.iter() {
+                        for (k, oc) in sl.iter().enumerate() {
+                            // a few records ahead: its bucket and the edge word it will fill
+                            if let Some(n) = sl.get(k + AHEAD) {
+                                prefetch(t.slots.add((b + (id_hash(n.id) as u32 & m & !3)) as usize));
+                                prefetch((eptr[(n.who >> 1) as usize] as *const [u32; 2]).add(n.edge as usize));
+                            }
                             let mut i = id_hash(oc.id) as u32 & m & !3;
                             let g = loop {
                                 let s = &mut *t.slots.add((b + i) as usize);
@@ -178,13 +187,22 @@ impl LinkTable {
                 }
             }
         });
+        let t_ins = tt.elapsed();
         let edges_ref: &[Vec<[u32; 2]>] = edges;
         par((0..edges_ref.len()).collect(), |_, i: usize| unsafe {
             let t = &t;
-            for e in &edges_ref[i] {
+            // The slots of a line's two IDs are anywhere in the table: ask for them a few
+            // lines ahead, so that the misses overlap instead of queueing up.
+            let es = &edges_ref[i];
+            for (k, e) in es.iter().enumerate() {
+                if let Some(n) = es.get(k + AHEAD) {
+                    prefetch(t.slots.add(n[0] as usize));
+                    prefetch(t.slots.add(n[1] as usize));
+                }
                 t.union(e[0], e[1]);
             }
         });
+        let t_un = tt.elapsed();
         let total = total as usize;
         let step = (total / (nthreads * 8)).max(4096);
         for phase in 0..2 {
@@ -196,7 +214,16 @@ impl LinkTable {
                     if s0 >= total {
                         break;
                     }
-                    for s in s0..(s0 + step).min(total) {
+                    let end = (s0 + step).min(total);
+                    for s in s0..end {
+                        // the parent (phase 0) or root (phase 1) of a slot further on
+                        if s + AHEAD < end {
+                            let n = t.slots.add(s + AHEAD);
+                            if (*n).key != 0 {
+                                let to = if phase == 0 { (*n).aux as u32 } else { ((*n).aux >> 32) as u32 };
+                                prefetch(t.slots.add(to as usize));
+                            }
+                        }
                         let s = s as u32;
                         let sl = t.slots.add(s as usize);
                         if (*sl).key != 0 {
@@ -209,6 +236,9 @@ impl LinkTable {
                     }
                 }
             });
+        }
+        if env_flag("SE_TIMING") {
+            eprintln!("[links] slots {} ({} MB), lines {}: insert {:.1} ms, union {:.1} ms, names {:.1} ms", total, total * 16 >> 20, edges.iter().map(|e| e.len()).sum::<usize>(), t_ins.as_secs_f64() * 1e3, (t_un - t_ins).as_secs_f64() * 1e3, (tt.elapsed() - t_un).as_secs_f64() * 1e3);
         }
         Some(t)
     }

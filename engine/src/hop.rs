@@ -245,6 +245,32 @@ mod k {
         }
     }
 
+    /// `fast::hex_key` with 33 readable bytes at `a`.
+    #[inline(always)]
+    pub unsafe fn hex33(a: *const u8, len: usize) -> Option<(u64, u64)> {
+        unsafe {
+            if len != 33 {
+                return None;
+            }
+            let v = _mm256_loadu_si256(a.add(1) as *const __m256i);
+            // a digit: byte - '0' <= 9; a letter: byte - 'a' <= 5 (unsigned)
+            let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+            let l = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+            let isd = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+            let isl = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+            if _mm256_movemask_epi8(_mm256_or_si256(isd, isl)) != -1 {
+                return None;
+            }
+            let nib = _mm256_blendv_epi8(_mm256_add_epi8(l, _mm256_set1_epi8(10)), d, isd);
+            // pairs of nibbles to bytes, eight bytes per 128-bit lane
+            let by = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+            let pk = _mm256_packus_epi16(by, by);
+            let hi = (_mm_cvtsi128_si64(_mm256_castsi256_si128(pk)) as u64).swap_bytes();
+            let lo = (_mm_cvtsi128_si64(_mm256_extracti128_si256(pk, 1)) as u64).swap_bytes();
+            Some((hi, lo))
+        }
+    }
+
     /// `pack_id16` of two IDs of 0..=9 bytes, all in `0x30..=0x7F` (see `pack2_id16`);
     /// lengths up to 16 are allowed and give a meaningless value.
     #[inline(always)]
@@ -354,6 +380,11 @@ mod k {
             }
             (a, l)
         }
+    }
+
+    #[inline(always)]
+    pub unsafe fn hex33(a: *const u8, len: usize) -> Option<(u64, u64)> {
+        unsafe { crate::fast::hex_key(a, len) }
     }
 
     #[inline(always)]
@@ -550,6 +581,17 @@ struct Hot {
     /// `REFILL`: the partitions the row wrote to.
     ps: usize,
     ds: usize,
+    us: usize,
+    ls: usize,
+    /// For the long lines finished in `hop_row`: the raw parts of the `UHRec` and `LHRec`
+    /// writers, their partition shift, the `URec` region, the or of the `UHRec` indexes.
+    uhh: *mut (*mut UHRec, *mut UHRec),
+    uhb: *mut UHRec,
+    lhh: *mut (*mut LHRec, *mut LHRec),
+    lhb: *mut LHRec,
+    lshift: u32,
+    ubase: usize,
+    max_uidx: usize,
     /// `PURCHASE`: the row so far.
     pur: Purchase,
     /// `LONGROW`: the row so far.
@@ -685,6 +727,28 @@ macro_rules! row_rest {
     }};
 }
 
+/// `push16` for 32-byte records.
+#[inline(always)]
+unsafe fn push32<T: Copy>(heads: *mut (*mut T, *mut T), buf: *mut T, s: usize, v: T, full: &mut usize) -> usize {
+    unsafe {
+        let so = s << 4;
+        let h = (heads as *mut u8).add(so) as *mut (*mut T, *mut T);
+        let p = (*h).0 as usize;
+        // which of the line's two records
+        let n = p & 0x20;
+        let line = (buf as *mut u8).add(so * 4);
+        (line.add(n) as *mut T).write(v);
+        (*h).0 = (p + 32) as *mut T;
+        if n != 0 {
+            wc_copy((p - 0x20) as *mut u8, line, 64);
+            if (*h).1 as usize == p + 32 {
+                *full = REFILL;
+            }
+        }
+        p
+    }
+}
+
 /// One line at `p` (with `GUARD` readable bytes): handles it and returns the start of the next
 /// line (plus `REFILL`), or one of the codes above. No calls in here: the loop around it
 /// keeps its constants in registers.
@@ -734,7 +798,71 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
         }
         if long {
             hot.lr.rest = (ts, ing_s, kt, s5, mcb, open, nl);
-            return LONGROW;
+            // The usual long line - an ID of the hexadecimal shape, the other one short or of
+            // that shape too, not a purchase in the window - is finished here like a short
+            // one; every other goes to `long_emit` (the same records, see there).
+            if !RAW {
+                return LONGROW;
+            }
+            let (a0, l0, a1, l1) = hot.lr.ids;
+            let good = ((ts.wrapping_sub(hot.ws) as u64) < hot.span) && (ing_s * 1000).wrapping_sub(ts) <= DAY && l1 != 0;
+            if good & (kt < 2) {
+                return LONGROW;
+            }
+            let (he, hu) = (k::hex33(a0, l0), k::hex33(a1, l1));
+            if ((l0 > 9) & he.is_none()) | ((l1 > 9) & hu.is_none()) {
+                return LONGROW;
+            }
+            let mut next = s5 as usize + nl + 1;
+            let dd = (ing_s - hot.ibase_s) as u64;
+            hot.max_d |= dd;
+            let mut prec = NOPREC;
+            if good {
+                let pts = (ts - hot.cbase) as u32;
+                let mut full = 0;
+                if let Some((hi, lo)) = hu {
+                    let rec = UHRec { hi, ts: pts, pc: 0, lo, pre: *a1 as u32, pad: 0 };
+                    let us = ((rec.hash() >> 1) >> hot.lshift) as usize;
+                    let r = push32(hot.uhh, hot.uhb, us, rec, &mut full);
+                    if full != 0 {
+                        hot.us = us;
+                        next |= REFILL;
+                    }
+                    let idx = r.wrapping_sub(hot.ubase) / 32;
+                    hot.max_uidx |= idx;
+                    prec = idx as u32 | UFLAG | HFLAG;
+                } else {
+                    let uid = pack_id16(a1, l1);
+                    let ps = ((id_hash(uid) >> 1) >> hot.pshift) as usize;
+                    let r = push16(hot.ph, hot.pb, ps, PRec { k: uid, ts: pts, pc: 0 }, &mut full);
+                    if full != 0 {
+                        hot.ps = ps;
+                        next |= REFILL;
+                    }
+                    let idx = r.wrapping_sub(hot.pbase) / std::mem::size_of::<PRec>();
+                    hot.max_idx |= idx;
+                    prec = idx as u32;
+                }
+            }
+            let mut full = 0;
+            if let Some((hi, lo)) = he {
+                let pre = *a0 as u32;
+                let ls = ((hex_hash(hi, lo, pre) >> 1) >> hot.lshift) as usize;
+                push32(hot.lhh, hot.lhb, ls, LHRec { hi, lo, ing: dd as u32, prec, pre, pad: 0 }, &mut full);
+                if full != 0 {
+                    hot.ls = ls;
+                    next |= REFILL;
+                }
+            } else {
+                let eid = pack_id16(a0, l0);
+                let ds = ((id_hash(eid) >> 1) >> hot.dshift) as usize;
+                push16(hot.dh, hot.db, ds, DRec { eid, ing: dd as u32, prec }, &mut full);
+                if full != 0 {
+                    hot.ds = ds;
+                    next |= REFILL;
+                }
+            }
+            return next;
         }
         let mut next = s5 as usize + nl + 1;
         let dd = (ing_s - hot.ibase_s) as u64;
@@ -787,7 +915,7 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
 /// bytes or more gets a `URec`, an event_id of 10 bytes or more an `LRec`: for these bytes
 /// `packable` is the length alone.
 #[inline(never)]
-unsafe fn long_emit<const RAW: bool>(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> *const u8 {
+unsafe fn long_emit<const RAW: bool>(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut LW, uw: &mut UW, escape: &mut bool) -> *const u8 {
     unsafe {
         let (a0, l0, a1, l1) = hot.lr.ids;
         let (ts, ing_s, kt, s5, mcb, open, nl) = hot.lr.rest;
@@ -799,7 +927,10 @@ unsafe fn long_emit<const RAW: bool>(ev: &EvRow, hot: &mut Hot, pw: &mut Writers
             if kt >= 2 || pc != 0 {
                 let pts = (ts - hot.cbase) as u32;
                 prec = if l1 > 9 {
-                    push_urec(ev.ctx, uw, escape, a1, l1, ev.fix, pts, pc, true)
+                    match k::hex33(a1, l1) {
+                        Some((hi, lo)) => push_uhrec(ev.ctx, uw, escape, *a1, hi, lo, pts, pc),
+                        None => push_urec(ev.ctx, uw, escape, a1, l1, ev.fix, pts, pc, true),
+                    }
                 } else if RAW {
                     let uid = pack_id16(a1, l1);
                     let ps = ((id_hash(uid) >> 1) >> hot.pshift) as usize;
@@ -830,8 +961,16 @@ unsafe fn long_emit<const RAW: bool>(ev: &EvRow, hot: &mut Hot, pw: &mut Writers
                 dw.push(ds, rec);
             }
         } else {
-            let h = bytes_hash(a0, l0);
-            lw.push(crate::links::part_of(h, ev.ctx.lbits), LRec { h, ptr: (a0 as usize).wrapping_add(ev.fix), len: l0 as u32, ing: dd as u32, prec, pad: 0 });
+            match k::hex33(a0, l0) {
+                Some((hi, lo)) => {
+                    let pre = *a0 as u32;
+                    lw.h.push(crate::links::part_of(hex_hash(hi, lo, pre), ev.ctx.lbits), LHRec { hi, lo, ing: dd as u32, prec, pre, pad: 0 });
+                }
+                None => {
+                    let h = bytes_hash(a0, l0);
+                    lw.g.push(crate::links::part_of(h, ev.ctx.lbits), LRec { h, ptr: (a0 as usize).wrapping_add(ev.fix), len: l0 as u32, ing: dd as u32, prec, pad: 0 });
+                }
+            }
         }
         s5.add(nl + 1)
     }
@@ -860,7 +999,7 @@ unsafe fn purchase_finish(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw:
 /// One pass that finds the newline and splits as `split_row` does: a field has no quote, or
 /// exactly two, as its first and last byte.
 #[inline(never)]
-unsafe fn slow_row_bytes(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> *const u8 {
+unsafe fn slow_row_bytes(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut LW, uw: &mut UW, escape: &mut bool) -> *const u8 {
     unsafe {
         let mut f: [Field; 7] = [(p, 0); 7];
         let (mut k, mut well, mut st, mut nq, mut i) = (0usize, true, p, 0usize, p);
@@ -899,7 +1038,7 @@ unsafe fn slow_row_bytes(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut D
 /// comes within 32 bytes of the end of the readable bytes is handed to `slow_row_bytes`.
 #[cold]
 #[inline(never)]
-unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> *const u8 {
+unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut LW, uw: &mut UW, escape: &mut bool) -> *const u8 {
     unsafe {
         let mut f: [Field; 7] = [(p, 0); 7];
         let (mut k, mut well, mut st, mut nq, mut b) = (0usize, true, p, 0u32, p);
@@ -944,11 +1083,13 @@ unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCac
 }
 
 #[inline(always)]
-unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> u64 {
+unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut LW, uw: &mut UW, escape: &mut bool) -> u64 {
     unsafe {
         let ctx = ev.ctx;
         let (ph, pb) = pw.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
         let (dh, db) = dw.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+        let (uhh, uhb) = uw.h.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+        let (lhh, lhb) = lw.h.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
         let mut hot = Hot {
             ws: ctx.ws,
             span: (ctx.we - ctx.ws) as u64,
@@ -966,6 +1107,15 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
             miss: base,
             ps: 0,
             ds: 0,
+            us: 0,
+            ls: 0,
+            uhh,
+            uhb,
+            lhh,
+            lhb,
+            lshift: 63 - ctx.lbits,
+            ubase: ctx.uregion.base,
+            max_uidx: 0,
             pur: Purchase { eid: 0, uid: 0, ts: 0, dd: 0, s5: base, mcb: 0, open: 0, nl: 0 },
             lr: LongRow { ids: (base, 0, base, 0), rest: (0, 0, 0, base, 0, 0, 0) },
         };
@@ -989,6 +1139,10 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
             if code & REFILL != 0 {
                 pw.refill_full(hot.ps);
                 dw.refill_full(hot.ds);
+                if RAW {
+                    uw.h.refill_full(hot.us);
+                    lw.h.refill_full(hot.ls);
+                }
                 p = (code & !REFILL) as *const u8;
                 continue;
             }
@@ -1020,7 +1174,7 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
             p = slow_row(ev, p, end, cache, pw, dw, lw, uw, escape);
         }
         // (a `PRec` index of NOPREC or more: as in `emit_event`)
-        *escape |= (hot.max_idx >= UFLAG as usize) | (hot.max_d > u32::MAX as u64);
+        *escape |= (hot.max_idx >= UFLAG as usize) | (hot.max_d > u32::MAX as u64) | (hot.max_uidx >= HFLAG as usize);
         slow
     }
 }
@@ -1028,9 +1182,9 @@ unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dat
 /// All event lines of `base[..len]` (whole lines; the last may lack its `\n` only when it
 /// ends at `ev.lim`). Returns how many lines took the general path.
 #[inline(always)]
-pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut Writers<LRec>, uw: &mut Writers<URec>, escape: &mut bool) -> u64 {
+pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, lw: &mut LW, uw: &mut UW, escape: &mut bool) -> u64 {
     unsafe {
-        if pw.raw().is_some() && dw.raw().is_some() && std::mem::size_of::<PRec>() == 16 && std::mem::size_of::<DRec>() == 16 {
+        if pw.raw().is_some() && dw.raw().is_some() && uw.h.raw().is_some() && lw.h.raw().is_some() && std::mem::size_of::<PRec>() == 16 && std::mem::size_of::<DRec>() == 16 {
             hop_loop::<true>(ev, base, len, dates, cache, pw, dw, lw, uw, escape)
         } else {
             hop_loop::<false>(ev, base, len, dates, cache, pw, dw, lw, uw, escape)
@@ -1104,7 +1258,7 @@ unsafe fn id_scan80(a: *const u8) -> (k::V16, usize) {
 }
 
 #[inline(always)]
-unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDates, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>) -> usize {
+unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDates, cw: &mut Writers<CRec>, ucw: &mut UCW) -> usize {
     unsafe {
         // click_id
         let q0 = (*p == b'"') as usize;
@@ -1189,7 +1343,7 @@ unsafe fn click_row(ctx: &Ctx, hot: &mut ClickHot, p: *const u8, dates: &HopDate
 /// The click line at `p` (ending before `end`) by the general rules; returns the next line's start.
 #[cold]
 #[inline(never)]
-unsafe fn slow_click(ctx: &Ctx, p: *const u8, end: *const u8, lim: *const u8, fix: usize, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>) -> *const u8 {
+unsafe fn slow_click(ctx: &Ctx, p: *const u8, end: *const u8, lim: *const u8, fix: usize, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut UCW) -> *const u8 {
     unsafe {
         let mut e = p;
         while e < end && *e != b'\n' {
@@ -1205,7 +1359,7 @@ unsafe fn slow_click(ctx: &Ctx, p: *const u8, end: *const u8, lim: *const u8, fi
 /// All click lines of `base[..len]` (whole lines; the last may lack its `\n` only when it
 /// ends at `lim`, the end of the readable bytes). Returns how many lines took the general path.
 #[inline(always)]
-pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8, fix: usize, dates: &mut HopDates, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut Writers<UCRec>) -> u64 {
+pub unsafe fn hop_clicks(ctx: &Ctx, base: *const u8, len: usize, lim: *const u8, fix: usize, dates: &mut HopDates, cache: &mut DateCache, cw: &mut Writers<CRec>, ucw: &mut UCW) -> u64 {
     unsafe {
         let mut hot = ClickHot { cbase: ctx.cbase, span: (ctx.we - ctx.cbase) as u64, fix, miss: base };
         let end = base.add(len);
