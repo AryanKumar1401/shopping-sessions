@@ -2081,6 +2081,11 @@ mod hop_tests {
     }
 
     fn test_ctx() -> Ctx {
+        // These tests create fresh writers and regions for every run and never free them. With
+        // transparent huge pages each writer's first block costs 2 MiB, which at a few
+        // hundred rounds exhausted a 31 GiB machine: run them without huge pages.
+        unsafe { std::env::set_var("SE_NOTHP", "1") };
+        thp_knob();
         let ws = parse_ts_slice(b"2026-10-01T00:00:00Z");
         let we = parse_ts_slice(b"2026-10-15T00:00:00Z");
         let mut products = IdMap::new(64);
