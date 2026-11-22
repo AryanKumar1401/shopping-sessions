@@ -568,18 +568,33 @@ pub const LONG: u64 = 1 << 63;
 // must scale: `intern_long` is called from every parse thread, for user IDs mostly with an
 // ID that is already known.
 //
-// - 4096 shards by the top bits of a hash of the bytes. A shard is an open-addressing table
-//   of atomic words (32 hash bits, index + 1); lookups take no lock. A miss takes the
-//   shard's lock, looks again, and inserts. A full table is replaced by a bigger copy; the
-//   old one stays valid (and is never freed) for readers that still hold it: they can only
-//   miss in it, which sends them to the lock.
-// - The index comes from one atomic counter; the bytes go to a bump arena of the calling
-//   thread (no allocation per ID); `(pointer, length)` by index sits in a directory of
-//   64K-entry chunks that is written before the table word is published and read without a
-//   lock (`id_bytes`, `id_less`).
+// - An interned ID is one record in a bump arena of the thread that first saw it (no
+//   allocation per ID): `IRec` header (hash, length, index), then the bytes. Records never
+//   move and are never freed.
+// - 4096 shards by the low bits of a hash of the bytes. A shard is an open-addressing table
+//   of atomic words (16 hash bits, 48-bit record address); lookups take no lock and touch
+//   the table word and the record. A miss takes the shard's lock, looks again, and inserts.
+//   A full table is replaced by a bigger copy; the old one stays valid (and is never freed)
+//   for readers that still hold it: they can only miss in it, which sends them to the lock.
+// - The index comes from one atomic counter; the record's address by index sits in a
+//   directory of 128K-entry chunks that is written before the table word is published and
+//   read without a lock (`long_bytes`, `id_bytes`, `id_less`).
 const INTERN_SHARD_BITS: u32 = 12;
-const DIR_CHUNK_BITS: u32 = 16;
+const DIR_CHUNK_BITS: u32 = 17;
 
+#[repr(C)]
+struct IRec {
+    hash: u64,
+    len: u32,
+    idx: u32,
+    // the bytes follow
+}
+impl IRec {
+    #[inline(always)]
+    fn bytes(&self) -> &'static [u8] {
+        unsafe { std::slice::from_raw_parts((self as *const IRec).add(1) as *const u8, self.len as usize) }
+    }
+}
 struct InternTable {
     mask: usize,
     slots: Box<[AtomicU64]>,
@@ -591,8 +606,9 @@ struct InternShard {
 }
 static INTERN: std::sync::OnceLock<Box<[InternShard]>> = std::sync::OnceLock::new();
 static INTERN_NEXT: AtomicU64 = AtomicU64::new(0);
-/// Directory chunks: `1 << DIR_CHUNK_BITS` entries of (pointer, length) each.
-static INTERN_DIR: [AtomicPtr<(usize, usize)>; 1 << 16] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 1 << 16];
+/// Directory chunks: `1 << DIR_CHUNK_BITS` record addresses each.
+static INTERN_DIR: [AtomicPtr<usize>; 1 << 15] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 1 << 15];
+const ADDR: u64 = (1 << 48) - 1;
 
 #[inline]
 fn hash_bytes(s: &[u8]) -> u64 {
@@ -612,12 +628,12 @@ fn hash_bytes(s: &[u8]) -> u64 {
 
 /// The directory entry of index `i`; its chunk is created if `make`.
 #[inline]
-fn intern_dir(i: usize, make: bool) -> *mut (usize, usize) {
+fn intern_dir(i: usize, make: bool) -> *mut usize {
     let c = &INTERN_DIR[i >> DIR_CHUNK_BITS];
     let mut p = c.load(Ordering::Acquire);
     if p.is_null() {
         assert!(make);
-        let n = os_alloc(std::mem::size_of::<(usize, usize)>() << DIR_CHUNK_BITS) as *mut (usize, usize);
+        let n = os_alloc(std::mem::size_of::<usize>() << DIR_CHUNK_BITS) as *mut usize;
         p = match c.compare_exchange(std::ptr::null_mut(), n, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => n,
             Err(other) => other, // the lost chunk stays untouched (never freed)
@@ -630,24 +646,28 @@ fn intern_dir(i: usize, make: bool) -> *mut (usize, usize) {
 /// for any handle obtained before the call, from any thread, while others are still interning.
 #[inline]
 pub fn long_bytes(id: Id) -> &'static [u8] {
-    let (p, n) = unsafe { *intern_dir((id & !LONG) as usize, false) };
-    unsafe { std::slice::from_raw_parts(p as *const u8, n) }
+    unsafe { (*(*intern_dir((id & !LONG) as usize, false) as *const IRec)).bytes() }
+}
+
+/// Where the probe sequence of hash `h` starts, and its tag (the top 16 bits, in place).
+#[inline(always)]
+fn intern_pos(h: u64, mask: usize) -> (usize, u64) {
+    ((h >> INTERN_SHARD_BITS) as usize & mask, h & !ADDR)
 }
 
 /// Finds `s` (hash `h`) in `t`: its index.
 #[inline]
 fn intern_find(t: &InternTable, h: u64, s: &[u8]) -> Option<u64> {
-    let tag = h >> 32;
-    let mut i = tag as usize & t.mask;
+    let (mut i, tag) = intern_pos(h, t.mask);
     loop {
-        let v = t.slots[i].load(Ordering::Acquire);
+        let v = unsafe { t.slots.get_unchecked(i) }.load(Ordering::Acquire);
         if v == 0 {
             return None;
         }
-        if v >> 32 == tag {
-            let idx = (v & 0xFFFF_FFFF) - 1;
-            if long_bytes(idx) == s {
-                return Some(idx);
+        if v & !ADDR == tag {
+            let r = unsafe { &*((v & ADDR) as *const IRec) };
+            if r.hash == h && r.bytes() == s {
+                return Some(r.idx as u64);
             }
         }
         i = (i + 1) & t.mask;
@@ -658,21 +678,27 @@ fn intern_table(cap: usize) -> *mut InternTable {
     Box::into_raw(Box::new(InternTable { mask: cap - 1, slots: (0..cap).map(|_| AtomicU64::new(0)).collect() }))
 }
 
-/// A private, permanent copy of `s`, from a bump arena of this thread.
-fn intern_copy(s: &[u8]) -> *const u8 {
+/// A new record for `s` in a bump arena of this thread (64 KiB at first, then 8 MiB slabs on huge pages).
+fn intern_record(s: &[u8], hash: u64, idx: u32) -> *const IRec {
     thread_local! {
-        static BUMP: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+        static BUMP: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 64 << 10)) };
     }
+    let need = (std::mem::size_of::<IRec>() + s.len() + 7) & !7;
     BUMP.with(|b| {
-        let (mut cur, mut end) = b.get();
-        if cur + s.len() > end {
-            let n = s.len().max(256 << 10);
+        let (mut cur, mut end, mut next) = b.get();
+        if cur + need > end {
+            let n = need.max(next);
             cur = os_alloc(n) as usize;
             end = cur + n;
+            next = SLAB;
         }
-        unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), cur as *mut u8, s.len()) };
-        b.set((cur + s.len(), end));
-        cur as *const u8
+        let r = cur as *mut IRec;
+        unsafe {
+            r.write(IRec { hash, len: s.len() as u32, idx });
+            std::ptr::copy_nonoverlapping(s.as_ptr(), r.add(1) as *mut u8, s.len());
+        }
+        b.set((cur + need, end, next));
+        r as *const IRec
     })
 }
 
@@ -680,7 +706,7 @@ fn intern_copy(s: &[u8]) -> *const u8 {
 pub fn intern_long(s: &[u8]) -> Id {
     let shards = INTERN.get_or_init(|| (0..1usize << INTERN_SHARD_BITS).map(|_| InternShard { lock: Mutex::new(0), table: AtomicPtr::new(std::ptr::null_mut()) }).collect());
     let h = hash_bytes(s);
-    let sh = &shards[(h >> (64 - INTERN_SHARD_BITS)) as usize];
+    let sh = &shards[h as usize & ((1 << INTERN_SHARD_BITS) - 1)];
     let t = sh.table.load(Ordering::Acquire);
     if !t.is_null() {
         if let Some(i) = intern_find(unsafe { &*t }, h, s) {
@@ -702,7 +728,7 @@ pub fn intern_long(s: &[u8]) -> Id {
             for slot in old.slots.iter() {
                 let v = slot.load(Ordering::Relaxed);
                 if v != 0 {
-                    let mut i = (v >> 32) as usize & new.mask;
+                    let mut i = intern_pos(unsafe { (*((v & ADDR) as *const IRec)).hash }, new.mask).0;
                     while new.slots[i].load(Ordering::Relaxed) != 0 {
                         i = (i + 1) & new.mask;
                     }
@@ -714,18 +740,19 @@ pub fn intern_long(s: &[u8]) -> Id {
         t = n;
     }
     let idx = INTERN_NEXT.fetch_add(1, Ordering::Relaxed);
-    if idx >= 0xFFFF_FFFF {
+    if idx >= 0xFFFF_FFFF || s.len() > u32::MAX as usize {
         eprintln!("shopping-engine: too many distinct long IDs");
         std::process::exit(1);
     }
-    unsafe { *intern_dir(idx as usize, true) = (intern_copy(s) as usize, s.len()) };
+    let rec = intern_record(s, h, idx as u32);
+    debug_assert!(rec as u64 & !ADDR == 0);
+    unsafe { *intern_dir(idx as usize, true) = rec as usize };
     let t = unsafe { &*t };
-    let tag = h >> 32;
-    let mut i = tag as usize & t.mask;
+    let (mut i, tag) = intern_pos(h, t.mask);
     while t.slots[i].load(Ordering::Relaxed) != 0 {
         i = (i + 1) & t.mask;
     }
-    t.slots[i].store((tag << 32) | (idx + 1), Ordering::Release);
+    t.slots[i].store(tag | rec as u64, Ordering::Release);
     *count += 1;
     idx | LONG
 }
