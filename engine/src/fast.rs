@@ -97,12 +97,21 @@ pub struct Ctx {
     pub pregion: &'static Region,
     /// Event lines by the row-hopping kernel (hop.rs) instead of the delimiter scanner.
     pub hop: bool,
+    /// Click lines by their row-hopping kernel (SE_CKERNEL=hop / scan; default as `hop`).
+    pub chop: bool,
 }
 
 /// Whether event lines take the row-hopping kernel: SE_KERNEL=hop / SE_KERNEL=scan decide;
 /// by default it is used where it has its vector code (x86-64 built with AVX2).
 pub fn hop_default(level: Level) -> bool {
-    match std::env::var("SE_KERNEL").as_deref() {
+    kernel_default("SE_KERNEL", level)
+}
+/// The same for click lines: SE_CKERNEL=hop / SE_CKERNEL=scan.
+pub fn chop_default(level: Level) -> bool {
+    kernel_default("SE_CKERNEL", level)
+}
+fn kernel_default(var: &str, level: Level) -> bool {
+    match std::env::var(var).as_deref() {
         Ok("hop") => true,
         Ok("scan") => false,
         _ => {
@@ -762,8 +771,8 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
                 scan_rows::<M, 7>(buf, base, len, #[inline(always)] |r| event_row(&ev, r, cache, pw, dw, escape));
             }
         } else {
-            if ctx.hop {
-                crate::hop::hop_clicks(ctx, base, len, lim, fix, dates, cache, cw);
+            if ctx.chop {
+                *slow += crate::hop::hop_clicks(ctx, base, len, lim, fix, dates, cache, cw);
             } else {
                 scan::<M, 4>(buf, base, len, #[inline(always)] |f, row| click_general(ctx, f, row, lim, fix, cache, cw));
             }
@@ -827,12 +836,13 @@ fn run_rest(
         return false;
     }
     let pregion = Region::new(pregion_bytes);
-    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_flag("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion, hop: hop_default(level) };
+    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_flag("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion, hop: hop_default(level), chop: chop_default(level) };
 
     if tm.on {
         eprintln!(
-            "[timing] threads={nthreads} simd={level:?} hop={} event_bytes={ev_bytes} dedup_parts={} person_parts={} categories={} campaigns={} links={}",
+            "[timing] threads={nthreads} simd={level:?} hop={} chop={} event_bytes={ev_bytes} dedup_parts={} person_parts={} categories={} campaigns={} links={}",
             ctx.hop,
+            ctx.chop,
             1usize << dbits,
             1usize << pbits,
             ctx.cats.len(),
@@ -962,7 +972,7 @@ fn run_rest(
 
 // ---------------------------------------------------------------- kernel microbenchmark
 
-/// `--kernel-bench`: parses the event files only, with the delimiter scanner ("scan") and the
+/// `--kernel-bench`: parses the event files only (the click files with KB_KIND=clicks), with the delimiter scanner ("scan") and the
 /// row-hopping kernel ("hop"), and prints for each run the wall time, the number of dedup
 /// records, of good events, of lines that left the hop kernel, and an order-independent hash
 /// of every record written (a `DRec` together with the `PRec` it names). Equal hashes and
@@ -983,17 +993,24 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
     let reps = env_usize("KB_REPS").unwrap_or(2);
     let nt_max = threads.iter().copied().max().unwrap_or(1).max(1);
     let pregion_bytes = ev_bytes + nt_max * ((PBLOCK * std::mem::size_of::<PRec>() + 64) << pbits) + (nt_max + 1) * (16 << 20);
-    let mut ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: 0, drop_pages: false, ibase: inp.ws - (1i64 << 31) * 1000, pregion: Region::new(1 << 20), hop: false };
+    let mut ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: 0, drop_pages: false, ibase: inp.ws - (1i64 << 31) * 1000, pregion: Region::new(1 << 20), hop: false, chop: false };
     let mut jobs = Vec::new();
-    make_jobs(&inp.events, 0, chunk_bytes(2 << 20), false, &mut jobs);
+    // KB_KIND=clicks: the click files instead (hash of every `CRec`, row pointer included).
+    let clicks = var("KB_KIND", "events") == "clicks";
+    if clicks {
+        make_jobs(&inp.clicks, 1, chunk_bytes(2 << 20), false, &mut jobs);
+    } else {
+        make_jobs(&inp.events, 0, chunk_bytes(2 << 20), false, &mut jobs);
+    }
     let wc = wc_default();
-    eprintln!("kernel-bench: level={level:?} event_bytes={ev_bytes} jobs={}", jobs.len());
+    eprintln!("kernel-bench: level={level:?} kind={} event_bytes={ev_bytes} jobs={}", if clicks { "clicks" } else { "events" }, jobs.len());
     let mut first: Option<(u64, u64, u64)> = None;
     let mut same = true;
     for &nt in &threads {
         for _ in 0..reps {
             for kernel in kernels.split(',') {
                 ctx.hop = kernel == "hop";
+                ctx.chop = kernel == "hop";
                 ctx.pregion = Region::new(pregion_bytes);
                 let nt = nt.min(jobs.len().max(1));
                 let next = AtomicUsize::new(0);
@@ -1009,12 +1026,24 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
                         }
                         unsafe { main_d(level, &ctx, &mut st, &jobs[j]) };
                     }
-                    (st.escape, st.slow, st.dw.finish(), st.pw.finish())
+                    (st.escape, st.slow, st.dw.finish(), st.pw.finish(), st.cw.finish())
                 });
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
                 let (mut h, mut nd, mut ng, mut slow, mut esc) = (0u64, 0u64, 0u64, 0u64, false);
                 let pbase = ctx.pregion.base as *const PRec;
-                for (e, s, d, _) in &res {
+                for (_, _, _, _, c) in &res {
+                    for part in 0..(1usize << pbits) {
+                        for sl in c.slices(part) {
+                            for r in sl.iter() {
+                                nd += 1;
+                                ng += 1;
+                                let x = mum(r.k ^ K0, K1) ^ (((r.ts as u64) << 32) | r.camp as u64);
+                                h = h.wrapping_add(mum(mum(x ^ r.ptr as u64, K1) ^ K1 ^ part as u64, K0));
+                            }
+                        }
+                    }
+                }
+                for (e, s, d, _, _) in &res {
                     esc |= *e;
                     slow += *s;
                     for part in 0..(1usize << dbits) {
@@ -1167,7 +1196,7 @@ mod hop_tests {
         ts(r, true, &mut f[3]);
         f[4] = if r.one_in(25) { r.pick(&[b"Purchase", b"cart ", b"viewx", b"", b"vie", b"purchas", b"VIEW", b"xiew", b"zart", b"vart", b"purchasd"]).to_vec() } else { r.pick(&[b"view", b"view", b"view", b"cart", b"purchase", b"purchase"]).to_vec() };
         f[5] = if r.one_in(25) { r.pick(&[b"", b"P1", b"p123456789012345678901234567890", b"p\xFF1", b"p 1", b"x"]).to_vec() } else { format!("p{}", r.below(40)).into_bytes() };
-        f[6] = if r.one_in(6) { r.pick(&[b"", b"19.99", b"-5", b"0", b"00", b"0250", b"10000000", b"10000001", b"1000\r", b"99999999999999999999", b"12a", b"123456789012345678901234567890123"]).to_vec() } else { format!("{}", 1 + r.below(60_000)).into_bytes() };
+        f[6] = if r.one_in(6) { r.pick(&[b"", b"19.99", b"-5", b"0", b"00", b"0250", b"10000000", b"10000001", b"1000\r", b"99999999999999999999", b"12a", b"123456789012345678901234567890123", b"1234567\x01", b"\x021", b"1 ", b"12345678", b"00000001", b"000000001", b"9999999", b"1234567\r", b"\t5"]).to_vec() } else { format!("{}", 1 + r.below(60_000)).into_bytes() };
         let mut nf = 7;
         if r.one_in(60) {
             nf = r.below(10) as usize;
@@ -1276,6 +1305,7 @@ mod hop_tests {
             ibase: ws - (1i64 << 31) * 1000,
             pregion: Region::new(1 << 20),
             hop: false,
+            chop: false,
         }
     }
 
@@ -1364,7 +1394,7 @@ mod hop_tests {
     }
 
     fn run_clicks(ctx: &mut Ctx, data: &'static [u8], hop: bool, level: Level, chunk: usize) -> Vec<(Id, u32, u32, usize)> {
-        ctx.hop = hop;
+        ctx.chop = hop;
         let mut st = PState {
             escape: false,
             slow: 0,
@@ -1387,6 +1417,7 @@ mod hop_tests {
         for part in 0..(1usize << ctx.pbits) {
             for sl in c.slices(part) {
                 for r in sl.iter() {
+                    assert!(part == part_of(id_hash(r.k), ctx.pbits));
                     out.push((r.k, r.ts, r.camp, r.ptr - data.as_ptr() as usize));
                 }
             }
@@ -1427,5 +1458,139 @@ mod hop_tests {
             }
         }
         assert!(kept > 1000, "the generator must produce clicks that are kept ({kept})");
+    }
+
+    fn click_line_edges(r: &mut Rng, out: &mut Vec<u8>) {
+        let mut f: Vec<Vec<u8>> = vec![Vec::new(); 4];
+        match r.below(40) {
+            0 => {}
+            1 => f[0] = b"k1234567890123456".to_vec(),
+            2 => f[0] = b"k123456789012345".to_vec(),
+            3 => f[0] = b"k1234567890123456789012345678901234567890".to_vec(),
+            4 => f[0] = b"k-1 x\xC3\xA9".to_vec(),
+            _ => id(r, b'k', &mut f[0]),
+        }
+        id(r, b'u', &mut f[1]);
+        f[2] = if r.one_in(15) { r.pick(&[b"", b"C_1", b"c_999", b"c_1 ", b" c_1", b"c_12345678", b"c_1234567", b"c_123456789", b"c-1", b"organic", b"c_1\x00", b"c_\xC3\xA9", b"c1"]).to_vec() } else { format!("c_{}", r.below(45)).into_bytes() };
+        if r.one_in(12) {
+            // the click window's edges (window 2026-10-01 .. 2026-10-15) and impossible values
+            f[3] = r
+                .pick(&[
+                    b"2026-09-24T00:00:00Z",
+                    b"2026-09-23T23:59:59Z",
+                    b"1790208000000",
+                    b"1790207999999",
+                    b"2026-09-24T02:00:00+02:00",
+                    b"2026-09-24T01:59:59+02:00",
+                    b"2026-09-23T23:00:00-01:00",
+                    b"2026-10-14T23:59:59Z",
+                    b"2026-10-15T00:00:00Z",
+                    b"1792022399999",
+                    b"1792022400000",
+                    b"2026-10-15T00:00:00+00:01",
+                    b"2026-10-14T23:59:00-00:01",
+                    b"2026-10-03T23:58:10-00:00",
+                    b"2026-10-03T23:58:10+24:00",
+                    b"2026-10-03T23:58:10+23:59",
+                    b"2026-10-03T23:58:10+05:60",
+                    b"2026-10-03T24:00:00Z",
+                    b"2026-10-03T23:60:00Z",
+                    b"2026-10-03T23:59:60Z",
+                    b"2026-10-03T23:58:10Z\r",
+                    b"0001791071890000",
+                    b"1791071890000 ",
+                    b"2026-10-03T23:58:10,00:00",
+                    b"2026-02-30T10:00:00Z",
+                    b"2026-10-03t23:58:10Z",
+                    b"2026-10-03T23:58:10z",
+                ])
+                .to_vec();
+        } else {
+            ts(r, false, &mut f[3]);
+        }
+        let mut nf = 4;
+        if r.one_in(50) {
+            nf = r.below(7) as usize;
+        }
+        let start = out.len();
+        for k in 0..nf {
+            if k > 0 {
+                out.push(b',');
+            }
+            let v: &[u8] = if k < 4 { &f[k] } else { b"x" };
+            let q = r.one_in(4);
+            if q {
+                out.push(b'"');
+            }
+            out.extend_from_slice(v);
+            if q && !r.one_in(150) {
+                out.push(b'"');
+            }
+        }
+        if r.one_in(25) && out.len() > start {
+            let pos = start + r.below((out.len() - start) as u64) as usize;
+            let c = *r.pick(&[b"\"", b",", b"\n", b"\r", b"\x00", b"\xE2", b" ", b"Z", b"0", b":", b"-", b"+"]).first().unwrap();
+            match r.below(3) {
+                0 => out[pos] = c,
+                1 => out.insert(pos, c),
+                _ => {
+                    out.remove(pos);
+                }
+            }
+        }
+        if r.one_in(100) {
+            out.push(b'\r');
+        }
+        out.push(b'\n');
+        if r.one_in(200) {
+            out.push(b'\n');
+        }
+    }
+
+
+    /// The same with more campaigns (long, odd and 9-byte IDs among them), click IDs of 15 to 40
+    /// bytes, and timestamps on both edges of the click window in all three forms.
+    #[test]
+    fn hop_clicks_window_edges() {
+        let mut ctx = test_ctx();
+        ctx.pregion = Region::new(1 << 20);
+        let mut campaigns = IdMap::new(64);
+        for i in 0..40u32 {
+            let name = format!("c_{i}");
+            campaigns.insert(unsafe { pack_id(name.as_ptr(), name.len(), name.as_ptr().add(name.len())) }, i);
+        }
+        for (i, name) in [&b"c_1234567"[..], b"c-1", b"c_12345678901"].iter().enumerate() {
+            campaigns.insert(unsafe { pack_id(name.as_ptr(), name.len(), name.as_ptr().add(name.len())) }, 100 + i as u32);
+        }
+        ctx.campaigns = campaigns;
+        let level = pick_level();
+        let rounds: u64 = std::env::var("HOP_FUZZ_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        let mut r = Rng(0x2545_F491_4F6C_DD1D);
+        let mut total = 0;
+        for round in 0..rounds {
+            let mut v = b"click_id,user_id,campaign_id,ts\n".to_vec();
+            let rows = 1 + r.below(if round % 4 == 0 { 30 } else { 3000 }) as usize;
+            for _ in 0..rows {
+                click_line_edges(&mut r, &mut v);
+            }
+            if round % 3 == 0 {
+                v.pop();
+            }
+            let data: &'static [u8] = Box::leak(v.into_boxed_slice());
+            let want = run_clicks(&mut ctx, data, false, Level::Scalar, 1 << 30);
+            total += want.len();
+            for chunk in [1usize << 30, 7, 193, 4096] {
+                let got = run_clicks(&mut ctx, data, true, level, chunk);
+                if got != want {
+                    let i = (0..got.len().min(want.len())).find(|&i| got[i] != want[i]).unwrap_or(got.len().min(want.len()));
+                    let at = got.get(i).or(want.get(i)).map_or(0, |x| x.3);
+                    let line = &data[at..data.len().min(at + 80)];
+                    panic!("round {round} chunk {chunk}: {} vs {} records; first difference at {i}: {:?} vs {:?} (line {:?})", got.len(), want.len(), got.get(i), want.get(i), String::from_utf8_lossy(line));
+                }
+            }
+            let got = run_clicks(&mut ctx, data, false, level, 4096);
+            assert!(got == want, "scan kernel differs in round {round}");
+        }
+        assert!(total as u64 > rounds * 100, "the reference accepted too few clicks: {total}");
     }
 }

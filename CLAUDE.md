@@ -72,8 +72,8 @@ Everything runs on `NCPU` threads over work queues; the process ends with `_exit
    (window span >= 2^32 ms, > 429 categories, huge counter grid, `ingest_ts` not on a whole second, >= 2^31
    events, ...). Force it with `SE_SLOW=1`. **Every fast path must keep an exact fallback.**
 
-Useful knobs: `SE_TIMING=1` (per-phase wall/user/sys), `SE_THREADS`, `SE_KERNEL=hop|scan`, `SE_SIMD=scalar|swar|sse2|avx512`,
-`SE_CHUNK`, `SE_SLOW=1`, `SE_PBITS`/`SE_DBITS`, `SE_STAGE`, `--kernel-bench`. Full list in `bench/README.md`.
+Useful knobs: `SE_TIMING=1` (per-phase wall/user/sys), `SE_THREADS`, `SE_KERNEL=hop|scan` (events), `SE_CKERNEL=hop|scan` (clicks), `SE_SIMD=scalar|swar|sse2|avx512`,
+`SE_CHUNK`, `SE_SLOW=1`, `SE_PBITS`/`SE_DBITS`, `SE_STAGE`, `--kernel-bench` (`KB_KIND=clicks` for the click kernel). Full list in `bench/README.md`.
 Known bug: `SE_SIMD=avx512` with the hop kernel segfaults (opt-in only; AVX-512 is slower anyway).
 
 ## Where the time goes now (benchmark VM, commit f35b7cd)
@@ -105,7 +105,7 @@ DATA_DIR=data/dev OUTPUT_DIR=out/x $E && .venv/bin/python scripts/compare.py out
 Plus, on real x86: 20M and 60M outputs must MATCH the DuckDB outputs (`duck/pipeline.py`), and an interleaved
 A/B (`bench/bench.py`) against the previous commit. On Linux use `bench/gate.sh` or `bench/qa_diff_spawn.py`
 instead of `qa/run_all.sh`. On an arm64 Mac the hop kernel is off by default: also run the gate with
-`SE_KERNEL=hop` to exercise its portable version.
+`SE_KERNEL=hop SE_CKERNEL=hop` to exercise the portable versions of both kernels.
 
 Datasets come from the organisers' generator (`downloads/generator`, std-only Rust):
 `generate --seed 1 --events 1000000 --clicks 250000 --output data/dev` (answer in `data/dev-answer`),
