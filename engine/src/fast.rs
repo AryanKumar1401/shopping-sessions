@@ -1601,7 +1601,7 @@ fn run_rest(
                 }
                 // (at most a quarter full: most probes then end at their first slot, without
                 // the mispredicted branch and the read of another record that a fuller table costs)
-                let cap = (a.len() * 4).next_power_of_two();
+                let cap = (a.len() * 8).next_power_of_two();
                 tab32.clear();
                 tab32.resize(cap, 0);
                 let mask = cap - 1;
