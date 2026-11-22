@@ -310,6 +310,23 @@ pub(crate) fn hex_hash(hi: u64, lo: u64, pre: u32) -> u64 {
     mum(hi ^ K0, lo ^ K1) ^ pre as u64
 }
 
+/// `intern_long_h` of each string (address, length, `intern_hash`) in order, into `ids`, the
+/// interner's table word and record prefetched a few strings ahead: most are lookups of IDs
+/// the link build interned, two dependent cache misses each.
+fn intern_ahead(keys: &[(*const u8, u32, u64)], ids: &mut Vec<Id>) {
+    ids.clear();
+    for k in 0..keys.len() {
+        if let Some(x) = keys.get(k + 8) {
+            intern_prefetch(x.2, false);
+        }
+        if let Some(x) = keys.get(k + 4) {
+            intern_prefetch(x.2, true);
+        }
+        let (p, n, h) = keys[k];
+        ids.push(intern_long_h(unsafe { std::slice::from_raw_parts(p, n as usize) }, h));
+    }
+}
+
 /// Turns the records with long user IDs into the records the parse would have written had it
 /// interned every user_id itself: the surviving `URec`s / `UHRec`s into `PRec`s, the `UCRec`s /
 /// `UCHRec`s into `CRec`s, in the partitions of their interned user IDs. Events and clicks of
@@ -336,8 +353,10 @@ pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<U
         let mut seen: Vec<(*const u8, u32, u64, Id)> = Vec::new();
         // (hi, lo, first byte, Id)
         let mut hseen: Vec<(u64, u64, u32, Id)> = Vec::new();
-        // the bytes and interner hash of each of `hseen`
-        let mut ids: Vec<([u8; 33], u64)> = Vec::new();
+        // for `intern_ahead`: the bytes of each of `hseen`, the strings, their Ids
+        let mut hbytes: Vec<[u8; 33]> = Vec::new();
+        let mut keys: Vec<(*const u8, u32, u64)> = Vec::new();
+        let mut ids: Vec<Id> = Vec::new();
         while let Some(&(_, p)) = order.get(next.fetch_add(1, Relaxed)) {
             // the hexadecimal kind: keys compared as words
             let n: usize = uhparts.iter().map(|u| u.count(p)).sum::<usize>() + ucparts.iter().map(|u| u.1.count(p)).sum::<usize>();
@@ -383,19 +402,13 @@ pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<U
                         }
                     }
                 }
-                ids.clear();
-                ids.extend(hseen.iter().map(|e| {
-                    let b = UHRec { hi: e.0, ts: 0, pc: 0, lo: e.1, pre: e.2, pad: 0 }.id();
-                    (b, intern_hash(&b))
-                }));
-                for k in 0..ids.len() {
-                    if let Some(x) = ids.get(k + 8) {
-                        intern_prefetch(x.1, false);
-                    }
-                    if let Some(x) = ids.get(k + 4) {
-                        intern_prefetch(x.1, true);
-                    }
-                    hseen[k].3 = intern_long_h(&ids[k].0, ids[k].1);
+                hbytes.clear();
+                hbytes.extend(hseen.iter().map(|e| UHRec { hi: e.0, ts: 0, pc: 0, lo: e.1, pre: e.2, pad: 0 }.id()));
+                keys.clear();
+                keys.extend(hbytes.iter().map(|b| (b.as_ptr(), 33, intern_hash(b))));
+                intern_ahead(&keys, &mut ids);
+                for (e, &id) in hseen.iter_mut().zip(ids.iter()) {
+                    e.3 = id;
                 }
                 // (every ID is in the table now: the same records went through the first pass)
                 let find = |hi: u64, lo: u64, pre: u32| -> Id {
@@ -437,16 +450,50 @@ pub(crate) fn resolve_long(ctx: &Ctx, uparts: &[Parts<URec>], uhparts: &[Parts<U
                 table.resize(cap, 0);
                 seen.clear();
                 let mask = cap - 1;
-                let mut find = |h: u64, b: &[u8]| -> Id {
+                // (the same three steps as the hexadecimal kind)
+                let mut find = |h: u64, b: &[u8]| {
                     let mut i = (h >> 20) as usize & mask;
                     loop {
                         let t = unsafe { *table.get_unchecked(i) };
                         if t == 0 {
-                            let id = intern_long(b);
-                            seen.push((b.as_ptr(), b.len() as u32, h, id));
+                            seen.push((b.as_ptr(), b.len() as u32, h, 0));
                             unsafe { *table.get_unchecked_mut(i) = seen.len() as u32 };
-                            return id;
+                            return;
                         }
+                        let e = unsafe { seen.get_unchecked(t as usize - 1) };
+                        if e.2 == h && e.1 as usize == b.len() && unsafe { std::slice::from_raw_parts(e.0, e.1 as usize) } == b {
+                            return;
+                        }
+                        i = (i + 1) & mask;
+                    }
+                };
+                for u in uparts {
+                    for sl in u.slices(p) {
+                        for r in sl.iter() {
+                            if r.ts != DEAD {
+                                find(r.h, unsafe { r.id() });
+                            }
+                        }
+                    }
+                }
+                for u in ucparts {
+                    for sl in u.0.slices(p) {
+                        for r in sl.iter() {
+                            find(r.h, unsafe { r.id() });
+                        }
+                    }
+                }
+                keys.clear();
+                keys.extend(seen.iter().map(|e| (e.0, e.1, intern_hash(unsafe { std::slice::from_raw_parts(e.0, e.1 as usize) }))));
+                intern_ahead(&keys, &mut ids);
+                for (e, &id) in seen.iter_mut().zip(ids.iter()) {
+                    e.3 = id;
+                }
+                let find = |h: u64, b: &[u8]| -> Id {
+                    let mut i = (h >> 20) as usize & mask;
+                    loop {
+                        let t = unsafe { *table.get_unchecked(i) };
+                        assert!(t != 0);
                         let e = unsafe { seen.get_unchecked(t as usize - 1) };
                         if e.2 == h && e.1 as usize == b.len() && unsafe { std::slice::from_raw_parts(e.0, e.1 as usize) } == b {
                             return e.3;
