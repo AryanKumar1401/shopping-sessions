@@ -1600,7 +1600,7 @@ fn run_rest(
                 if a.len() < 2 {
                     continue;
                 }
-                let cap = (a.len() * 2).next_power_of_two();
+                let cap = (a.len() * 4).next_power_of_two();
                 tab32.clear();
                 tab32.resize(cap, 0);
                 let mask = cap - 1;
