@@ -433,6 +433,7 @@ fn build_links(files: &[&'static [u8]], level: Level, nthreads: usize) -> Option
     if bytes == 0 {
         return Some(LinkTable::empty());
     }
+    let mut t0 = std::time::Instant::now();
     let est_occ = bytes / 10;
     let bits = ceil_log2(est_occ / 32_768).min(9);
     let mut jobs = Vec::new();
@@ -453,7 +454,8 @@ fn build_links(files: &[&'static [u8]], level: Level, nthreads: usize) -> Option
         (st.occ.finish(), st.edges)
     });
     let (occ, mut edges): (Vec<_>, Vec<_>) = res.into_iter().unzip();
-    LinkTable::build(&occ, &mut edges, bits, nthreads)
+    bg_lap("L parse+scatter", &mut t0);
+    LinkTable::build(&occ, &mut edges, bits, nthreads, &mut t0)
 }
 
 fn env_usize(k: &str) -> Option<usize> {
@@ -775,6 +777,89 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
 }
 dispatch!(main_d, main_g, (ctx: &Ctx, st: &mut PState, job: &Job));
 
+/// Dedup variant (SE_DEDUP): 0 = one table of record pointers per partition, 1 = the same with
+/// the slot of a later record prefetched, 2 = `dedup_grouped`.
+const DEDUP_MODE: usize = 0;
+/// Experiment defaults: link-build threads; 1 = build the links before the parse (measurement).
+const LINK_THREADS: usize = 2;
+const LINKS_FIRST: usize = 0;
+
+/// Dedup of event-ID partition `p` (`n` records) in cache-sized groups: the records are copied
+/// to `tmp` grouped by more bits of the hash (a stable counting sort), and each group gets its
+/// own small table of indices into `tmp`. The rule is the one of the plain loop: of two copies
+/// of an event_id the one with the larger ingest_ts loses and its `PRec`, if any, is marked dead.
+#[allow(clippy::too_many_arguments)]
+unsafe fn dedup_grouped(dparts: &[Parts<DRec>], p: usize, n: usize, dbits: u32, per_group: usize, pbase: *mut PRec, tmp: &mut Vec<DRec>, table: &mut Vec<u32>) {
+    unsafe {
+        // the group: the `gb` hash bits below the partition's
+        let gb = ceil_log2(n.div_ceil(per_group)).min(10);
+        let group = |eid: Id| part_of(id_hash(eid) << dbits, gb);
+        let mut at = [0u32; 1025];
+        for d in dparts {
+            for sl in d.slices(p) {
+                for rec in sl.iter() {
+                    *at.get_unchecked_mut(group(rec.eid) + 1) += 1;
+                }
+            }
+        }
+        let mut sum = 0;
+        for a in at.iter_mut().take((1 << gb) + 1) {
+            sum += *a;
+            *a = sum;
+        }
+        // `at[g]`: where group g's next record goes; afterwards the end of group g
+        tmp.clear();
+        tmp.reserve(n);
+        let t = tmp.as_mut_ptr();
+        for d in dparts {
+            for sl in d.slices(p) {
+                for rec in sl.iter() {
+                    let a = at.get_unchecked_mut(group(rec.eid));
+                    t.add(*a as usize).write(*rec);
+                    *a += 1;
+                }
+            }
+        }
+        let mut start = 0usize;
+        for g in 0..1usize << gb {
+            let end = at[g] as usize;
+            let m = end - start;
+            if m >= 2 {
+                let cap = (m * 2).next_power_of_two();
+                table.clear();
+                table.resize(cap, 0);
+                let mask = cap - 1;
+                for j in start..end {
+                    let rec = &*t.add(j);
+                    let mut i = id_hash(rec.eid) as usize & mask;
+                    loop {
+                        let s = *table.get_unchecked(i);
+                        if s == 0 {
+                            *table.get_unchecked_mut(i) = j as u32 + 1;
+                            break;
+                        }
+                        let other = &*t.add(s as usize - 1);
+                        if other.eid == rec.eid {
+                            let loser = if rec.ing < other.ing {
+                                *table.get_unchecked_mut(i) = j as u32 + 1;
+                                other.prec
+                            } else {
+                                rec.prec
+                            };
+                            if loser != NOPREC {
+                                (*pbase.add(loser as usize)).ts = DEAD;
+                            }
+                            break;
+                        }
+                        i = (i + 1) & mask;
+                    }
+                }
+            }
+            start = end;
+        }
+    }
+}
+
 pub fn run(inp: &Inputs, out: &Path, nthreads: usize, tm: &mut Timer) -> bool {
     let level = pick_level();
     let cbase = inp.ws - WEEK;
@@ -794,8 +879,15 @@ pub fn run(inp: &Inputs, out: &Path, nthreads: usize, tm: &mut Timer) -> bool {
     tm.lap("tables");
     std::thread::scope(|sc| {
         // Parse and dedup never look at links, so the link table builds alongside them.
-        let lt = env_usize("SE_LTHREADS").unwrap_or(2).max(1);
+        let lt = env_usize("SE_LTHREADS").unwrap_or(LINK_THREADS).max(1);
         let lh = sc.spawn(move || build_links(&inp.links, level, lt));
+        if env_usize("SE_LFIRST").unwrap_or(LINKS_FIRST) != 0 {
+            // measurement only: the link build alone, before the parse
+            while !lh.is_finished() {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            tm.lap("links first");
+        }
         run_rest(inp, out, nthreads, tm, level, cbase, (products, cats, unknown_cat), (campaigns, camp_names, camp_channels), lh)
     })
 }
@@ -896,8 +988,13 @@ fn run_rest(
     let next = AtomicUsize::new(0);
     let dparts_ref = &dparts;
     let pbase_addr = ctx.pregion.base;
+    let dmode = env_usize("SE_DEDUP").unwrap_or(DEDUP_MODE);
+    let dsub = env_usize("SE_DSUB").unwrap_or(2048).max(1);
+    let dpf = env_usize("SE_DPF").unwrap_or(12);
     par((0..nthreads).collect::<Vec<usize>>(), |_, _| {
         let mut table: Vec<u64> = Vec::new();
+        let mut tmp: Vec<DRec> = Vec::new();
+        let mut idx: Vec<u32> = Vec::new();
         let pbase = pbase_addr as *mut PRec;
         loop {
             let p = next.fetch_add(1, Relaxed);
@@ -908,13 +1005,21 @@ fn run_rest(
             if n < 2 {
                 continue;
             }
+            if dmode == 2 && n < u32::MAX as usize {
+                unsafe { dedup_grouped(dparts_ref, p, n, dbits, dsub, pbase, &mut tmp, &mut idx) };
+                continue;
+            }
             let cap = (n * 2).next_power_of_two();
             table.clear();
             table.resize(cap, 0);
             let mask = cap - 1;
             for d in dparts_ref {
                 for sl in d.slices(p) {
-                    for rec in sl.iter_mut() {
+                    let (sp, sn) = (sl.as_ptr(), sl.len());
+                    for (j, rec) in sl.iter_mut().enumerate() {
+                        if dmode == 1 && j + dpf < sn {
+                            prefetch(unsafe { table.as_ptr().add(id_hash((*sp.add(j + dpf)).eid) as usize & mask) });
+                        }
                         let h = id_hash(rec.eid);
                         let tag = (h >> 32) << 48;
                         let me = (rec as *mut DRec as u64) | tag;

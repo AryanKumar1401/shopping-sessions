@@ -554,6 +554,20 @@ impl Timer {
     }
 }
 
+pub fn timing_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_flag("SE_TIMING") || std::env::args().any(|a| a == "--timing"))
+}
+
+/// Measurement only: a `[timing]` line (wall) from a background thread.
+pub fn bg_lap(name: &str, last: &mut Instant) {
+    if timing_on() {
+        let n = Instant::now();
+        eprintln!("[timing] {:<28} wall {:>9.3} ms   user {:>9.3} ms   sys {:>8.3} ms   (t={:.3} ms)", name, (n - *last).as_secs_f64() * 1e3, 0.0, 0.0, 0.0);
+        *last = n;
+    }
+}
+
 // ---------------------------------------------------------------- IDs
 
 /// An ID string as one word. IDs of at most 9 bytes, all in 1..=127 (every generated ID), are

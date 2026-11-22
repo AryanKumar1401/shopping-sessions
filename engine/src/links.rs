@@ -122,7 +122,7 @@ impl LinkTable {
 
     /// `occ[t]`: thread t's ID occurrences partitioned by `part_of(id_hash, bits)`;
     /// `edges[t]`: thread t's link lines, filled here with slot numbers.
-    pub fn build(occ: &[Parts<Occ>], edges: &mut [Vec<[u32; 2]>], bits: u32, nthreads: usize) -> Option<LinkTable> {
+    pub fn build(occ: &[Parts<Occ>], edges: &mut [Vec<[u32; 2]>], bits: u32, nthreads: usize, t0: &mut std::time::Instant) -> Option<LinkTable> {
         let np = 1usize << bits;
         let mut base = Vec::with_capacity(np);
         let mut mask = Vec::with_capacity(np);
@@ -178,6 +178,7 @@ impl LinkTable {
                 }
             }
         });
+        bg_lap("L insert", t0);
         let edges_ref: &[Vec<[u32; 2]>] = edges;
         par((0..edges_ref.len()).collect(), |_, i: usize| unsafe {
             let t = &t;
@@ -185,6 +186,7 @@ impl LinkTable {
                 t.union(e[0], e[1]);
             }
         });
+        bg_lap("L union", t0);
         let total = total as usize;
         let step = (total / (nthreads * 8)).max(4096);
         for phase in 0..2 {
@@ -209,6 +211,12 @@ impl LinkTable {
                     }
                 }
             });
+            bg_lap(if phase == 0 { "L find" } else { "L name" }, t0);
+        }
+        if timing_on() {
+            let used = (0..total).filter(|&i| unsafe { (*t.slots.add(i)).key != 0 }).count();
+            let roots = (0..total).filter(|&i| unsafe { (*t.slots.add(i)).key != 0 && (*t.slots.add(i)).key == (*t.slots.add(i)).aux }).count();
+            eprintln!("[links] parts={np} slots={total} ids={used} people={roots} edges={} table={} MiB", edges_ref.iter().map(|e| e.len()).sum::<usize>(), total * 16 >> 20);
         }
         Some(t)
     }
