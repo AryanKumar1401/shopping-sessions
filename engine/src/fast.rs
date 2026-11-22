@@ -1457,7 +1457,7 @@ fn run_rest(
     let ev_bytes: usize = inp.events.iter().map(|f| f.len()).sum();
     let est_rows = ev_bytes / 75;
     let dbits = env_usize("SE_DBITS").map_or(ceil_log2(est_rows / 65_536).min(10), |b| b.min(12) as u32);
-    let lbits = env_usize("SE_LBITS").map_or(dbits.min(7), |b| b.min(12) as u32);
+    let lbits = env_usize("SE_LBITS").map_or(dbits.min(9), |b| b.min(12) as u32);
     let pbits = env_usize("SE_PBITS").map_or(ceil_log2(est_rows / 50_000).min(10), |b| b.min(12) as u32);
     // Every PRec comes from one region, so that a DRec can name it in 32 bits. A good event
     // line has at least 16 bytes, so the records need at most `ev_bytes`; the rest is for the
@@ -1775,7 +1775,7 @@ pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
     let ev_bytes: usize = inp.events.iter().map(|f| f.len()).sum();
     let est_rows = ev_bytes / 75;
     let dbits = env_usize("SE_DBITS").map_or(ceil_log2(est_rows / 65_536).min(10), |b| b.min(12) as u32);
-    let lbits = env_usize("SE_LBITS").map_or(dbits.min(7), |b| b.min(12) as u32);
+    let lbits = env_usize("SE_LBITS").map_or(dbits.min(9), |b| b.min(12) as u32);
     let pbits = env_usize("SE_PBITS").map_or(ceil_log2(est_rows / 50_000).min(10), |b| b.min(12) as u32);
     let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let kernels = var("KB_KERNELS", "scan,hop");
