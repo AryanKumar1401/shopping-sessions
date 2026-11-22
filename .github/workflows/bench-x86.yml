@@ -1,34 +1,32 @@
-# Scratch: pre-submit check of the real Docker image from main on x86. Not for main.
+# Scratch: speed-of-light probe vs the engine on x86. Not for main.
 name: bench-x86
 on: { push: { branches: [bench-x86] }, workflow_dispatch: {} }
 jobs:
   x86:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env: { RF: "-C target-cpu=x86-64-v3 -C target-feature=+crt-static", T: x86_64-unknown-linux-gnu }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: data and reference engine
+      - name: setup
         run: |
-          lscpu | grep -E "Model name|^CPU\(s\)"
-          (cd bench/x86/generator && cargo build -q --release && ./target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev >/dev/null && ./target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output /tmp/s3 >/dev/null)
-          git worktree add -q /tmp/c4 2fe17ed
-          (cd /tmp/c4/engine && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build -q --release 2>/dev/null) && /tmp/c4/engine/target/release/shopping-engine /tmp/s3 /tmp/ref20
-          python3 -m venv /tmp/venv && /tmp/venv/bin/pip -q install polars pyarrow >/dev/null 2>&1
-      - name: docker build from main
+          lscpu | grep -E "Model name|^CPU\(s\)|L1d|L2|L3"
+          (cd bench/x86/generator && cargo build -q --release && ./target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output /tmp/s3 >/dev/null)
+          (cd bench/x86/sol && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build -q --release && cp target/release/sol /tmp/sol)
+          git worktree add -q /tmp/wt origin/main
+          git -C /tmp/wt apply $GITHUB_WORKSPACE/bench/x86/patches/skip.patch
+          (cd /tmp/wt/engine && RUSTFLAGS="$RF" cargo build -q --release --locked --target $T 2>/dev/null && cp target/$T/release/shopping-engine /tmp/eng)
+          du -sh /tmp/s3/events /tmp/s3/clicks
+      - name: floors
         run: |
-          git worktree add -q /tmp/main origin/main && git -C /tmp/main log --oneline -1
-          docker build -q -t ss:main /tmp/main
-      - name: docker run (scorer-style, read-only data) and check
+          for t in 4; do for m in 0 1 2 3; do /tmp/sol /tmp/s3 $t $m; done; done
+          for i in 1 2 3; do s=$(date +%s%N); find /tmp/s3/events /tmp/s3/clicks -name '*.csv' | xargs -P4 -n8 wc -l >/dev/null; e=$(date +%s%N); echo "xargs -P4 wc -l: $(( (e-s)/1000000 )) ms"; done
+      - name: engine (main + probe knob)
         run: |
-          for d in dev s3; do
-            rm -rf /tmp/out-$d; mkdir -p /tmp/out-$d /tmp/scr && chmod 777 /tmp/out-$d /tmp/scr
-            s=$(date +%s%N); docker run --rm --network none --cpus 4 -v /tmp/$d:/data:ro -v /tmp/out-$d:/output -v /tmp/scr:/scratch ss:main; e=$(date +%s%N)
-            echo "$d: docker run wall $(( (e-s)/1000000 )) ms, exit ok"
+          best() { sort -n | head -1; }
+          for cfg in "full:0:" "scan-only:1:" "events-scan-only:1:clicks" "events-full:0:clicks" "clicks-full:0:events"; do
+            IFS=: read name st sk <<< "$cfg"
+            printf "%-18s " $name; for i in 1 2 3 4 5; do SE_STAGE=$st SE_SKIP=$sk SE_TIMING=1 /tmp/eng /tmp/s3 /tmp/o 2>&1 | grep 'parse events' | awk '{print $5, $8}'; done | best
           done
-          echo "dev vs official-equivalent (DuckDB not needed: compare to c4 engine on dev)"
-          /tmp/c4/engine/target/release/shopping-engine /tmp/dev /tmp/c4dev
-          echo "dev: $(/tmp/venv/bin/python scripts/compare.py /tmp/out-dev /tmp/c4dev | tail -1)"
-          echo "20M: $(/tmp/venv/bin/python scripts/compare.py /tmp/out-s3 /tmp/ref20 | tail -1)"
-          ls /tmp/out-s3/user_daily | head -3
-          for i in 1 2 3; do s=$(date +%s%N); docker run --rm --network none -v /tmp/s3:/data:ro -v /tmp/out-s3:/output -v /tmp/scr:/scratch ss:main; e=$(date +%s%N); echo "20M docker run wall $(( (e-s)/1000000 )) ms"; done
+          for i in 1 2 3; do SE_TIMING=1 /tmp/eng /tmp/s3 /tmp/o 2>&1 | grep -E "timing\] (list|links|parse|dedup|people|campaign|release)" ; echo; done | tail -9
