@@ -1,9 +1,9 @@
 //! OS glue (mmap, arenas), IDs, hashing, thread helper, timing.
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::fd::AsRawFd;
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::time::Instant;
 
 unsafe extern "C" {
@@ -563,30 +563,170 @@ impl Timer {
 pub type Id = u64;
 pub const LONG: u64 = 1 << 63;
 
-struct Interner {
-    map: Mutex<HashMap<&'static [u8], u64>>,
-    list: RwLock<Vec<&'static [u8]>>,
+// The interner. An ID that does not pack is rare in the generated data only by luck of the
+// format (one generator version gives every eighth ID a 32-character suffix), so this path
+// must scale: `intern_long` is called from every parse thread, for user IDs mostly with an
+// ID that is already known.
+//
+// - 4096 shards by the top bits of a hash of the bytes. A shard is an open-addressing table
+//   of atomic words (32 hash bits, index + 1); lookups take no lock. A miss takes the
+//   shard's lock, looks again, and inserts. A full table is replaced by a bigger copy; the
+//   old one stays valid (and is never freed) for readers that still hold it: they can only
+//   miss in it, which sends them to the lock.
+// - The index comes from one atomic counter; the bytes go to a bump arena of the calling
+//   thread (no allocation per ID); `(pointer, length)` by index sits in a directory of
+//   64K-entry chunks that is written before the table word is published and read without a
+//   lock (`id_bytes`, `id_less`).
+const INTERN_SHARD_BITS: u32 = 12;
+const DIR_CHUNK_BITS: u32 = 16;
+
+struct InternTable {
+    mask: usize,
+    slots: Box<[AtomicU64]>,
 }
-static INTERN: std::sync::OnceLock<Interner> = std::sync::OnceLock::new();
-fn interner() -> &'static Interner {
-    INTERN.get_or_init(|| Interner { map: Mutex::new(HashMap::new()), list: RwLock::new(Vec::new()) })
+struct InternShard {
+    /// Guards inserts and table replacement; holds the number of entries.
+    lock: Mutex<usize>,
+    table: AtomicPtr<InternTable>,
+}
+static INTERN: std::sync::OnceLock<Box<[InternShard]>> = std::sync::OnceLock::new();
+static INTERN_NEXT: AtomicU64 = AtomicU64::new(0);
+/// Directory chunks: `1 << DIR_CHUNK_BITS` entries of (pointer, length) each.
+static INTERN_DIR: [AtomicPtr<(usize, usize)>; 1 << 16] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 1 << 16];
+
+#[inline]
+fn hash_bytes(s: &[u8]) -> u64 {
+    let mut h = K0 ^ (s.len() as u64).wrapping_mul(K1);
+    let mut c = s.chunks_exact(8);
+    for w in &mut c {
+        h = mum(h ^ u64::from_le_bytes(w.try_into().unwrap()), K1);
+    }
+    let r = c.remainder();
+    if !r.is_empty() {
+        let mut b = [0u8; 8];
+        b[..r.len()].copy_from_slice(r);
+        h = mum(h ^ u64::from_le_bytes(b), K1);
+    }
+    mum(h ^ K1, K0)
 }
 
-#[cold]
+/// The directory entry of index `i`; its chunk is created if `make`.
+#[inline]
+fn intern_dir(i: usize, make: bool) -> *mut (usize, usize) {
+    let c = &INTERN_DIR[i >> DIR_CHUNK_BITS];
+    let mut p = c.load(Ordering::Acquire);
+    if p.is_null() {
+        assert!(make);
+        let n = os_alloc(std::mem::size_of::<(usize, usize)>() << DIR_CHUNK_BITS) as *mut (usize, usize);
+        p = match c.compare_exchange(std::ptr::null_mut(), n, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => n,
+            Err(other) => other, // the lost chunk stays untouched (never freed)
+        };
+    }
+    unsafe { p.add(i & ((1 << DIR_CHUNK_BITS) - 1)) }
+}
+
+/// The bytes of an interned ID.
+#[inline]
+fn long_bytes(id: Id) -> &'static [u8] {
+    let (p, n) = unsafe { *intern_dir((id & !LONG) as usize, false) };
+    unsafe { std::slice::from_raw_parts(p as *const u8, n) }
+}
+
+/// Finds `s` (hash `h`) in `t`: its index.
+#[inline]
+fn intern_find(t: &InternTable, h: u64, s: &[u8]) -> Option<u64> {
+    let tag = h >> 32;
+    let mut i = tag as usize & t.mask;
+    loop {
+        let v = t.slots[i].load(Ordering::Acquire);
+        if v == 0 {
+            return None;
+        }
+        if v >> 32 == tag {
+            let idx = (v & 0xFFFF_FFFF) - 1;
+            if long_bytes(idx) == s {
+                return Some(idx);
+            }
+        }
+        i = (i + 1) & t.mask;
+    }
+}
+
+fn intern_table(cap: usize) -> *mut InternTable {
+    Box::into_raw(Box::new(InternTable { mask: cap - 1, slots: (0..cap).map(|_| AtomicU64::new(0)).collect() }))
+}
+
+/// A private, permanent copy of `s`, from a bump arena of this thread.
+fn intern_copy(s: &[u8]) -> *const u8 {
+    thread_local! {
+        static BUMP: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    BUMP.with(|b| {
+        let (mut cur, mut end) = b.get();
+        if cur + s.len() > end {
+            let n = s.len().max(256 << 10);
+            cur = os_alloc(n) as usize;
+            end = cur + n;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), cur as *mut u8, s.len()) };
+        b.set((cur + s.len(), end));
+        cur as *const u8
+    })
+}
+
 #[inline(never)]
 pub fn intern_long(s: &[u8]) -> Id {
-    let it = interner();
-    let mut m = it.map.lock().unwrap();
-    if let Some(&i) = m.get(s) {
-        return i | LONG;
+    let shards = INTERN.get_or_init(|| (0..1usize << INTERN_SHARD_BITS).map(|_| InternShard { lock: Mutex::new(0), table: AtomicPtr::new(std::ptr::null_mut()) }).collect());
+    let h = hash_bytes(s);
+    let sh = &shards[(h >> (64 - INTERN_SHARD_BITS)) as usize];
+    let t = sh.table.load(Ordering::Acquire);
+    if !t.is_null() {
+        if let Some(i) = intern_find(unsafe { &*t }, h, s) {
+            return i | LONG;
+        }
     }
-    // A private copy: the caller's bytes may sit in a reused read buffer.
-    let s: &'static [u8] = Box::leak(s.to_vec().into_boxed_slice());
-    let mut l = it.list.write().unwrap();
-    let i = l.len() as u64;
-    l.push(s);
-    m.insert(s, i);
-    i | LONG
+    let mut count = sh.lock.lock().unwrap();
+    let mut t = sh.table.load(Ordering::Acquire);
+    if !t.is_null() {
+        if let Some(i) = intern_find(unsafe { &*t }, h, s) {
+            return i | LONG;
+        }
+    }
+    // Insert. First make room: at most 3/4 full.
+    if t.is_null() || (*count + 1) * 4 > (unsafe { &*t }.mask + 1) * 3 {
+        let n = intern_table(if t.is_null() { 16 } else { (unsafe { &*t }.mask + 1) * 2 });
+        if !t.is_null() {
+            let (old, new) = unsafe { (&*t, &*n) };
+            for slot in old.slots.iter() {
+                let v = slot.load(Ordering::Relaxed);
+                if v != 0 {
+                    let mut i = (v >> 32) as usize & new.mask;
+                    while new.slots[i].load(Ordering::Relaxed) != 0 {
+                        i = (i + 1) & new.mask;
+                    }
+                    new.slots[i].store(v, Ordering::Relaxed);
+                }
+            }
+        }
+        sh.table.store(n, Ordering::Release);
+        t = n;
+    }
+    let idx = INTERN_NEXT.fetch_add(1, Ordering::Relaxed);
+    if idx >= 0xFFFF_FFFF {
+        eprintln!("shopping-engine: too many distinct long IDs");
+        std::process::exit(1);
+    }
+    unsafe { *intern_dir(idx as usize, true) = (intern_copy(s) as usize, s.len()) };
+    let t = unsafe { &*t };
+    let tag = h >> 32;
+    let mut i = tag as usize & t.mask;
+    while t.slots[i].load(Ordering::Relaxed) != 0 {
+        i = (i + 1) & t.mask;
+    }
+    t.slots[i].store((tag << 32) | (idx + 1), Ordering::Release);
+    *count += 1;
+    idx | LONG
 }
 
 #[inline(always)]
@@ -598,7 +738,7 @@ pub fn is_long(id: Id) -> bool {
 #[inline]
 pub fn id_bytes(id: Id, out: &mut Vec<u8>) {
     if is_long(id) {
-        out.extend_from_slice(interner().list.read().unwrap()[(id & !LONG) as usize]);
+        out.extend_from_slice(long_bytes(id));
     } else {
         let mut sh = 56i32;
         while sh >= 0 {
@@ -619,10 +759,24 @@ pub fn id_less(a: Id, b: Id) -> bool {
 }
 #[cold]
 fn id_less_slow(a: Id, b: Id) -> bool {
-    let (mut x, mut y) = (Vec::new(), Vec::new());
-    id_bytes(a, &mut x);
-    id_bytes(b, &mut y);
-    x < y
+    // the bytes of an interned ID as stored; a packed one decoded on the stack
+    fn bytes(id: Id, buf: &mut [u8; 9]) -> &[u8] {
+        if is_long(id) {
+            return long_bytes(id);
+        }
+        let mut n = 0;
+        while n < 9 {
+            let c = ((id >> (56 - 7 * n as u32)) & 0x7F) as u8;
+            if c == 0 {
+                break;
+            }
+            buf[n] = c;
+            n += 1;
+        }
+        &buf[..n]
+    }
+    let (mut x, mut y) = ([0u8; 9], [0u8; 9]);
+    bytes(a, &mut x) < bytes(b, &mut y)
 }
 
 pub const K0: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -837,6 +991,82 @@ impl IdMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rng(x: &mut u64) -> u64 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
+    }
+
+    /// Byte string number `k` of a family of distinct strings of 10..=40 bytes.
+    fn long_name(k: u64) -> Vec<u8> {
+        let mut v = format!("u{k:x}-").into_bytes();
+        let mut x = k.wrapping_mul(K0) | 1;
+        while v.len() < 10 + (k % 31) as usize {
+            v.push(b"0123456789abcdef\xC3\xA9"[(rng(&mut x) % 18) as usize]);
+        }
+        v
+    }
+
+    #[test]
+    fn intern_concurrent() {
+        // 8 threads intern the same 131072 strings in different orders (plus private ones).
+        const N: u64 = 1 << 17; // a power of two: the odd multipliers below give permutations
+        let res = par((0..8u64).collect::<Vec<u64>>(), |_, t| {
+            let mut out = vec![0u64; N as usize];
+            let mut x = 0x1234_5678 + t;
+            for round in 0..3 * N {
+                let k = if round < N { (round * (2 * t + 1) + t * 7919) % N } else { rng(&mut x) % N };
+                let id = intern_long(&long_name(k));
+                assert!(is_long(id));
+                assert!(out[k as usize] == 0 || out[k as usize] == id);
+                out[k as usize] = id;
+            }
+            let own = intern_long(format!("private-thread-{t}").as_bytes());
+            (out, own)
+        });
+        let mut seen = std::collections::HashSet::new();
+        for k in 0..N as usize {
+            for r in &res {
+                assert_eq!(r.0[k], res[0].0[k], "one handle per string");
+            }
+            assert!(seen.insert(res[0].0[k]), "distinct strings, distinct handles");
+            let mut b = Vec::new();
+            id_bytes(res[0].0[k], &mut b);
+            assert_eq!(b, long_name(k as u64));
+        }
+        for (t, r) in res.iter().enumerate() {
+            assert!(seen.insert(r.1));
+            let mut b = Vec::new();
+            id_bytes(r.1, &mut b);
+            assert_eq!(b, format!("private-thread-{t}").into_bytes());
+            assert_eq!(intern_long(&b), r.1);
+        }
+    }
+
+    #[test]
+    fn id_less_is_bytewise() {
+        let mut x = 0xFEED_F00D_u64;
+        let mut ids: Vec<(Vec<u8>, Id)> = Vec::new();
+        for _ in 0..3000 {
+            let len = 1 + (rng(&mut x) % 14) as usize;
+            let alpha: &[u8] = if rng(&mut x) % 4 == 0 { b"ab\x01\x7f\x80\xff\x00z" } else { b"abz019" };
+            // few distinct letters and shared prefixes: many near-equal pairs
+            let s: Vec<u8> = (0..len).map(|_| alpha[(rng(&mut x) % alpha.len() as u64) as usize]).collect();
+            let id = unsafe { pack_id(s.as_ptr(), s.len(), s.as_ptr().add(s.len())) };
+            let mut b = Vec::new();
+            id_bytes(id, &mut b);
+            assert_eq!(b, s);
+            ids.push((s, id));
+        }
+        for i in 0..ids.len() {
+            for j in (i % 7..ids.len()).step_by(7) {
+                assert_eq!(id_less(ids[i].1, ids[j].1), ids[i].0 < ids[j].0, "{:?} {:?}", ids[i].0, ids[j].0);
+                assert_eq!(ids[i].1 == ids[j].1, ids[i].0 == ids[j].0);
+            }
+        }
+    }
 
     #[test]
     fn pack_id16_is_pack_id() {
