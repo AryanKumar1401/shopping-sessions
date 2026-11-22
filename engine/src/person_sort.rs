@@ -18,6 +18,15 @@ fn people_mode() -> u8 {
     })
 }
 
+fn knob_lahead() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("SE_LAHEAD").unwrap_or(8))
+}
+fn knob_bwarm() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_flag("SE_BWARM"))
+}
+
 fn env_usize(k: &str) -> Option<usize> {
     std::env::var(k).ok().and_then(|v| v.parse().ok())
 }
@@ -632,13 +641,13 @@ fn pass_a_flat(ctx: &Ctx, q: usize, ev: &[Parts<PRec>], cl: &[Parts<CRec>], sc: 
     sc.names.clear();
     let links = ctx.links.get().unwrap();
     if links.any {
-        const AHEAD: usize = 8;
-        for i in 0..nk.min(AHEAD) {
+        let ahead = knob_lahead();
+        for i in 0..nk.min(ahead) {
             links.prefetch(id_hash(sc.keys[i]));
         }
         for i in 0..nk {
-            if i + AHEAD < nk {
-                links.prefetch(id_hash(sc.keys[i + AHEAD]));
+            if i + ahead < nk {
+                links.prefetch(id_hash(sc.keys[i + ahead]));
             }
             let k = sc.keys[i];
             sc.names.push(links.lookup(k, id_hash(k)));
@@ -836,6 +845,19 @@ fn pass_b_flat(ctx: &Ctx, d: usize, blocks: &[Vec<Vec<(usize, usize)>>], sc: &mu
         let c = &mut sc.cur[idx as usize];
         sc.rp[*c as usize] = p;
         *c += 1;
+    }
+    if knob_bwarm() {
+        let mut acc = 0u64;
+        for th in blocks {
+            for &(st, used) in &th[d] {
+                let mut p = st & !63;
+                while p < st + used {
+                    acc = acc.wrapping_add(unsafe { *(p as *const u64) });
+                    p += 64;
+                }
+            }
+        }
+        std::hint::black_box(acc);
     }
     f.lap(9);
     f.ss.clear();
