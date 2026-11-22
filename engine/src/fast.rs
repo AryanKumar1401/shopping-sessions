@@ -771,6 +771,7 @@ fn build_links(files: &[&'static [u8]], level: Level, nthreads: usize) -> Option
     if bytes == 0 {
         return Some(LinkTable::empty());
     }
+    let t0 = std::time::Instant::now();
     let est_occ = bytes / 10;
     let bits = ceil_log2(est_occ / 32_768).min(9);
     let mut jobs = Vec::new();
@@ -791,7 +792,12 @@ fn build_links(files: &[&'static [u8]], level: Level, nthreads: usize) -> Option
         (st.occ.finish(), st.edges)
     });
     let (occ, mut edges): (Vec<_>, Vec<_>) = res.into_iter().unzip();
-    LinkTable::build(&occ, &mut edges, bits, nthreads)
+    let t1 = std::time::Instant::now();
+    let r = LinkTable::build(&occ, &mut edges, bits, nthreads);
+    if env_flag("SE_TIMING") {
+        eprintln!("[links] threads {nthreads}: parse {:.1} ms, table + union-find {:.1} ms (wall)", (t1 - t0).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3);
+    }
+    r
 }
 
 fn env_usize(k: &str) -> Option<usize> {
@@ -1131,8 +1137,16 @@ pub fn run(inp: &Inputs, out: &Path, nthreads: usize, tm: &mut Timer) -> bool {
     tm.lap("tables");
     std::thread::scope(|sc| {
         // Parse and dedup never look at links, so the link table builds alongside them.
+        // SE_LINKS=first: built on all threads before the parse starts instead.
         let lt = env_usize("SE_LTHREADS").unwrap_or(2).max(1);
-        let lh = sc.spawn(move || build_links(&inp.links, level, lt));
+        let pre = if std::env::var("SE_LINKS").as_deref() == Ok("first") {
+            let r = build_links(&inp.links, level, nthreads);
+            tm.lap("links (first)");
+            Some(r)
+        } else {
+            None
+        };
+        let lh = sc.spawn(move || pre.unwrap_or_else(|| build_links(&inp.links, level, lt)));
         run_rest(inp, out, nthreads, tm, level, cbase, (products, cats, unknown_cat), (campaigns, camp_names, camp_channels), lh)
     })
 }
