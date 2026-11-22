@@ -692,9 +692,12 @@ pub fn long_bytes(id: Id) -> &'static [u8] {
 }
 
 /// Where the probe sequence of hash `h` starts, and its tag (the top 16 bits, in place).
+/// The start comes from the tag bits, so that a table can be rebuilt from its words alone,
+/// without a cache miss per record (a shard's table rarely has more than a few hundred
+/// slots; beyond 65536 slots the starts just crowd together).
 #[inline(always)]
 fn intern_pos(h: u64, mask: usize) -> (usize, u64) {
-    ((h >> INTERN_SHARD_BITS) as usize & mask, h & !ADDR)
+    ((h >> 48) as usize & mask, h & !ADDR)
 }
 
 /// The slots and the mask of a table word of `InternShard::table` (not 0).
@@ -787,13 +790,13 @@ fn intern_new(sh: &InternShard, h: u64, s: &[u8]) -> Id {
     }
     // Insert. First make room: at most 3/4 full.
     if t == 0 || (*count + 1) * 4 > (intern_slots(t).1 + 1) * 3 {
-        let n = intern_table(if t == 0 { 4 } else { (t & 63) as u32 + 1 });
+        let n = intern_table(if t == 0 { 6 } else { (t & 63) as u32 + 1 });
         if t != 0 {
             let ((old, omask), (new, nmask)) = (intern_slots(t), intern_slots(n));
             for k in 0..=omask {
                 let v = unsafe { &*old.add(k) }.load(Ordering::Relaxed);
                 if v != 0 {
-                    let mut i = intern_pos(unsafe { (*((v & ADDR) as *const IRec)).hash }, nmask).0;
+                    let mut i = intern_pos(v, nmask).0;
                     while unsafe { &*new.add(i) }.load(Ordering::Relaxed) != 0 {
                         i = (i + 1) & nmask;
                     }
