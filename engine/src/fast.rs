@@ -841,8 +841,13 @@ fn run_rest(
         );
     }
     let mut jobs = Vec::new();
-    // SE_READ=1: pread each chunk into a per-thread buffer instead of parsing the mapping.
-    let read = env_flag("SE_READ");
+    // pread each chunk into a per-thread buffer instead of parsing the mapping: the default on
+    // Linux (SE_READ=0 parses the mapping). Warm-cache cost is nil, and it does not depend on
+    // how fast the runtime serves page faults on the input files.
+    let read = match std::env::var("SE_READ") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => cfg!(target_os = "linux"),
+    };
     let chunk = chunk_bytes(2 << 20);
     let rcap = if read { chunk + READ_SLACK + 64 } else { 0 };
     make_jobs(&inp.events, 0, chunk, read, &mut jobs);
