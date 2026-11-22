@@ -3,46 +3,44 @@
 //!
 //!   id , id , ts , ingest_ts , type , product , price \n
 //!
-//! where each `id` is 1 to 9 bytes that are all in `0x30..=0x7F`, `ts` is a 13-digit F3, an
-//! F1 or an F2, `ingest_ts` is an F1, `type` is `view`, `cart` or `purchase`, the product is
-//! not empty, and product, price and the newline fit in 32 bytes. Any of the first five fields
-//! may be wrapped in quotes; quotes in the last two are checked with masks.
+//! where each `id` is 1 to 9 bytes that are all in `0x30..=0x7F`, `ts` is a 13-digit F3, or
+//! an F1 or F2 of the years 2000 to 2099, `ingest_ts` is such an F1, `type` is `view`, `cart`
+//! or `purchase`, the product is not empty, and product, price and the newline fit in 32
+//! bytes. Any of the first five fields may be wrapped in quotes; quotes in the last two are
+//! checked with masks.
 //!
-//! Exactness: *every* byte of an accepted line is checked against that shape (the content of
-//! each of the first five fields can hold no comma, quote or newline because of what it is
-//! compared to; the bytes after each are exactly `,` or `",`; the tail has exactly one comma
-//! before the first newline and its quotes wrap whole fields). Therefore an accepted line is
-//! well-formed, its field boundaries are the ones `split_row` finds, and it is evaluated with
-//! the same arithmetic as `event_row`. Every other line (and every line within `GUARD` bytes
-//! of the end of the readable bytes) takes `split_row` + `event_general`, the plain statement
-//! of the rules.
+//! Exactness: *every* byte of an accepted line is checked against that shape. An ID's bytes
+//! are at least 0x30 and are followed by exactly `,` or `",`; a timestamp or a type is
+//! compared byte for byte (ranges for digits) with a template that includes its opening
+//! quote, its closing quote and the comma after it; the tail has exactly one comma before the
+//! first newline and its quotes wrap whole fields. So an accepted line is well-formed, its
+//! fields are the ones `split_row` finds, and it is evaluated with the same arithmetic as
+//! `event_row`. Every other line (and every line within `GUARD` bytes of the end of the
+//! readable bytes) takes `split_row` + `event_general`, the plain statement of the rules.
 
 use crate::fast::*;
-use crate::links::part_of;
 use crate::scan::split_row;
 use crate::ts::*;
 use crate::util::*;
 
 /// Bytes that must be readable from a line's start for the speculative walk: it never reads
 /// further than this, whatever the bytes are (2 x (1 + 16 + 2) for the IDs, 28 + 23 for the
-/// timestamps, 11 for the type, 32 for the tail = 132, and the 16-byte loads behind them).
+/// timestamps, 11 for the type, 32 for the tail = 132, and the 32-byte loads behind each).
 pub const GUARD: usize = 192;
 
-const VIEW: u32 = u32::from_le_bytes(*b"view");
-const CART: u32 = u32::from_le_bytes(*b"cart");
-const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
-
-/// What must follow a field's content: `,` (index 0) or `",` (index 1), as a little-endian
+/// What must follow an ID's bytes: `,` (index 0) or `",` (index 1), as a little-endian
 /// 16-bit word and the mask of the bytes that count.
 static TERM_WANT: [u16; 2] = [0x002C, 0x2C22];
 static TERM_MASK: [u16; 2] = [0x00FF, 0xFFFF];
+/// Nonzero for an ID length that is not 1..=9.
+static LEN_BAD: [u8; 17] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1];
 
 /// Nonzero unless the bytes at `t` are `,` (q = 0) or `",` (q = 1).
 #[inline(always)]
-unsafe fn term(t: *const u8, q: usize) -> u32 {
+unsafe fn term(t: *const u8, q: usize) -> u64 {
     unsafe {
         let w = (t as *const u16).read_unaligned();
-        ((w ^ *TERM_WANT.get_unchecked(q)) & *TERM_MASK.get_unchecked(q)) as u32
+        ((w ^ *TERM_WANT.get_unchecked(q)) & *TERM_MASK.get_unchecked(q)) as u64
     }
 }
 
@@ -51,8 +49,148 @@ unsafe fn rd64(p: *const u8) -> u64 {
     unsafe { (p as *const u64).read_unaligned() }
 }
 
+// ---------------------------------------------------------------- templates
+
+/// Timestamp templates, a field from its first byte (the opening quote if it has one) to the
+/// comma after it: byte `i` must satisfy `b - lo[i] <= rng[i]` (unsigned, wrapping).
+/// Index: form * 2 + quoted, forms F1, F2, F3 (13 digits).
+#[repr(C, align(32))]
+struct TsPat {
+    lo: [[u8; 32]; 6],
+    rng: [[u8; 32]; 6],
+}
+const F1: usize = 0;
+const F2: usize = 1;
+const F3: usize = 2;
+
+const fn ts_pat() -> TsPat {
+    const D: (u8, u8) = (b'0', b'9');
+    const fn x(c: u8) -> (u8, u8) {
+        (c, c)
+    }
+    // "20YY-MM-DDTHH:MM:SS": the digits in their loosest ranges (the calendar and the hour
+    // are checked on the values)
+    let civil: [(u8, u8); 19] =
+        [x(b'2'), x(b'0'), D, D, x(b'-'), (b'0', b'1'), D, x(b'-'), (b'0', b'3'), D, x(b'T'), (b'0', b'2'), D, x(b':'), (b'0', b'5'), D, x(b':'), (b'0', b'5'), D];
+    // F2's sign may be `+`, `,` or `-` here; the caller excludes the comma
+    let off: [(u8, u8); 6] = [(b'+', b'-'), (b'0', b'2'), D, x(b':'), (b'0', b'5'), D];
+    let mut t = TsPat { lo: [[0; 32]; 6], rng: [[0xFF; 32]; 6] };
+    let mut form = 0;
+    while form < 3 {
+        let mut q = 0;
+        while q < 2 {
+            let k = form * 2 + q;
+            let mut body = [(0u8, 0u8); 32];
+            let mut n = 0;
+            if q == 1 {
+                body[n] = x(b'"');
+                n += 1;
+            }
+            if form == F3 {
+                let mut i = 0;
+                while i < 13 {
+                    body[n] = D;
+                    n += 1;
+                    i += 1;
+                }
+            } else {
+                let mut i = 0;
+                while i < 19 {
+                    body[n] = civil[i];
+                    n += 1;
+                    i += 1;
+                }
+                if form == F1 {
+                    body[n] = x(b'Z');
+                    n += 1;
+                } else {
+                    let mut i = 0;
+                    while i < 6 {
+                        body[n] = off[i];
+                        n += 1;
+                        i += 1;
+                    }
+                }
+            }
+            if q == 1 {
+                body[n] = x(b'"');
+                n += 1;
+            }
+            body[n] = x(b',');
+            n += 1;
+            let mut i = 0;
+            while i < n {
+                t.lo[k][i] = body[i].0;
+                t.rng[k][i] = body[i].1 - body[i].0;
+                i += 1;
+            }
+            q += 1;
+        }
+        form += 1;
+    }
+    t
+}
+static TS_PAT: TsPat = ts_pat();
+
+/// Event type templates, as above but exact bytes under a mask. Index: `(c & 6) + quoted`
+/// for the first letter `c` (`p` -> 0, `c` -> 2, `v` -> 6; 4 matches nothing). `adv`: bytes
+/// from the field's first byte to the next field's first byte.
+#[repr(C, align(16))]
+struct TypePat {
+    pat: [[u8; 16]; 8],
+    mask: [[u8; 16]; 8],
+    adv: [u8; 8],
+}
+const fn type_pat() -> TypePat {
+    let mut t = TypePat { pat: [[0xFF; 16]; 8], mask: [[0xFF; 16]; 8], adv: [0; 8] };
+    let words: [(&[u8], usize); 3] = [(b"purchase", 0), (b"cart", 2), (b"view", 6)];
+    let mut w = 0;
+    while w < 3 {
+        let (name, base) = words[w];
+        let mut q = 0;
+        while q < 2 {
+            let k = base + q;
+            t.pat[k] = [0; 16];
+            t.mask[k] = [0; 16];
+            let mut n = 0;
+            if q == 1 {
+                t.pat[k][n] = b'"';
+                n += 1;
+            }
+            let mut i = 0;
+            while i < name.len() {
+                t.pat[k][n] = name[i];
+                n += 1;
+                i += 1;
+            }
+            if q == 1 {
+                t.pat[k][n] = b'"';
+                n += 1;
+            }
+            t.pat[k][n] = b',';
+            n += 1;
+            let mut i = 0;
+            while i < n {
+                t.mask[k][i] = 0xFF;
+                i += 1;
+            }
+            t.adv[k] = n as u8;
+            q += 1;
+        }
+        w += 1;
+    }
+    t
+}
+static TYPE_PAT: TypePat = type_pat();
+
+/// What `k::tod` adds to the seconds of the day: the digits are multiplied as ASCII.
+const TOD_BIAS: i64 = 48 * (11 * 3600 + 10 * 60 + 60 + 11);
+
+// ---------------------------------------------------------------- vector pieces
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 mod k {
+    use super::{TS_PAT, TYPE_PAT};
     use crate::util::{Id, LEN_MASK};
     use std::arch::x86_64::*;
 
@@ -74,10 +212,9 @@ mod k {
     #[inline(always)]
     pub unsafe fn pack2(v0: V16, l0: usize, v1: V16, l1: usize) -> (Id, Id) {
         unsafe {
-            let data = _mm256_inserti128_si256(_mm256_castsi128_si256(v0), v1, 1);
             let m0 = _mm_loadu_si128(LEN_MASK.get_unchecked(l0).as_ptr() as *const __m128i);
             let m1 = _mm_loadu_si128(LEN_MASK.get_unchecked(l1).as_ptr() as *const __m128i);
-            let d = _mm256_and_si256(data, _mm256_inserti128_si256(_mm256_castsi128_si256(m0), m1, 1));
+            let d = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_and_si128(v0, m0)), _mm_and_si128(v1, m1), 1);
             let w = _mm256_maddubs_epi16(_mm256_set1_epi16(0x0180), d);
             let dd = _mm256_madd_epi16(w, _mm256_set1_epi32(0x0001_4000));
             let q = _mm256_or_si256(_mm256_mul_epu32(dd, _mm256_set1_epi64x(1 << 28)), _mm256_srli_epi64(dd, 32));
@@ -86,22 +223,54 @@ mod k {
         }
     }
 
-    /// 13 digits at `a` (16 bytes readable) -> (value, nonzero when one is not a digit).
+    /// True when the 32 bytes at `s` do not fit timestamp template `k`.
     #[inline(always)]
-    pub unsafe fn f3_13(a: *const u8) -> (i64, u64) {
+    pub unsafe fn ts_misfit(s: *const u8, k: usize) -> bool {
+        unsafe {
+            let v = _mm256_loadu_si256(s as *const __m256i);
+            let x = _mm256_sub_epi8(v, _mm256_load_si256(TS_PAT.lo.get_unchecked(k).as_ptr() as *const __m256i));
+            let over = _mm256_subs_epu8(x, _mm256_load_si256(TS_PAT.rng.get_unchecked(k).as_ptr() as *const __m256i));
+            _mm256_testz_si256(over, over) == 0
+        }
+    }
+
+    /// True when the 16 bytes at `s` do not fit type template `k`.
+    #[inline(always)]
+    pub unsafe fn type_misfit(s: *const u8, k: usize) -> bool {
+        unsafe {
+            let v = _mm_loadu_si128(s as *const __m128i);
+            let x = _mm_xor_si128(v, _mm_load_si128(TYPE_PAT.pat.get_unchecked(k).as_ptr() as *const __m128i));
+            _mm_testz_si128(x, _mm_load_si128(TYPE_PAT.mask.get_unchecked(k).as_ptr() as *const __m128i)) == 0
+        }
+    }
+
+    /// `HH:MM:SS` at `a` (16 bytes readable), its bytes taken as they are:
+    /// seconds of the day + `TOD_BIAS` when all six are digits.
+    #[inline(always)]
+    pub unsafe fn tod(a: *const u8) -> i64 {
+        unsafe {
+            let v = _mm_loadu_si128(a as *const __m128i);
+            let w = _mm_maddubs_epi16(v, _mm_setr_epi8(10, 1, 0, 10, 1, 0, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
+            let d = _mm_madd_epi16(w, _mm_setr_epi16(3600, 60, 60, 1, 0, 0, 0, 0));
+            let s = _mm_add_epi32(d, _mm_shuffle_epi32(d, 0x55));
+            _mm_cvtsi128_si32(s) as u32 as i64
+        }
+    }
+
+    /// 13 digits at `a` (16 bytes readable) -> their value.
+    #[inline(always)]
+    pub unsafe fn f3_13(a: *const u8) -> i64 {
         unsafe {
             let d = _mm_sub_epi8(_mm_loadu_si128(a as *const __m128i), _mm_set1_epi8(b'0' as i8));
             // three leading zeros, then the 13 digits: a 16-digit number
             let s = _mm_slli_si128(d, 3);
-            let over = _mm_subs_epu8(s, _mm_set1_epi8(9));
-            let bad = (_mm_testz_si128(over, over) == 0) as u64;
             let w = _mm_maddubs_epi16(s, _mm_set1_epi16(0x010A));
             let x = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_0064));
             let y = _mm_packus_epi32(x, x);
             let z = _mm_madd_epi16(y, _mm_set1_epi32(0x0001_2710));
             let hi = _mm_cvtsi128_si32(z) as u32 as u64;
             let lo = _mm_extract_epi32(z, 1) as u32 as u64;
-            ((hi * 100_000_000 + lo) as i64, bad)
+            (hi * 100_000_000 + lo) as i64
         }
     }
 
@@ -116,10 +285,16 @@ mod k {
             (c, n, q)
         }
     }
+
+    #[inline(always)]
+    pub fn date_slot(key: u64) -> usize {
+        unsafe { _pext_u64(key, 0x0F03_0000_0000_0000) as usize }
+    }
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 mod k {
+    use super::{TS_PAT, TYPE_PAT};
     use crate::util::{Id, pack_id16};
 
     pub type V16 = *const u8;
@@ -141,10 +316,43 @@ mod k {
     }
 
     #[inline(always)]
-    pub unsafe fn f3_13(a: *const u8) -> (i64, u64) {
+    pub unsafe fn ts_misfit(s: *const u8, k: usize) -> bool {
         unsafe {
-            let v = crate::ts::parse_f3_13(a);
-            (v, (v == crate::ts::NONE) as u64)
+            let mut bad = false;
+            for i in 0..32 {
+                bad |= (*s.add(i)).wrapping_sub(TS_PAT.lo[k][i]) > TS_PAT.rng[k][i];
+            }
+            bad
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn type_misfit(s: *const u8, k: usize) -> bool {
+        unsafe {
+            let mut bad = false;
+            for i in 0..16 {
+                bad |= (*s.add(i) ^ TYPE_PAT.pat[k][i]) & TYPE_PAT.mask[k][i] != 0;
+            }
+            bad
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn tod(a: *const u8) -> i64 {
+        unsafe {
+            let b = |i: usize| *a.add(i) as i64;
+            (b(0) * 10 + b(1)) * 3600 + (b(3) * 10 + b(4)) * 60 + b(6) * 10 + b(7)
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn f3_13(a: *const u8) -> i64 {
+        unsafe {
+            let mut v = 0i64;
+            for i in 0..13 {
+                v = v * 10 + (*a.add(i) - b'0') as i64;
+            }
+            v
         }
     }
 
@@ -161,7 +369,60 @@ mod k {
             (c, n, q)
         }
     }
+
+    #[inline(always)]
+    pub fn date_slot(key: u64) -> usize {
+        (((key >> 48) & 3) | ((key >> 54) & 0x3C)) as usize
+    }
 }
+
+// ---------------------------------------------------------------- dates
+
+/// Memo of the dates of the years 20YY: key = the eight bytes `YY-MM-DD`, value = epoch
+/// seconds of that midnight less `TOD_BIAS`. Slot: the low bits of the two day digits.
+pub struct HopDates {
+    e: [(u64, i64); 64],
+}
+impl HopDates {
+    pub fn new() -> Self {
+        HopDates { e: [(0, 0); 64] }
+    }
+}
+
+/// The date `20YY-MM-DDT` at `a` is not in its slot: computes and stores it. NONE when it is
+/// not a date (nothing is stored).
+#[cold]
+#[inline(never)]
+unsafe fn date_miss(a: *const u8, dates: &mut HopDates, slot: usize) -> i64 {
+    unsafe {
+        let v = date_secs(a);
+        if v == NONE || *a != b'2' || *a.add(1) != b'0' {
+            return NONE;
+        }
+        dates.e[slot] = (rd64(a.add(2)), v - TOD_BIAS);
+        v - TOD_BIAS
+    }
+}
+
+/// `20YY-MM-DDTHH:MM:SS` at `a`, already compared with its template (so every digit is one,
+/// and `20`, `-`, `T`, `:` are in place) -> epoch seconds, or NONE for an impossible date or
+/// hour.
+#[inline(always)]
+unsafe fn civil(a: *const u8, dates: &mut HopDates) -> i64 {
+    unsafe {
+        let key = rd64(a.add(2));
+        let slot = k::date_slot(key);
+        let e = *dates.e.get_unchecked(slot);
+        let day = if e.0 == key { e.1 } else { date_miss(a, dates, slot) };
+        let t = k::tod(a.add(11));
+        if (day == NONE) | (t >= TOD_BIAS + 86_400) {
+            return NONE;
+        }
+        day + t
+    }
+}
+
+// ---------------------------------------------------------------- the row
 
 /// The purchase's `category * PRICE_MUL + price`, or 0 when the price is bad. Product: the
 /// tail's first field (ends at bit `mcb`), price: its second (ends at `nl`); `open`: the
@@ -185,10 +446,45 @@ unsafe fn purchase_pc(ev: &EvRow, s5: *const u8, mcb: u32, nl: usize, open: u32)
     }
 }
 
+/// What the row loop keeps in registers or on its stack instead of reading through `Ctx`.
+struct Hot {
+    ws: i64,
+    we: i64,
+    cbase: i64,
+    ibase_s: i64,
+    pshift: u32,
+    dshift: u32,
+    pbase: usize,
+    /// The writers' raw parts (`Writers::raw`), or nulls when `RAW` is false.
+    ph: *mut (*mut PRec, *mut PRec),
+    pb: *mut PRec,
+    dh: *mut (*mut DRec, *mut DRec),
+    db: *mut DRec,
+    /// Largest `PRec` index and `DRec::ing` seen: `escape` when one does not fit.
+    max_idx: usize,
+    max_d: u64,
+}
+
+/// `Writers::push_ptr` for the aligned write-combining form of 16-byte records.
+#[inline(always)]
+unsafe fn push16<T: Copy>(w: &mut Writers<T>, heads: *mut (*mut T, *mut T), buf: *mut T, s: usize, v: T) -> *mut T {
+    unsafe {
+        let h = heads.add(s);
+        let p = (*h).0;
+        let n = (p as usize >> 4) & 3;
+        buf.add(s * 4 + n).write(v);
+        (*h).0 = p.add(1);
+        if n == 3 {
+            w.flush_line(s, p);
+        }
+        p
+    }
+}
+
 /// One line at `p` (with `GUARD` readable bytes): handles it and returns the start of the next
 /// line, or returns null having done nothing when the line is not of the usual shape.
 #[inline(always)]
-unsafe fn hop_row(ev: &EvRow, p: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) -> *const u8 {
+unsafe fn hop_row<const RAW: bool>(ev: &EvRow, hot: &mut Hot, p: *const u8, dates: &mut HopDates, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>) -> *const u8 {
     unsafe {
         // event_id
         let q0 = (*p == b'"') as usize;
@@ -204,73 +500,68 @@ unsafe fn hop_row(ev: &EvRow, p: *const u8, cache: &mut DateCache, pw: &mut Writ
         let t1 = a1.add(l1);
         bad |= term(t1, q1);
         // both 1..=9 bytes (an empty or a long ID is not the usual shape)
-        bad |= ((l0.wrapping_sub(1) > 8) | (l1.wrapping_sub(1) > 8)) as u32;
+        bad |= (*LEN_BAD.get_unchecked(l0) | *LEN_BAD.get_unchecked(l1)) as u64;
         // ts: F1 / F2 have a '-' after the year, a 13-digit F3 a digit
         let s2 = t1.add(q1 + 1);
         let q2 = (*s2 == b'"') as usize;
         let a2 = s2.add(q2);
-        let (ts, l2);
+        let (ts, s3);
         if *a2.add(4) == b'-' {
-            let (t, e) = civil19h(a2, cache);
-            if e != 0 {
+            let z = *a2.add(19);
+            let f2 = (z != b'Z') as usize;
+            if k::ts_misfit(s2, (F1 + f2) * 2 + q2) {
                 return std::ptr::null();
             }
-            let z = *a2.add(19);
-            if z == b'Z' {
+            let t = civil(a2, dates);
+            if t == NONE {
+                return std::ptr::null();
+            }
+            if f2 == 0 {
                 ts = t * 1000;
-                l2 = 20;
+                s3 = a2.add(21 + q2);
             } else {
-                // "+HH:MM" / "-HH:MM": each digit at most 2 9 . 5 9, hours at most 23
+                // "+HH:MM" / "-HH:MM": the template has checked the digits' ranges
                 let o = rd64(a2.add(19));
                 let v = ((o >> 8) ^ 0x30_303A_3030) & 0xFF_FFFF_FFFF;
-                let e = (v | v.wrapping_add(0x76_7A7F_767D)) & 0x80_8080_8080;
                 let x = v.wrapping_mul(2561);
                 let hh = (x >> 8) & 0xFF;
                 let mm = (x >> 32) & 0xFF;
-                if (e != 0) | (hh > 23) | ((z != b'+') & (z != b'-')) {
+                if (hh > 23) | (z == b',') {
                     return std::ptr::null();
                 }
                 let off = ((hh * 60 + mm) * 60_000) as i64;
                 ts = if z == b'+' { t * 1000 - off } else { t * 1000 + off };
-                l2 = 25;
+                s3 = a2.add(26 + q2);
             }
         } else {
-            let (t, e) = k::f3_13(a2);
-            if e != 0 {
+            if k::ts_misfit(s2, F3 * 2 + q2) {
                 return std::ptr::null();
             }
-            ts = t;
-            l2 = 13;
+            ts = k::f3_13(a2);
+            s3 = a2.add(14 + q2);
         }
-        let t2 = a2.add(l2);
-        bad |= term(t2, q2);
         // ingest_ts: F1
-        let s3 = t2.add(q2 + 1);
         let q3 = (*s3 == b'"') as usize;
         let a3 = s3.add(q3);
-        let (ing_s, e3) = civil19h(a3, cache);
-        bad |= (e3 != 0) as u32 | (*a3.add(19) ^ b'Z') as u32;
-        let t3 = a3.add(20);
-        bad |= term(t3, q3);
-        // event_type
-        let s4 = t3.add(q3 + 1);
-        let q4 = (*s4 == b'"') as usize;
-        let a4 = s4.add(q4);
-        let w = rd64(a4);
-        let purchase = w == PURCHASE;
-        let l4 = if (w as u32 == VIEW) | (w as u32 == CART) {
-            4
-        } else if purchase {
-            8
-        } else {
+        if k::ts_misfit(s3, F1 * 2 + q3) {
             return std::ptr::null();
-        };
-        let t4 = a4.add(l4);
-        bad |= term(t4, q4);
+        }
+        let ing_s = civil(a3, dates);
+        if ing_s == NONE {
+            return std::ptr::null();
+        }
+        // event_type
+        let s4 = a3.add(21 + q3);
+        let q4 = (*s4 == b'"') as usize;
+        let kt = (*s4.add(q4) as usize & 6) + q4;
+        if k::type_misfit(s4, kt) {
+            return std::ptr::null();
+        }
         // product_id , price_cents \n : one comma before the first newline; every quote opens
         // or closes a field, a field that opens closes, and no quote does both
-        let s5 = t4.add(q4 + 1);
+        let s5 = s4.add(*TYPE_PAT.adv.get_unchecked(kt) as usize);
         let (mc, mn, mq) = k::tail_masks(s5);
+        let nl = mn.trailing_zeros() as usize;
         let below = mn ^ mn.wrapping_sub(1);
         let mcb = mc & below;
         let d = (mc | mn) & below;
@@ -278,31 +569,37 @@ unsafe fn hop_row(ev: &EvRow, p: *const u8, cache: &mut DateCache, pw: &mut Writ
         let open = mqb & ((d << 1) | 1);
         let close = mqb & (d >> 1);
         let opened = (!d).wrapping_add(open) & d;
-        bad |= (mn == 0) as u32 | (mcb.count_ones() != 1) as u32;
-        bad |= (opened ^ (close << 1)) | (open & close) | (mqb & !(open | close));
-        // the product is empty when the comma is the first byte, or the third after `""`
-        bad |= (mcb | ((mcb >> 2) & open)) & 1;
+        // no newline; no comma or several (`d` is then just the newline, or holds a comma
+        // above the lowest one); quotes; an empty product (`,` first, or `""` first)
+        let tb = (nl as u32 >> 5) | (mcb.wrapping_sub(1) & d) | (opened ^ (close << 1)) | (open & close) | (mqb ^ (open | close)) | ((mcb | ((mcb >> 2) & open)) & 1);
+        bad |= tb as u64;
         if bad != 0 {
             return std::ptr::null();
         }
-        let nl = mn.trailing_zeros() as usize;
         let ing = ing_s * 1000;
-        let mut ok = (ts >= ev.ctx.ws) & (ts < ev.ctx.we) & (ing.wrapping_sub(ts) <= DAY);
+        let mut ok = (ts >= hot.ws) & (ts < hot.we) & (ing.wrapping_sub(ts) <= DAY);
         let mut pc = 0u32;
-        if purchase && ok {
+        if kt < 2 && ok {
             pc = purchase_pc(ev, s5, mcb, nl, open);
             ok = pc != 0;
         }
         let (eid, uid) = k::pack2(v0, l0, v1, l1);
-        let dd = ing_s - ev.ibase_s;
+        let dd = (ing_s - hot.ibase_s) as u64;
+        hot.max_d = hot.max_d.max(dd);
+        let ds = ((id_hash(eid) >> 1) >> hot.dshift) as usize;
+        let mut idx = NOPREC as usize;
         if ok {
-            let prec = pw.push_ptr(part_of(id_hash(uid), ev.ctx.pbits), PRec { k: uid, ts: (ts - ev.ctx.cbase) as u32, pc });
-            let idx = (prec as usize).wrapping_sub(ev.ctx.pregion.base) / std::mem::size_of::<PRec>();
-            *escape |= (idx >= NOPREC as usize) | (dd as u64 > u32::MAX as u64);
-            dw.push(part_of(id_hash(eid), ev.ctx.dbits), DRec { eid, ing: dd as u32, prec: idx as u32 });
+            let ps = ((id_hash(uid) >> 1) >> hot.pshift) as usize;
+            let rec = PRec { k: uid, ts: (ts - hot.cbase) as u32, pc };
+            let prec = if RAW { push16(pw, hot.ph, hot.pb, ps, rec) } else { pw.push_ptr(ps, rec) };
+            idx = (prec as usize).wrapping_sub(hot.pbase) / std::mem::size_of::<PRec>();
+            hot.max_idx = hot.max_idx.max(idx);
+        }
+        let rec = DRec { eid, ing: dd as u32, prec: idx as u32 };
+        if RAW {
+            push16(dw, hot.dh, hot.db, ds, rec);
         } else {
-            *escape |= dd as u64 > u32::MAX as u64;
-            dw.push(part_of(id_hash(eid), ev.ctx.dbits), DRec { eid, ing: dd as u32, prec: NOPREC });
+            dw.push(ds, rec);
         }
         s5.add(nl + 1)
     }
@@ -322,17 +619,22 @@ unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCac
     }
 }
 
-/// All event lines of `base[..len]` (whole lines; the last may lack its `\n` only when it
-/// ends at `ev.lim`). Returns how many lines took the general path.
 #[inline(always)]
-pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) -> u64 {
+unsafe fn hop_loop<const RAW: bool>(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) -> u64 {
     unsafe {
+        let ctx = ev.ctx;
+        let (ph, pb) = pw.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+        let (dh, db) = dw.raw().unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+        let mut hot = Hot { ws: ctx.ws, we: ctx.we, cbase: ctx.cbase, ibase_s: ev.ibase_s, pshift: 63 - ctx.pbits, dshift: 63 - ctx.dbits, pbase: ctx.pregion.base, ph, pb, dh, db, max_idx: 0, max_d: 0 };
         let end = base.add(len);
+        // lines that start before `fast_end` have `GUARD` readable bytes
+        let room = ev.lim as usize - base as usize;
+        let fast_end = if room >= GUARD { base.add((room - GUARD + 1).min(len)) } else { base };
         let mut p = base;
         let mut slow = 0u64;
         while p < end {
-            if ev.lim as usize - p as usize >= GUARD {
-                let nx = hop_row(ev, p, cache, pw, dw, escape);
+            if p < fast_end {
+                let nx = hop_row::<RAW>(ev, &mut hot, p, dates, pw, dw);
                 if !nx.is_null() {
                     p = nx;
                     continue;
@@ -341,6 +643,21 @@ pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, cache: &mut Da
             slow += 1;
             p = slow_row(ev, p, end, cache, pw, dw, escape);
         }
+        // (a `PRec` index of NOPREC or more: as in `emit_event`)
+        *escape |= (hot.max_idx >= NOPREC as usize) | (hot.max_d > u32::MAX as u64);
         slow
+    }
+}
+
+/// All event lines of `base[..len]` (whole lines; the last may lack its `\n` only when it
+/// ends at `ev.lim`). Returns how many lines took the general path.
+#[inline(always)]
+pub unsafe fn hop_events(ev: &EvRow, base: *const u8, len: usize, dates: &mut HopDates, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) -> u64 {
+    unsafe {
+        if pw.raw().is_some() && dw.raw().is_some() && std::mem::size_of::<PRec>() == 16 && std::mem::size_of::<DRec>() == 16 {
+            hop_loop::<true>(ev, base, len, dates, cache, pw, dw, escape)
+        } else {
+            hop_loop::<false>(ev, base, len, dates, cache, pw, dw, escape)
+        }
     }
 }

@@ -418,6 +418,25 @@ impl<T: Copy> Writers<T> {
             }
         }
     }
+    /// The aligned form's parts for a push written out by the caller (hop.rs): the heads and
+    /// the buffers (`LINE` records per partition). None when this writer is not in that form.
+    /// The caller does what `push_ptr` does: record to `buf[s * LINE + n]`, head advanced,
+    /// and `flush_line` when it wrote the last record of a line.
+    #[inline(always)]
+    pub fn raw(&mut self) -> Option<(*mut (*mut T, *mut T), *mut T)> {
+        if Self::LINE != 0 && self.aligned { Some((self.heads.as_mut_ptr(), self.buf)) } else { None }
+    }
+    /// See `raw`: `p` is the place of the line's last record, which was just buffered.
+    #[inline(always)]
+    pub unsafe fn flush_line(&mut self, s: usize, p: *mut T) {
+        unsafe {
+            wc_copy((p as *mut u8).add(std::mem::size_of::<T>()).sub(64), self.buf.add(s * Self::LINE) as *const u8, 64);
+            let h = self.heads.get_unchecked(s);
+            if h.0 == h.1 {
+                self.refill(s);
+            }
+        }
+    }
     /// Per partition: the filled slices.
     pub fn finish(mut self) -> Parts<T> {
         if self.aligned {

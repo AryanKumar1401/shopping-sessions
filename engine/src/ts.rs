@@ -35,9 +35,8 @@ unsafe fn rd64(p: *const u8) -> u64 {
     unsafe { (p as *const u64).read_unaligned() }
 }
 
-#[cold]
-#[inline(never)]
-unsafe fn date_slow(p: *const u8, cache: &mut DateCache, slot: usize) -> i64 {
+/// `YYYY-MM-DDT` (11 bytes at `p`) -> epoch seconds of that midnight, or NONE.
+pub unsafe fn date_secs(p: *const u8) -> i64 {
     unsafe {
         let b = std::slice::from_raw_parts(p, 11);
         let dg = |i: usize| -> i64 {
@@ -61,6 +60,15 @@ unsafe fn date_slow(p: *const u8, cache: &mut DateCache, slot: usize) -> i64 {
                 v = days_from_civil(y, m, d) * (DAY / 1000);
             }
         }
+        v
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn date_slow(p: *const u8, cache: &mut DateCache, slot: usize) -> i64 {
+    unsafe {
+        let v = date_secs(p);
         cache.e[slot] = DateEnt { k8: rd64(p), k3: (p.add(8) as *const u32).read_unaligned() & 0x00FF_FFFF, v };
         v
     }
@@ -88,30 +96,6 @@ pub unsafe fn civil19(p: *const u8, cache: &mut DateCache) -> i64 {
             return NONE;
         }
         day + (h * 3600 + m * 60 + s) as i64
-    }
-}
-
-/// `civil19` for the row-hopping kernel: the same memo (any slot function is correct, an
-/// entry is only used when its key matches), with the slot taken by one PEXT, and the checks
-/// folded into one flag. Returns (epoch seconds, nonzero when invalid).
-#[inline(always)]
-pub unsafe fn civil19h(p: *const u8, cache: &mut DateCache) -> (i64, u64) {
-    unsafe {
-        let k8 = rd64(p);
-        let k3 = (p.add(8) as *const u32).read_unaligned() & 0x00FF_FFFF;
-        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-        let slot = std::arch::x86_64::_pext_u32(k3, 0x0F0F) as usize;
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
-        let slot = ((k3 as usize & 15) << 4) | ((k3 as usize >> 8) & 15);
-        let e = cache.e.get_unchecked(slot);
-        let day = if (e.k8 == k8) & (e.k3 == k3) { e.v } else { date_slow(p, cache, slot) };
-        let v = rd64(p.add(11)) ^ 0x3030_3A30_303A_3030;
-        let bad = (v | v.wrapping_add(0x767A_7F76_7A7F_767D)) & 0x8080_8080_8080_8080;
-        let x = v.wrapping_mul(2561);
-        let h = (x >> 8) & 0xFF;
-        let m = (x >> 32) & 0xFF;
-        let s = x >> 56;
-        (day.wrapping_add((h * 3600 + m * 60 + s) as i64), bad | (h > 23) as u64 | (day == NONE) as u64)
     }
 }
 
