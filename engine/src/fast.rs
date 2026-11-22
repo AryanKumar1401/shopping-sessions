@@ -1166,7 +1166,7 @@ mod hop_tests {
         ts(r, true, &mut f[3]);
         f[4] = if r.one_in(25) { r.pick(&[b"Purchase", b"cart ", b"viewx", b"", b"vie", b"purchas", b"VIEW", b"xiew", b"zart", b"vart", b"purchasd"]).to_vec() } else { r.pick(&[b"view", b"view", b"view", b"cart", b"purchase", b"purchase"]).to_vec() };
         f[5] = if r.one_in(25) { r.pick(&[b"", b"P1", b"p123456789012345678901234567890", b"p\xFF1", b"p 1", b"x"]).to_vec() } else { format!("p{}", r.below(40)).into_bytes() };
-        f[6] = if r.one_in(6) { r.pick(&[b"", b"19.99", b"-5", b"0", b"00", b"0250", b"10000000", b"10000001", b"1000\r", b"99999999999999999999", b"12a", b"123456789012345678901234567890123"]).to_vec() } else { format!("{}", 1 + r.below(60_000)).into_bytes() };
+        f[6] = if r.one_in(6) { r.pick(&[b"", b"19.99", b"-5", b"0", b"00", b"0250", b"10000000", b"10000001", b"1000\r", b"99999999999999999999", b"12a", b"123456789012345678901234567890123", b"1234567\x01", b"\x021", b"1 ", b"12345678", b"00000001", b"000000001", b"9999999", b"1234567\r", b"\t5"]).to_vec() } else { format!("{}", 1 + r.below(60_000)).into_bytes() };
         let mut nf = 7;
         if r.one_in(60) {
             nf = r.below(10) as usize;

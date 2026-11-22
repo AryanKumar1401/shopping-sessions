@@ -476,7 +476,18 @@ unsafe fn purchase_pc(ev: &EvRow, s5: *const u8, mcb: u32, nl: usize, open: u32)
         let c = mcb.trailing_zeros() as usize;
         let qp = (open & 1) as usize;
         let qr = ((open >> (c + 1)) & 1) as usize;
-        let price = parse_price(s5.add(c + 1 + qr), nl - c - 1 - 2 * qr);
+        let (pp, pl) = (s5.add(c + 1 + qr), nl - c - 1 - 2 * qr);
+        // (up to 8 digits at once: the bytes after the price are readable, see `GUARD`)
+        let price = if pl - 1 < 8 {
+            let w = (rd64(pp) << (8 * (8 - pl))) | ((0x3030_3030_3030_3030u64 >> 8) >> (8 * (pl - 1)));
+            let ok = ((w & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030) & ((w.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030);
+            let x = (w & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(2561) >> 8;
+            let x = (x & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+            let v = (x & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32;
+            if ok && (1..=10_000_000).contains(&v) { v as u32 } else { 0 }
+        } else {
+            parse_price(pp, pl)
+        };
         if price == 0 {
             return 0;
         }
@@ -504,7 +515,11 @@ struct Hot {
     pb: *mut PRec,
     dh: *mut (*mut DRec, *mut DRec),
     db: *mut DRec,
-    /// Largest `PRec` index and `DRec::ing` seen: `escape` when one does not fit.
+    /// All `PRec` indexes and all `DRec::ing` seen, or-ed: `escape` when one does not fit.
+    /// (An `ing` does not fit exactly when a bit from 32 up is set. For the indexes the test
+    /// `>= NOPREC` is exact from 2^32 up and never misses NOPREC itself; it could only be
+    /// true without cause if indexes reached 2^31, which merely sends the run to the
+    /// general path.)
     max_idx: usize,
     max_d: u64,
     /// `DATE_MISS`: the date that is not in the memo.
@@ -679,17 +694,19 @@ unsafe fn hop_row<const RAW: bool>(hot: &mut Hot, p: *const u8, dates: &HopDates
                     pw.push_ptr(ps, rec) as usize
                 };
                 idx = prec.wrapping_sub(hot.pbase) / std::mem::size_of::<PRec>();
-                hot.max_idx = hot.max_idx.max(idx);
+                hot.max_idx |= idx;
             }
         }
-        hot.max_d = hot.max_d.max(dd);
+        hot.max_d |= dd;
         let ds = ((id_hash(eid) >> 1) >> hot.dshift) as usize;
-        hot.ds = ds;
         let rec = DRec { eid, ing: dd as u32, prec: idx as u32 };
         if RAW {
             let mut full = 0;
             push16(hot.dh, hot.db, ds, rec, &mut full);
-            next |= full;
+            if full != 0 {
+                hot.ds = ds;
+                next |= REFILL;
+            }
         } else {
             dw.push(ds, rec);
         }
@@ -708,9 +725,9 @@ unsafe fn purchase_finish(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw:
         if pc != 0 && uid != 0 {
             let prec = pw.push_ptr(((id_hash(uid) >> 1) >> hot.pshift) as usize, PRec { k: uid, ts: (ts - hot.cbase) as u32, pc });
             idx = (prec as usize).wrapping_sub(hot.pbase) / std::mem::size_of::<PRec>();
-            hot.max_idx = hot.max_idx.max(idx);
+            hot.max_idx |= idx;
         }
-        hot.max_d = hot.max_d.max(dd);
+        hot.max_d |= dd;
         dw.push(((id_hash(eid) >> 1) >> hot.dshift) as usize, DRec { eid, ing: dd as u32, prec: idx as u32 });
         s5.add(nl + 1)
     }
@@ -719,9 +736,8 @@ unsafe fn purchase_finish(ev: &EvRow, hot: &mut Hot, pw: &mut Writers<PRec>, dw:
 /// The line at `p` (ending before `end`) by the general rules; returns the next line's start.
 /// One pass that finds the newline and splits as `split_row` does: a field has no quote, or
 /// exactly two, as its first and last byte.
-#[cold]
 #[inline(never)]
-unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) -> *const u8 {
+unsafe fn slow_row_bytes(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) -> *const u8 {
     unsafe {
         let mut f: [Field; 7] = [(p, 0); 7];
         let (mut k, mut well, mut st, mut nq, mut i) = (0usize, true, p, 0usize, p);
@@ -753,6 +769,54 @@ unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCac
             event_general(ev.ctx, &f, ev.lim, cache, pw, dw, escape);
         }
         i.add(1)
+    }
+}
+
+/// `slow_row_bytes` with the delimiters and quotes found 32 bytes at a time; a line that
+/// comes within 32 bytes of the end of the readable bytes is handed to `slow_row_bytes`.
+#[cold]
+#[inline(never)]
+unsafe fn slow_row(ev: &EvRow, p: *const u8, end: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) -> *const u8 {
+    unsafe {
+        let mut f: [Field; 7] = [(p, 0); 7];
+        let (mut k, mut well, mut st, mut nq, mut b) = (0usize, true, p, 0u32, p);
+        loop {
+            if (ev.lim as usize - b as usize) < 32 {
+                return slow_row_bytes(ev, p, end, cache, pw, dw, escape);
+            }
+            let (mc, mn, mq) = k::tail_masks(b);
+            let mut dm = mc | mn;
+            // quotes of the block not yet counted: those from bit `from` on
+            let mut from = 0u32;
+            while dm != 0 {
+                let i = dm.trailing_zeros();
+                nq += (((mq as u64) >> from) << from & ((1u64 << i) - 1)).count_ones();
+                let e = b.add(i as usize);
+                let len = e as usize - st as usize;
+                if k < 7 {
+                    if nq == 0 {
+                        f[k] = (st, len);
+                    } else if nq == 2 && len >= 2 && *st == b'"' && *e.sub(1) == b'"' {
+                        f[k] = (st.add(1), len - 2);
+                    } else {
+                        well = false;
+                    }
+                }
+                k += 1;
+                if (mn >> i) & 1 != 0 {
+                    if well && k == 7 {
+                        event_general(ev.ctx, &f, ev.lim, cache, pw, dw, escape);
+                    }
+                    return e.add(1);
+                }
+                st = e.add(1);
+                nq = 0;
+                from = i + 1;
+                dm &= dm - 1;
+            }
+            nq += ((mq as u64) >> from).count_ones();
+            b = b.add(32);
+        }
     }
 }
 
