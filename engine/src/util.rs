@@ -195,8 +195,20 @@ fn release_files(_nthreads: usize) {
 /// on one thread. Nothing may use arena memory afterwards.
 pub fn release_all(_nthreads: usize) {
     #[cfg(target_os = "linux")]
+    release_files(_nthreads);
+    release_anon(_nthreads);
+}
+
+/// Gives the pages of every big `os_alloc` slab back to the kernel from `nthreads` threads
+/// (Linux): the regions and arenas of the record streams, the write-combining buffers, the
+/// link table, the interner. The addresses stay mapped and read as zeros afterwards, so
+/// nothing that was stored there may be used again. The file mappings are not touched.
+/// For the hand-off to the general path (`slow.rs`), which reads only the input files and
+/// its own heap: without this a fast path that gave up after parsing keeps its arenas
+/// resident underneath the general path's tables.
+pub fn release_anon(_nthreads: usize) {
+    #[cfg(target_os = "linux")]
     {
-        release_files(_nthreads);
         let slabs = std::mem::take(&mut *SLABS.lock().unwrap());
         drop_ranges(&slabs, _nthreads);
     }

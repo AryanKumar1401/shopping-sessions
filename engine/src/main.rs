@@ -88,8 +88,17 @@ fn main() {
         fast::kernel_bench(&inp, nthreads);
         unsafe { util::_exit(0) }
     }
-    let done = !util::env_flag("SE_SLOW") && fast::run(&inp, &out, nthreads, &mut tm);
+    let forced = util::env_flag("SE_SLOW");
+    let done = !forced && fast::run(&inp, &out, nthreads, &mut tm);
     if !done {
+        // The fast path gave up, possibly after parsing everything into its arenas. All its
+        // threads have been joined (they are scoped) and the general path uses none of its
+        // data - only `inp` (file mappings, window) and the heap - so the arenas go back to
+        // the kernel before the general path builds its own tables (SE_RELEASE=0: kept).
+        if !forced && util::env_on("SE_RELEASE") {
+            util::release_anon(nthreads);
+            tm.lap("release fast path");
+        }
         slow::run(&inp, &out, nthreads, &mut tm);
         tm.lap("slow path");
     }
