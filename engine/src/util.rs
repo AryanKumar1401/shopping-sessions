@@ -104,8 +104,13 @@ pub fn map_file(path: &std::path::Path) -> std::io::Result<&'static [u8]> {
         if len >= (1 << 20) && env_flag("SE_WILLNEED") {
             madvise(p, len, MADV_WILLNEED);
         }
-        use std::os::fd::IntoRawFd;
-        FDS.lock().unwrap().push((p as usize, f.into_raw_fd()));
+        // The descriptor is only needed for SE_READ=1 (pread instead of parsing the mapping).
+        // Otherwise it is closed here - the mapping stays valid - so a dataset with more
+        // files than the open-file limit (1024 by default) cannot fail.
+        if env_flag("SE_READ") {
+            use std::os::fd::IntoRawFd;
+            FDS.lock().unwrap().push((p as usize, f.into_raw_fd()));
+        }
         #[cfg(target_os = "linux")]
         MAPS.lock().unwrap().push((p as usize, (len + 4095) & !4095));
         Ok(std::slice::from_raw_parts(p as *const u8, len))
