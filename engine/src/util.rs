@@ -673,7 +673,7 @@ pub unsafe fn pack_id16(p: *const u8, len: usize) -> Id {
 
 /// Byte masks of the first `len` (0..=9) of 16 bytes.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-static LEN_MASK: [[u8; 16]; 10] = {
+pub static LEN_MASK: [[u8; 16]; 10] = {
     let mut t = [[0u8; 16]; 10];
     let mut l = 0;
     while l < 10 {

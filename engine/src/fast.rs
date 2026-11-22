@@ -94,6 +94,28 @@ pub struct Ctx {
     pub ibase: i64,
     /// Where every `PRec` lives.
     pub pregion: &'static Region,
+    /// Event lines by the row-hopping kernel (hop.rs) instead of the delimiter scanner.
+    pub hop: bool,
+}
+
+/// Whether event lines take the row-hopping kernel: SE_KERNEL=hop / SE_KERNEL=scan decide;
+/// by default it is used where it has its vector code (x86-64 built with AVX2).
+pub fn hop_default(level: Level) -> bool {
+    match std::env::var("SE_KERNEL").as_deref() {
+        Ok("hop") => true,
+        Ok("scan") => false,
+        _ => {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                matches!(level, Level::Avx2 | Level::Avx512)
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            {
+                let _ = level;
+                false
+            }
+        }
+    }
 }
 
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -548,6 +570,8 @@ unsafe fn read_job(job: &Job, rbuf: *mut u8, cap: usize) -> Option<(*const u8, u
 unsafe impl Send for PState {}
 struct PState {
     escape: bool,
+    /// Event lines the row-hopping kernel handed to the general path.
+    slow: u64,
     rbuf: *mut u8,
     rcap: usize,
     buf: ScanBuf,
@@ -579,7 +603,7 @@ fn emit_event(ctx: &Ctx, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape:
 /// One well-formed event line, by the general rules (`eval_event`), into the writers.
 #[cold]
 #[inline(never)]
-unsafe fn event_general(ctx: &Ctx, f: &[Field; 7], lim: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) {
+pub(crate) unsafe fn event_general(ctx: &Ctx, f: &[Field; 7], lim: *const u8, cache: &mut DateCache, pw: &mut Writers<PRec>, dw: &mut Writers<DRec>, escape: &mut bool) {
     unsafe {
         let stage = ctx.stage;
         let r = eval_event(ctx, f, lim, cache);
@@ -605,13 +629,13 @@ unsafe fn event_general(ctx: &Ctx, f: &[Field; 7], lim: *const u8, cache: &mut D
 }
 
 /// What `event_row` needs besides the row and the writers.
-struct EvRow<'a> {
-    ctx: &'a Ctx,
+pub(crate) struct EvRow<'a> {
+    pub ctx: &'a Ctx,
     /// End of the readable bytes.
-    lim: *const u8,
+    pub lim: *const u8,
     /// `DRec::ing` is a whole number of seconds from `ibase` for every F1 `ingest_ts`.
-    fast_rows: bool,
-    ibase_s: i64,
+    pub fast_rows: bool,
+    pub ibase_s: i64,
 }
 
 /// One well-formed event line.
@@ -687,7 +711,7 @@ unsafe fn event_row(ev: &EvRow, r: &Row, cache: &mut DateCache, pw: &mut Writers
 #[inline(always)]
 unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
     unsafe {
-        let PState { escape, rbuf, rcap, buf, cache, dw, pw, cw } = st;
+        let PState { escape, slow, rbuf, rcap, buf, cache, dw, pw, cw } = st;
         // `base[..len]`: the job's lines; `lim`: end of the readable bytes; `fix`: what to add
         // to a row pointer to get its address in the file's mapping (which outlives the job).
         let (base, len, lim, fix) = match read_job(job, *rbuf, *rcap) {
@@ -706,7 +730,9 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
         if job.kind == 0 {
             // (SE_STAGE: 1 = scan only; 2, 3 = the general evaluator without scatter)
             let ev = EvRow { ctx, lim, fast_rows: ctx.ibase % 1000 == 0 && ctx.stage == 0, ibase_s: ctx.ibase / 1000 };
-            if ctx.stage == 1 {
+            if ctx.hop && ev.fast_rows {
+                *slow += crate::hop::hop_events(&ev, base, len, cache, pw, dw, escape);
+            } else if ctx.stage == 1 {
                 scan_rows::<M, 7>(buf, base, len, |r| {
                     std::hint::black_box(r);
                 });
@@ -789,11 +815,12 @@ fn run_rest(
         return false;
     }
     let pregion = Region::new(pregion_bytes);
-    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_on("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion };
+    let ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: std::env::var("SE_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), drop_pages: env_on("SE_DROP"), ibase: inp.ws - (1i64 << 31) * 1000, pregion, hop: hop_default(level) };
 
     if tm.on {
         eprintln!(
-            "[timing] threads={nthreads} simd={level:?} event_bytes={ev_bytes} dedup_parts={} person_parts={} categories={} campaigns={} links={}",
+            "[timing] threads={nthreads} simd={level:?} hop={} event_bytes={ev_bytes} dedup_parts={} person_parts={} categories={} campaigns={} links={}",
+            ctx.hop,
             1usize << dbits,
             1usize << pbits,
             ctx.cats.len(),
@@ -815,6 +842,7 @@ fn run_rest(
     let states: Vec<PState> = (0..nt)
         .map(|_| PState {
             escape: false,
+            slow: 0,
             rbuf: if read { os_alloc(rcap) } else { std::ptr::null_mut() },
             rcap,
             buf: ScanBuf::new(),
@@ -917,4 +945,87 @@ fn run_rest(
     crate::person::write_campaign_daily(&ctx, &accs, out);
     tm.lap("campaign_daily");
     true
+}
+
+// ---------------------------------------------------------------- kernel microbenchmark
+
+/// `--kernel-bench`: parses the event files only, with the delimiter scanner ("scan") and the
+/// row-hopping kernel ("hop"), and prints for each run the wall time, the number of dedup
+/// records, of good events, of lines that left the hop kernel, and an order-independent hash
+/// of every record written (a `DRec` together with the `PRec` it names). Equal hashes and
+/// counts mean both kernels emitted the same records.
+/// KB_KERNELS=scan,hop  KB_THREADS=1,8  KB_REPS=2  KB_SIMD as SE_SIMD.
+pub fn kernel_bench(inp: &Inputs, nthreads: usize) {
+    let level = pick_level();
+    let cbase = inp.ws - WEEK;
+    let (products, cats, unknown_cat) = load_products(inp.products, level);
+    let (campaigns, camp_names, camp_channels) = load_campaigns(inp.campaigns, level);
+    let ev_bytes: usize = inp.events.iter().map(|f| f.len()).sum();
+    let est_rows = ev_bytes / 75;
+    let dbits = env_usize("SE_DBITS").map_or(ceil_log2(est_rows / 65_536).min(10), |b| b.min(12) as u32);
+    let pbits = env_usize("SE_PBITS").map_or(ceil_log2(est_rows / 50_000).min(10), |b| b.min(12) as u32);
+    let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+    let kernels = var("KB_KERNELS", "scan,hop");
+    let threads: Vec<usize> = var("KB_THREADS", &format!("1,{nthreads}")).split(',').filter_map(|x| x.parse().ok()).collect();
+    let reps = env_usize("KB_REPS").unwrap_or(2);
+    let nt_max = threads.iter().copied().max().unwrap_or(1).max(1);
+    let pregion_bytes = ev_bytes + nt_max * ((PBLOCK * std::mem::size_of::<PRec>() + 64) << pbits) + (nt_max + 1) * (16 << 20);
+    let mut ctx = Ctx { ws: inp.ws, we: inp.we, cbase, links: std::sync::OnceLock::new(), products, unknown_cat, cats, campaigns, camp_names, camp_channels, dbits, pbits, stage: 0, drop_pages: false, ibase: inp.ws - (1i64 << 31) * 1000, pregion: Region::new(1 << 20), hop: false };
+    let mut jobs = Vec::new();
+    make_jobs(&inp.events, 0, chunk_bytes(2 << 20), false, &mut jobs);
+    let wc = wc_default();
+    eprintln!("kernel-bench: level={level:?} event_bytes={ev_bytes} jobs={}", jobs.len());
+    let mut first: Option<(u64, u64, u64)> = None;
+    let mut same = true;
+    for &nt in &threads {
+        for _ in 0..reps {
+            for kernel in kernels.split(',') {
+                ctx.hop = kernel == "hop";
+                ctx.pregion = Region::new(pregion_bytes);
+                let nt = nt.min(jobs.len().max(1));
+                let next = AtomicUsize::new(0);
+                let states: Vec<PState> = (0..nt)
+                    .map(|_| PState { escape: false, slow: 0, rbuf: std::ptr::null_mut(), rcap: 0, buf: ScanBuf::new(), cache: DateCache::new(), dw: Writers::with_wc(1 << dbits, 1024, wc), pw: Writers::in_region(1 << pbits, PBLOCK, wc, ctx.pregion), cw: Writers::with_wc(1 << pbits, 128, wc) })
+                    .collect();
+                let t0 = std::time::Instant::now();
+                let res = par(states, |_, mut st| {
+                    loop {
+                        let j = next.fetch_add(1, Relaxed);
+                        if j >= jobs.len() {
+                            break;
+                        }
+                        unsafe { main_d(level, &ctx, &mut st, &jobs[j]) };
+                    }
+                    (st.escape, st.slow, st.dw.finish(), st.pw.finish())
+                });
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let (mut h, mut nd, mut ng, mut slow, mut esc) = (0u64, 0u64, 0u64, 0u64, false);
+                let pbase = ctx.pregion.base as *const PRec;
+                for (e, s, d, _) in &res {
+                    esc |= *e;
+                    slow += *s;
+                    for part in 0..(1usize << dbits) {
+                        for sl in d.slices(part) {
+                            for r in sl.iter() {
+                                nd += 1;
+                                let mut x = mum(r.eid ^ K0, K1) ^ r.ing as u64;
+                                if r.prec != NOPREC {
+                                    ng += 1;
+                                    let p = unsafe { &*pbase.add(r.prec as usize) };
+                                    x = mum(x ^ p.k, K1) ^ (((p.ts as u64) << 32) | p.pc as u64);
+                                }
+                                h = h.wrapping_add(mum(x ^ K1, K0));
+                            }
+                        }
+                    }
+                }
+                println!("kernel={kernel} threads={nt} ms={ms:.1} drecs={nd} good={ng} slow={slow} escape={esc} hash={h:016x}");
+                match first {
+                    None => first = Some((h, nd, ng)),
+                    Some(f) => same &= f == (h, nd, ng),
+                }
+            }
+        }
+    }
+    println!("{}", if same { "RECORDS IDENTICAL" } else { "RECORDS DIFFER" });
 }

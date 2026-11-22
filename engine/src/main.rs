@@ -1,6 +1,7 @@
 //! shopping-engine: the Shopping Sessions pipeline. See docs/CONTRACT.md and rules.md.
 
 mod fast;
+mod hop;
 mod links;
 mod parquet;
 mod person;
@@ -59,6 +60,10 @@ fn main() {
     }
     let inp = fast::load_inputs(&data);
     tm.lap("list+mmap");
+    if args.iter().any(|a| a == "--kernel-bench") {
+        fast::kernel_bench(&inp, nthreads);
+        unsafe { util::_exit(0) }
+    }
     let done = !util::env_flag("SE_SLOW") && fast::run(&inp, &out, nthreads, &mut tm);
     if !done {
         slow::run(&inp, &out);
