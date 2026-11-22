@@ -40,7 +40,7 @@ jobs:
           echo "docker s11 vs DuckDB: $(.venv/bin/python scripts/compare.py /tmp/dk /tmp/duck11 2>&1 | tail -1)"
       - name: bench 20M (interleaved)
         run: python3 bench/bench.py --data /tmp/s3 --reps 11 old=out/perf/old new=out/perf/new 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list|tables|links \(join)|rss"
-      - name: 60M (the final's size): output and interleaved bench
+      - name: 60M output and interleaved bench
         run: |
           out/perf/old /tmp/s5 /tmp/a-s5 >/dev/null 2>&1; out/perf/new /tmp/s5 /tmp/b-s5 >/dev/null 2>&1; echo "new s5-60m vs old: $(.venv/bin/python scripts/compare.py /tmp/b-s5 /tmp/a-s5 2>&1 | tail -1)"
           python3 bench/bench.py --data /tmp/s5 --reps 5 old=out/perf/old new=out/perf/new 2>&1 | grep -vE "^ +(setup|campaign_daily|release|list|tables|links \(join)|rss"
