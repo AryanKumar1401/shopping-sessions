@@ -780,11 +780,43 @@ fn intern_record(s: &[u8], hash: u64, idx: u32) -> *const IRec {
 /// known-ID case is this inlineable lookup; a new ID goes out of line.
 #[inline]
 pub fn intern_long(s: &[u8]) -> Id {
-    let h = hash_bytes(s);
+    intern_long_h(s, hash_bytes(s))
+}
+
+/// The hash `intern_long` takes of `s` (for `intern_long_h` and `intern_prefetch`).
+#[inline]
+pub fn intern_hash(s: &[u8]) -> u64 {
+    hash_bytes(s)
+}
+
+/// `intern_long` of `s` whose `intern_hash` is `h`.
+#[inline]
+pub fn intern_long_h(s: &[u8], h: u64) -> Id {
     let sh = &INTERN[h as usize & ((1 << INTERN_SHARD_BITS) - 1)];
     match intern_find(sh.table.load(Ordering::Acquire), h, s) {
         Some(i) => i | LONG,
         None => intern_new(sh, h, s),
+    }
+}
+
+/// For a lookup of hash `h` some calls ahead: `rec` false prefetches the table word its probe
+/// starts at; `rec` true reads that word (prefetched before) and prefetches the record it
+/// names when the tags agree. Only a hint: nothing changes.
+#[inline(always)]
+pub fn intern_prefetch(h: u64, rec: bool) {
+    let t = INTERN[h as usize & ((1 << INTERN_SHARD_BITS) - 1)].table.load(Ordering::Relaxed);
+    if t != 0 {
+        let (slots, mask) = intern_slots(t);
+        let (i, tag) = intern_pos(h, mask);
+        let w = unsafe { slots.add(i) };
+        if !rec {
+            prefetch(w);
+        } else {
+            let v = unsafe { &*w }.load(Ordering::Relaxed);
+            if v & !ADDR == tag {
+                prefetch((v & ADDR) as *const u8);
+            }
+        }
     }
 }
 
