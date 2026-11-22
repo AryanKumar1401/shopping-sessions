@@ -328,7 +328,7 @@ fn intern_ahead(keys: &[(*const u8, u32, u64)], ids: &mut Vec<Id>) {
 }
 
 /// The index in `list` of the key `k` (hash `h`), appended if new. `table`: slots of 1 + an
-/// index into `list`, or 0, a power of two in size (64 to start); doubled when half full, every
+/// index into `list`, or 0, a power of two in size (64 to start); doubled when a quarter full, every
 /// key placed again by `hash` (the hash the callers give). Keys compare exactly (`DKey`).
 #[inline(always)]
 fn distinct<K: DKey>(table: &mut Vec<u32>, list: &mut Vec<K>, k: K, h: u64, hash: impl Fn(&K) -> u64) -> u32 {
@@ -346,7 +346,7 @@ fn distinct<K: DKey>(table: &mut Vec<u32>, list: &mut Vec<K>, k: K, h: u64, hash
     }
     list.push(k);
     unsafe { *table.get_unchecked_mut(i) = list.len() as u32 };
-    if list.len() * 2 > table.len() {
+    if list.len() * 4 > table.len() {
         let cap = table.len() * 2;
         table.clear();
         table.resize(cap, 0);
