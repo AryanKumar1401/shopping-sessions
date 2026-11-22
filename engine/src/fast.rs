@@ -69,6 +69,9 @@ pub struct Inputs {
     pub campaigns: &'static [u8],
     pub ws: i64,
     pub we: i64,
+    pub level: Level,
+    /// Being built since `load_inputs`; `run` takes it.
+    pub tables: std::sync::Mutex<Option<std::thread::JoinHandle<Tables>>>,
 }
 
 pub struct Ctx {
@@ -151,22 +154,51 @@ pub fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
+/// The two small tables: (products, categories, unknown category), (campaigns, names, channels).
+pub type Tables = ((IdMap, Vec<Vec<u8>>, u32), (IdMap, Vec<Vec<u8>>, Vec<Vec<u8>>));
+
 pub fn load_inputs(data: &Path) -> Inputs {
     let map = |p: &Path| map_file(p).unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
-    let maps = |d: &str| -> Vec<&'static [u8]> { list_csv(&data.join(d)).iter().map(|p| map(p)).collect() };
     let manifest = std::fs::read(data.join("manifest.json")).unwrap_or_else(|e| die(&format!("manifest.json: {e}")));
+    let (products, campaigns) = (map(&data.join("products.csv")), map(&data.join("campaigns.csv")));
+    // The tables are built on their own thread while the other files are opened and mapped
+    // (a few hundred of them: that takes as long as the tables do).
+    let level = pick_level();
+    let tables = std::thread::spawn(move || (load_products(products, level), load_campaigns(campaigns, level)));
+    let lists = ["events", "clicks", "links"].map(|d| list_csv(&data.join(d)));
+    let n = [lists[0].len(), lists[1].len()];
+    let paths: Vec<PathBuf> = lists.into_iter().flatten().collect();
+    let nt = (paths.len() / 16).clamp(1, 4);
+    let next = AtomicUsize::new(0);
+    let mut maps: Vec<&'static [u8]> = vec![&[]; paths.len()];
+    let slots = maps.as_mut_ptr() as usize;
+    std::thread::scope(|sc| {
+        for _ in 0..nt {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= paths.len() {
+                    break;
+                }
+                // each index is written by exactly one thread
+                unsafe { (slots as *mut &'static [u8]).add(i).write(map(&paths[i])) };
+            });
+        }
+    });
+    let links = maps.split_off(n[0] + n[1]);
+    let clicks = maps.split_off(n[0]);
     Inputs {
-        events: maps("events"),
-        clicks: maps("clicks"),
-        links: maps("links"),
-        products: map(&data.join("products.csv")),
-        campaigns: map(&data.join("campaigns.csv")),
+        events: maps,
+        clicks,
+        links,
+        products,
+        campaigns,
         ws: manifest_value(&manifest, "window_start"),
         we: manifest_value(&manifest, "window_end"),
+        level,
+        tables: std::sync::Mutex::new(Some(tables)),
     }
 }
 
-/// Byte range of the lines that start in `[start, end)`; the file's first line (header) is never included.
 fn bounds(data: &[u8], start: usize, end: usize) -> (usize, usize) {
     let len = data.len();
     let after_nl = |from: usize| -> usize {
@@ -765,14 +797,14 @@ unsafe fn main_g<M: Masker>(ctx: &Ctx, st: &mut PState, job: &Job) {
 dispatch!(main_d, main_g, (ctx: &Ctx, st: &mut PState, job: &Job));
 
 pub fn run(inp: &Inputs, out: &Path, nthreads: usize, tm: &mut Timer) -> bool {
-    let level = pick_level();
+    let level = inp.level;
     let cbase = inp.ws - WEEK;
     if inp.we.saturating_sub(cbase) >= u32::MAX as i64 || inp.we < inp.ws {
         return false;
     }
     tm.lap("setup");
-    let (products, cats, unknown_cat) = load_products(inp.products, level);
-    let (campaigns, camp_names, camp_channels) = load_campaigns(inp.campaigns, level);
+    let Some(tables) = inp.tables.lock().unwrap().take() else { return false };
+    let ((products, cats, unknown_cat), (campaigns, camp_names, camp_channels)) = tables.join().unwrap();
     // Fast-path preconditions (anything else goes to the general path in slow.rs):
     // category * PRICE_MUL + price fits u32; the dense [campaign][day] counters stay small;
     // the link table's slot numbers fit u32 (checked when the background build joins).
